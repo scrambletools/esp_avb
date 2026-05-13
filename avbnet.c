@@ -215,6 +215,10 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
         pkt.protocol_idx = AVTP;
         break;
       }
+      /* Ingress port: 0 = Ethernet (eth_handle non-NULL), 1 = Wi-Fi shim
+       * (eth_handle == NULL). On endpoint builds NUM_PORTS == 1 so it
+       * always lands at 0. */
+      pkt.ingress_port = (eth_handle == NULL) ? 1 : 0;
       /* Copy source MAC from offset 6 */
       memcpy(pkt.src_addr, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
       /* Copy payload (strip ETH header) */
@@ -254,13 +258,13 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
   }
 }
 
-/* Wi-Fi RX path (Phase 6b.2 step 3). esp_wifi delivers each L2 frame
- * via this callback in the Wi-Fi driver's task context. The eb
- * descriptor owns the buffer, so we copy out, free eb, and feed the
- * fresh heap buffer into avb_unified_rx_cb (which assumes ownership
- * and free()s on its way out). One memcpy per frame; acceptable for
- * control-plane rates. The talker fast-path TX bypasses this entirely
- * (it sends via avb_net_transmit_raw → esp_wifi_internal_tx). */
+/* Wi-Fi RX path. esp_wifi delivers each L2 frame via this callback
+ * in the Wi-Fi driver's task context. The eb descriptor owns the
+ * buffer, so we copy out, free eb, and feed the fresh heap buffer
+ * into avb_unified_rx_cb (which assumes ownership and free()s on
+ * its way out). One memcpy per frame; acceptable for control-plane
+ * rates. The talker fast-path TX bypasses this entirely (it sends
+ * via avb_net_transmit_raw → esp_wifi_internal_tx). */
 extern esp_err_t esp_wifi_internal_free_rx_buffer(void *eb);
 extern esp_err_t esp_wifi_internal_reg_rxcb(
     int wifi_if, esp_err_t (*fn)(void *buffer, uint16_t len, void *eb));
@@ -344,7 +348,7 @@ static int avb_net_init_port_l2tap(avb_state_s *state, int port_index) {
 /* Initialize the network interfaces for all configured ports.
  *
  * Port-0 medium can be ethernet (wired endpoint or bridge) or wifi
- * (c6 endpoint, Phase 6b). On the wifi path we skip L2TAP fds
+ * (e.g. c6 wireless endpoint). On the wifi path we skip L2TAP fds
  * (L2TAP is Ethernet-only) and pull the MAC via esp_netif — the
  * frame TX/RX path uses esp_wifi_internal_* APIs instead, wired
  * later in this function.
@@ -628,14 +632,16 @@ int avb_net_send(avb_state_s *state, ethertype_t ethertype, void *msg,
 /* Receive next control frame from the unified EMAC RX dispatcher.
  * Blocks up to timeout_ms. Returns payload length, or 0 on timeout.
  * protocol_idx is set to AVTP/MSRP/MVRP. */
-int avb_net_recv_ctrl(avb_state_s *state, int *protocol_idx, void *msg,
-                      uint16_t msg_len, eth_addr_t *src_addr, int timeout_ms) {
+int avb_net_recv_ctrl(avb_state_s *state, int *protocol_idx, int *ingress_port,
+                      void *msg, uint16_t msg_len, eth_addr_t *src_addr,
+                      int timeout_ms) {
   ctrl_rx_pkt_t pkt;
   if (xQueueReceive(s_ctrl_rx_queue, &pkt, pdMS_TO_TICKS(timeout_ms)) !=
       pdTRUE) {
     return 0; /* timeout — no frame available */
   }
   *protocol_idx = pkt.protocol_idx;
+  *ingress_port = pkt.ingress_port;
   memcpy(src_addr, pkt.src_addr, ETH_ADDR_LEN);
   uint16_t copy_len = pkt.length < msg_len ? pkt.length : msg_len;
   memcpy(msg, pkt.data, copy_len);

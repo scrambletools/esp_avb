@@ -1,11 +1,11 @@
 # Source list.
 #
-# Always-compiled core: avb.c, avbutils.c, avbnet.c, msrp.c, avbstats.c.
-#   - msrp.c holds the SRP family (MSRP / MVRP / MAAP) plus the
-#     bridge-only admission control. Used by both endpoint and bridge
-#     builds. The MSRP/MVRP/MAAP code lived in avtp.c historically;
-#     it was misfiled there because AVTP per IEEE 1722 is the audio/
-#     video transport, while SRP is IEEE 802.1Q reservation.
+# Always-compiled core: avb.c, avbutils.c, avbnet.c, mrp.c, avbstats.c.
+#   - mrp.c holds the MRP family (MSRP / MVRP / MAAP) — the generic
+#     MRP state machines (Applicant/Registrar/LeaveAll/timers per
+#     IEEE 802.1Q-2018 §10) plus the MSRP and MVRP application logic
+#     and the bridge-only admission control. Used by both endpoint
+#     and bridge builds. Renamed from msrp.c in the MRP-refactor.
 #
 # Endpoint-only:
 #   - avtp.c (now AVTPDU stream construction + talker/listener tasks
@@ -18,7 +18,7 @@
 #   - avbbridge.c (L2 forwarding + ATDECC/codec/PLL no-op stubs)
 #   - avbfqtss.c (802.1Qav credit-based shaper)
 
-set(avb_srcs avb.c avbutils.c avbnet.c msrp.c avtp.c avbstats.c)
+set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avtp.c avbstats.c)
 
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)
     list(APPEND avb_srcs avbbridge.c avbfqtss.c)

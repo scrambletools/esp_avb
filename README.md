@@ -12,6 +12,16 @@ scrambletools/ESP-AVB-Bridge.
 This component is available via the ESP Component Registry
 (<https://components.espressif.com>).
 
+## Terminology
+
+Where IEEE 1722.1 / 802.1AS would use "grandmaster clock" or "GM",
+this component uses **BTC** (best timetransmitter clock). Where the
+spec uses "BMCA" (best master clock algorithm), this uses **BTCA**.
+The wire format and algorithm are unchanged — only the identifiers
+and prose differ. The renaming applies to both code identifiers
+(e.g. the `gptp_btc_id` field in `aecp_get_avb_info_rsp_s`) and
+human-readable comments / docs.
+
 ## Roles
 
 The role is selected automatically from the per-port configuration owned

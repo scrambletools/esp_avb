@@ -748,11 +748,11 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
 
   /* gPTP discontinuity detection — mr and tu bit management.
-   * mr toggles on media clock restart, tu=1 on gPTP GM change.
+   * mr toggles on media clock restart, tu=1 on gPTP BTC change.
    * Both held for MCR_HOLD_PACKETS after the event. */
 #define MCR_HOLD_PACKETS 8
-  uint8_t last_gm_id[8];
-  memcpy(last_gm_id, state->ptp_status.clock_source_info.gm_id, 8);
+  uint8_t last_btc_id[8];
+  memcpy(last_btc_id, state->ptp_status.clock_source_info.btc_id, 8);
   bool mr_state = true;         /* starts toggled (first packet = restart) */
   int mcr_hold_remaining = MCR_HOLD_PACKETS;
   bool tu_active = false;
@@ -935,10 +935,10 @@ static void avb_stream_out_task(void *task_param) {
      * jitter leaking into presentation timestamps. */
     avtp_media_ts += avtp_ts_increment;
 
-    /* Check for gPTP grandmaster change every ~1 second (8000 packets at 125us) */
+    /* Check for gPTP BTC change every ~1 second (8000 packets at 125us) */
     if ((loop_count & 0x1FFF) == 0 && loop_count > 0) {
-      if (memcmp(last_gm_id, state->ptp_status.clock_source_info.gm_id, 8) != 0) {
-        memcpy(last_gm_id, state->ptp_status.clock_source_info.gm_id, 8);
+      if (memcmp(last_btc_id, state->ptp_status.clock_source_info.btc_id, 8) != 0) {
+        memcpy(last_btc_id, state->ptp_status.clock_source_info.btc_id, 8);
         mr_state = !mr_state;
         mcr_hold_remaining = MCR_HOLD_PACKETS;
         tu_active = true;
@@ -1090,10 +1090,7 @@ static void avb_stream_out_task(void *task_param) {
                           params->channels);
     } /* end else (mic path) */
 
-    /* Transmit via avbnet's medium-abstracted raw send. On the EMAC
-     * port this is a single copy into the DMA ring; Phase 6b.2 will
-     * route wifi-medium ports to esp_wifi internal TX with the same
-     * caller signature. */
+    /* Transmit via avbnet's medium-abstracted raw send. */
     if (avb_net_transmit_raw(params->eth_handle, tx_frame, frame_len) !=
         ESP_OK) {
       send_fail_count++;
@@ -1294,8 +1291,8 @@ static stream_rx_ctx_t *s_stream_rx_ctx = NULL;
 
 /* CRF stream RX context. Allocated by avb_start_stream_in when index is the
  * endpoint's CRF media-clock STREAM_INPUT. Unlike the audio stream
- * context this has no I2S/jitter-buffer machinery, just packet reception
- * state for Phase 2 media-clock recovery. */
+ * context this has no I2S/jitter-buffer machinery, just packet
+ * reception state for media-clock recovery. */
 typedef struct {
   avb_state_s *state; /* for media_clock stats update */
   uint8_t expected_stream_id[UNIQUE_ID_LEN]; /* filter: CRF talker's stream_id */
@@ -1305,7 +1302,7 @@ typedef struct {
   uint8_t last_seq_num;
   bool seq_num_valid;
   /* Last CRF timestamp observed (IEEE 1722-2016 §10, 64-bit gPTP ns).
-   * Reserved for Phase 2 PLL. */
+   * Reserved for media-clock PLL. */
   uint64_t last_timestamp_ns;
   uint32_t timestamp_count;
   /* Latest-packet snapshot for the deferred drift sampler. Same
@@ -1416,10 +1413,10 @@ static void stream_in_drain_cb(void *arg) {
   }
 }
 
-/* CRF stream RX handler — counts CRF AVTPDUs and records the most recent
- * media-clock timestamp. Called inline from EMAC RX task via the
- * dispatcher; must return quickly. Phase 2 will use the collected
- * timestamps for a media-clock PLL. */
+/* CRF stream RX handler — counts CRF AVTPDUs and records the most
+ * recent media-clock timestamp. Called inline from EMAC RX task via
+ * the dispatcher; must return quickly. Timestamps are collected for
+ * a future media-clock PLL. */
 static void avb_crf_rx_handler(uint8_t *avtp_data, uint16_t len,
                                crf_rx_ctx_t *ctx) {
   int64_t rx_ts_us = esp_timer_get_time();
@@ -1936,9 +1933,9 @@ static void avb_stream_rx_dispatcher(uint8_t *avtp_data, uint16_t len,
 }
 
 /* Start CRF media clock input (Milan v1.3 §7.2.2).
- * Lightweight compared to the audio stream input: no I2S, no jitter buffer — just a context
- * for packet reception and stats. Phase 2 will use the recorded
- * timestamps to drive a media-clock PLL. */
+ * Lightweight compared to the audio stream input: no I2S, no jitter
+ * buffer — just a context for packet reception and stats. Recorded
+ * timestamps feed a future media-clock PLL. */
 static int avb_start_stream_in_crf(avb_state_s *state, uint16_t index) {
   if (s_crf_rx_ctx != NULL) {
     avberr("CRF stream-in already running");

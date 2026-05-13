@@ -8,7 +8,7 @@
  * "credit" value with these dynamics:
  *
  *   idle_slope     bandwidth allocated to the class, bytes/s
- *                  (Phase 5d will set this from MSRP admission)
+ *                  (set from MSRP admission)
  *   port_tx_rate   link rate, bytes/s
  *   send_slope     idle_slope - port_tx_rate    (negative)
  *   creditMax      worst-case interference burst, bytes
@@ -56,8 +56,8 @@ static const char *TAG = "avb_fqtss";
 #define FQTSS_MTU_BYTES   1518
 
 /* Frame envelope passed through the per-class queues. The bridge
- * forwarder (Phase 5b) will call avb_fqtss_enqueue with a frame copy;
- * the worker eventually frees it after egress. */
+ * forwarder calls avb_fqtss_enqueue with a frame copy; the worker
+ * eventually frees it after egress. */
 typedef struct {
   uint8_t port_index;
   uint8_t sr_class;
@@ -98,8 +98,8 @@ static inline void fqtss_credit_advance(fqtss_class_state_t *c, int64_t dt_us) {
 }
 
 /* If queue has a frame and credit allows, dequeue + transmit one.
- * Phase 5b owns the actual egress path; this skeleton frees the
- * buffer to keep the queue draining during local testing.
+ * The egress path is currently a stub that frees the buffer to keep
+ * the queue draining during local testing.
  * Returns 1 if a frame was sent, 0 otherwise. */
 static int fqtss_try_send_one(int port_index, int cls) {
   fqtss_class_state_t *c = &s_class[port_index][cls];
@@ -115,8 +115,7 @@ static int fqtss_try_send_one(int port_index, int cls) {
   if (xQueueReceive(c->queue, &frame, 0) != pdTRUE) {
     return 0;
   }
-  /* Phase 5b will hand the payload to the egress port's socket here.
-   * Skeleton: drop on floor. */
+  /* TODO: hand the payload to the egress port's socket. Stub drops. */
   free(frame.payload);
   /* Deduct frame bytes from credit; clamp to creditMin. */
   c->credit_x256_bytes -= (int64_t)frame.length * 256;
@@ -146,10 +145,9 @@ static void fqtss_worker(void *arg) {
      * default 100 Hz tick (10 ms) this dramatically over-relaxes the
      * intended 100 µs cadence. AVB workloads typically run with
      * tick=1000 Hz (1 ms) — confirmed in ESP-AVB-Endpoint's
-     * sdkconfig.defaults via CONFIG_FREERTOS_HZ. The skeleton
-     * accepts ms-level granularity; Phase 5d may switch to an
-     * esp_timer-driven semaphore for sub-ms ticks if jitter
-     * measurements warrant it. */
+     * sdkconfig.defaults via CONFIG_FREERTOS_HZ. ms-level granularity
+     * is acceptable for now; may switch to an esp_timer-driven
+     * semaphore for sub-ms ticks if jitter measurements warrant it. */
     vTaskDelay(1);
   }
   ESP_LOGI(TAG, "FQTSS worker exiting");
@@ -160,8 +158,8 @@ static void fqtss_worker(void *arg) {
 int avb_fqtss_init(avb_state_s *state) {
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
     /* Link rate. Ethernet ports default to 1 Gbps; Wi-Fi ports start
-     * at 0 (unknown) and Phase 5b will call set_idle_slope once the
-     * AP has measured the negotiated MCS rate. */
+     * at 0 (unknown) until set_idle_slope is called with the
+     * negotiated MCS rate. */
     int64_t link_bps =
         (state->port[p].medium == avb_port_medium_ethernet) ? 1000000000LL : 0LL;
     for (int cl = 0; cl < AVB_SR_CLASS_COUNT; cl++) {
@@ -197,8 +195,8 @@ int avb_fqtss_init(avb_state_s *state) {
 void avb_fqtss_stop(avb_state_s *state) {
   (void)state;
   s_stop = true;
-  /* Worker self-deletes. Queue handles leak across stop in skeleton —
-   * Phase 5b adds proper teardown when the bridge actually shuts down. */
+  /* Worker self-deletes. Queue handles leak across stop — TODO:
+   * proper teardown when the bridge actually shuts down. */
 }
 
 int avb_fqtss_enqueue(int port_index, int sr_class, const void *frame,

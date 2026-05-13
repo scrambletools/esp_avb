@@ -95,8 +95,8 @@ static int mclk_hw_init(uint32_t nominal_mclk_hz) {
            nominal_mclk_hz, s_hw.mclk_div, s_hw.nominal_apll_hz);
   return 0;
 #else
-  /* No APLL on this SOC (e.g. esp32c6). Phase 6b.2 will need a
-   * software-only clock-recovery path on Wi-Fi-only targets. */
+  /* No APLL on this SOC (e.g. esp32c6). A software-only clock-
+   * recovery path is needed on Wi-Fi-only targets. */
   (void)nominal_mclk_hz;
   s_hw.initialised = false;
   return -1;
@@ -109,10 +109,10 @@ static int mclk_hw_init(uint32_t nominal_mclk_hz) {
  * tuning; they're not incremental.
  *
  * Hardware path uses the on-chip APLL coefficient registers via
- * rtc_clk_apll_coeff_calc/_set. These are only available on SOCs with
- * APLL (e.g. ESP32-P4); Wi-Fi-only targets like ESP32-C6 have no APLL.
- * On those targets this is a stub that returns -1; Phase 6b.2 will
- * supply a software clock-recovery alternative on the Wi-Fi path. */
+ * rtc_clk_apll_coeff_calc/_set. These are only available on SOCs
+ * with APLL (e.g. ESP32-P4); Wi-Fi-only targets like ESP32-C6 have
+ * no APLL. On those targets this returns -1 — a software clock-
+ * recovery path is needed on the Wi-Fi side. */
 static int mclk_hw_tune_ppm_q16(int32_t ppm_q16) {
 #if SOC_CLK_APLL_SUPPORTED
   if (!s_hw.initialised)

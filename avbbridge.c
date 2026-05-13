@@ -2,19 +2,15 @@
  * Copyright 2026 Scramble Tools
  * License: MIT
  *
- * Bridge-role L2 forwarding task.
+ * Bridge-role L2 forwarding task. Defines the public init/stop
+ * surface and the forwarding task entry point. EtherType dispatch
+ * happens inline in avb_unified_rx_cb (avbnet.c): PTP/MSRP/MVRP
+ * terminate locally and re-declare via MRP MAP; AVTP frames classify
+ * by VLAN PCP and route through avbfqtss; Class A from Ethernet is
+ * dropped on Wi-Fi egress per the Class-B-only Wi-Fi policy.
  *
- * Phase 5a skeleton — defines the public init/stop surface and the
- * forwarding task entry point. The actual EtherType dispatch
- * (PTP terminated per port; MSRP/MVRP terminated and re-declared via
- * the MRP MAP machinery; AVTP frames classified by VLAN PCP and
- * routed through avbfqtss; everything else best-effort; Class A from
- * Ethernet dropped on Wi-Fi egress per the Class-B-only Wi-Fi policy)
- * is filled in incrementally in Phase 5b.
- *
- * esp_avb terminology: "port" indexes into avb_state_s.port[]. With
- * CONFIG_ESP_AVB_NUM_PORTS=2 (bridge build) port[0] is Ethernet and
- * port[1] is Wi-Fi.
+ * "port" indexes into avb_state_s.port[]. With NUM_PORTS=2 (bridge
+ * build) port[0] is Ethernet and port[1] is Wi-Fi.
  */
 
 #include "avbbridge.h"
@@ -36,9 +32,8 @@ static void bridge_task(void *arg) {
            CONFIG_ESP_AVB_NUM_PORTS);
 
   while (!s_bridge_stop) {
-    /* Phase 5b: poll/select across both ports' L2TAP fds, dispatch
-     * by EtherType, route through FQTSS for AVTP frames. Skeleton
-     * just sleeps for now. */
+    /* Forwarding runs out of avb_unified_rx_cb (avbnet.c); this task
+     * is reserved for future shaper bookkeeping. */
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 
@@ -53,8 +48,7 @@ int avb_bridge_init(avb_state_s *state) {
     return 0;
   }
   s_bridge_stop = false;
-  /* Pin to core 1 alongside AVB-OUT so the EMAC RX cores stay free.
-   * Phase 5b may rebalance once shaper load is measured. */
+  /* Pin to core 1 alongside AVB-OUT so the EMAC RX cores stay free. */
   BaseType_t r = xTaskCreatePinnedToCore(bridge_task, "AVB-BR", 8192,
                                          state, 22, &s_bridge_task, 1);
   return (r == pdPASS) ? 0 : -1;
@@ -98,9 +92,7 @@ avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
                                              uint8_t vlan_pcp) {
   avb_bridge_disposition_t d = {0};
   /* Egress is always the OTHER port. Asserts NUM_PORTS == 2 in the
-   * bridge build; with NUM_PORTS=1 the bridge can't actually forward
-   * anything (Phase 5 carries NUM_PORTS=1 until the AP project
-   * bumps it). */
+   * bridge build; with NUM_PORTS=1 nothing can actually be forwarded. */
   d.egress_port = (uint8_t)((ingress_port == 0) ? 1 : 0);
 
   switch (ethertype) {
@@ -165,8 +157,8 @@ avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
  * paths from the periodic-send and RX-message routines. Rather than
  * thread #ifdefs through avb.c, satisfy the linker with no-op stubs
  * here. Each function's purpose is annotated for future readers; if
- * the bridge ever grows a Controller-class entity (Phase 8 v2), these
- * stubs become the entry points to a slim ATDECC subset.
+ * the bridge ever grows a Controller-class entity, these stubs
+ * become the entry points to a slim ATDECC subset.
  * ---------------------------------------------------------------------- */
 
 int avb_send_adp_entity_available(avb_state_s *state) {

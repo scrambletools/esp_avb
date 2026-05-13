@@ -180,8 +180,8 @@ static void avb_cpu_stats_tick(void) {
    * visible on the wire but never reaching avb_unified_rx_cb.
    *
    * Only meaningful on targets with on-chip EMAC (e.g. esp32p4). On
-   * Wi-Fi-only targets (esp32c6 endpoint, Phase 6b) the AVB ingress
-   * comes from esp_wifi instead and these registers don't exist. */
+   * Wi-Fi-only targets (e.g. esp32c6 endpoint) the AVB ingress comes
+   * from esp_wifi instead and these registers don't exist. */
 #if SOC_EMAC_SUPPORTED
   uint32_t dma_miss = EMAC_DMA.dmamissedfr.val;
   avbinfo("  ====> EMAC DMA missed_fc=%u overflow_fc=%u bmfc_ovf=%u bfoc_ovf=%u",

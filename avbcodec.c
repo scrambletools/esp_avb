@@ -148,8 +148,8 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    *
    * On SOCs without an APLL (e.g. esp32c6) fall back to XTAL — the
    * Milan PLL's hardware-tune path is a no-op there (see avbpll.c's
-   * SOC_CLK_APLL_SUPPORTED gate); Phase 6b.2 will need a software-only
-   * clock-recovery alternative for that target. */
+   * SOC_CLK_APLL_SUPPORTED gate). A software-only clock-recovery
+   * alternative is needed on those targets. */
 #if SOC_CLK_APLL_SUPPORTED
   std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 #else

@@ -30,7 +30,7 @@ int avb_send_adp_entity_available(avb_state_s *state) {
   msg.header.status_valtime = 10; // valid time: 20 seconds (Milan v1.3)
   msg.header.control_data_len = body_size;
   memcpy(&msg.entity, &state->own_entity.summary, sizeof(avb_entity_summary_s));
-  memcpy(msg.gptp_gm_id, state->ptp_status.clock_source_info.gm_id, 8);
+  memcpy(msg.gptp_btc_id, state->ptp_status.clock_source_info.btc_id, 8);
   msg.gptp_domain_num = 0;
   uint16_t current_config_index = 0;
   uint16_t identify_control_index = 0;
@@ -626,7 +626,7 @@ int avb_send_aecp_rsp_read_descr_clock_source(avb_state_s *state,
     uint16_t location_type = aem_desc_type_audio_unit;
     int_to_octets(&localized_description, descriptor.localized_description, 2);
     memcpy(&descriptor.clock_source_id,
-           state->ptp_status.clock_source_info.gm_id, sizeof(unique_id_t));
+           state->ptp_status.clock_source_info.btc_id, sizeof(unique_id_t));
     int_to_octets(&location_type, &descriptor.clock_source_location_type, 2);
   }
 
@@ -2545,17 +2545,17 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   memcpy(&response, msg, sizeof(aecp_get_avb_info_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
 
-  // populate gPTP grandmaster ID from PTP status. Two cases:
-  //   1. We are syncing to a remote master → report that master's gm_id.
-  //   2. BMCA has elected us as GM (no remote source selected) → report our
-  //      own clock identity, otherwise this field would stay zero and look
-  //      like "no GM" to controllers like Hive. Applies in both gPTP and
-  //      standard PTP profiles.
+  // Populate gPTP BTC ID from PTP status. Two cases:
+  //   1. Syncing to a remote BTC → report that BTC's id.
+  //   2. BTCA has elected us as BTC (no remote source selected) →
+  //      report our own clock identity, otherwise the field stays
+  //      zero and looks like "no BTC" to controllers like Hive.
+  //      Applies in both gPTP and standard PTP profiles.
   if (state->ptp_status.clock_source_valid) {
-    memcpy(&response.gptp_grandmaster_id,
-           state->ptp_status.clock_source_info.gm_id, UNIQUE_ID_LEN);
+    memcpy(&response.gptp_btc_id,
+           state->ptp_status.clock_source_info.btc_id, UNIQUE_ID_LEN);
   } else {
-    memcpy(&response.gptp_grandmaster_id,
+    memcpy(&response.gptp_btc_id,
            state->ptp_status.own_identity_info.id, UNIQUE_ID_LEN);
   }
 
@@ -2626,17 +2626,17 @@ int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
   memcpy(&response, msg, sizeof(aecp_get_as_path_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
 
-  // build path sequence: grandmaster -> [intermediate clocks] -> this entity
+  // Build path sequence: BTC -> [intermediate clocks] -> this entity
   uint16_t count = 0;
   if (state->ptp_status.clock_source_valid) {
-    // add grandmaster clock identity
+    // Add BTC clock identity
     memcpy(&response.path_sequence[count],
-           state->ptp_status.clock_source_info.gm_id, UNIQUE_ID_LEN);
+           state->ptp_status.clock_source_info.btc_id, UNIQUE_ID_LEN);
     count++;
-    // if the selected source is not the grandmaster (i.e. an intermediate
+    // If the selected source is not the BTC (i.e. an intermediate
     // boundary clock like the AVB switch), add it to the path
     if (memcmp(state->ptp_status.clock_source_info.id,
-               state->ptp_status.clock_source_info.gm_id, UNIQUE_ID_LEN) != 0) {
+               state->ptp_status.clock_source_info.btc_id, UNIQUE_ID_LEN) != 0) {
       memcpy(&response.path_sequence[count],
              state->ptp_status.clock_source_info.id, UNIQUE_ID_LEN);
       count++;
@@ -2731,7 +2731,7 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
         &response.counters_valid.avb_interface_counters_val;
     iface_valid->link_up = true;
     iface_valid->link_down = true;
-    iface_valid->gptp_gm_changed = true;
+    iface_valid->gptp_btc_changed = true;
     break;
   }
   case aem_desc_type_clock_domain: {
@@ -4066,13 +4066,10 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   // Setting as connected will cause the stream-in handler to start
   stream->connected = true;
 
-  // send SRP listener ready command, as MSRP or CVU depending on avb mode
-  int ret = avb_send_msrp_listener(state, mrp_attr_event_new,
-                                   msrp_listener_event_ready, false,
-                                   &state->input_streams[index].stream_id);
-  if (ret < 0) {
-    return acmp_status_listener_misbehaving;
-  }
+  // declare SRP listener ready via the MRP state machine; the Applicant
+  // will emit JoinIn/New on the next JoinTimer fire.
+  mrp_declare_listener(state, 0, &state->input_streams[index].stream_id,
+                       msrp_listener_event_ready);
 
   return status;
 }
@@ -4098,13 +4095,9 @@ acmp_status_t avb_disconnect_listener(avb_state_s *state,
          sizeof(avtp_stream_format_s));
   memcpy(state->input_streams[index].vlan_id, saved_vlan, 2);
 
-  // send SRP listener deregistration command using the pre-clear stream ID
-  int ret = avb_send_msrp_listener(state, mrp_attr_event_lv,
-                                   msrp_listener_event_ready, false,
-                                   &saved_stream_id);
-  if (ret < 0) {
-    return acmp_status_listener_misbehaving;
-  }
+  // withdraw the SRP listener via the MRP state machine; the Applicant
+  // moves to LA and emits sL at the next JoinTimer fire.
+  mrp_withdraw_listener(state, 0, &saved_stream_id);
 
   return status;
 }

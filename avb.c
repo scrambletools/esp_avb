@@ -219,9 +219,9 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
             sizeof(state->port[0].eth_interface) - 1);
     state->port[0].eth_interface[sizeof(state->port[0].eth_interface) - 1] = '\0';
   }
-  /* asCapable defaults to true on the wired path because the existing gPTP
-   * daemon owns that determination; placeholder until per-port asCapable
-   * machinery lands in Phase 5+. */
+  /* asCapable defaults to true on the wired path because the gPTP
+   * daemon owns that determination; placeholder until per-port
+   * asCapable machinery lands. */
   state->port[0].as_capable = true;
   state->port[0].neighbor_gptp_capable = true;
 
@@ -253,11 +253,20 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
         [sizeof(state->port[1].eth_interface) - 1] = '\0';
   }
   /* Wi-Fi port asCapable / neighbor_gptp_capable will be updated by
-   * the per-port asCapable logic (clause 12.4) in Phase 6/7; default
-   * false until the wireless endpoint negotiates. */
+   * the per-port asCapable logic (clause 12.4); default false until
+   * the wireless endpoint negotiates. */
   state->port[1].as_capable = false;
   state->port[1].neighbor_gptp_capable = false;
 #endif /* CONFIG_ESP_AVB_NUM_PORTS > 1 */
+
+  /* Initialize the per-port MRP timer state (JoinTimer disarmed,
+   * LeaveAllTimer and PeriodicTimer armed). The SM-driven path
+   * coexists with the legacy avb_send_msrp_* / avb_process_msrp_*
+   * direct-call path until the cutover lands. Zero behavior change
+   * until something calls mrp_declare_* or mrp_rx_msrp(). */
+  for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
+    mrp_port_init(state, p);
+  }
 
 #if defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   /* Bridge has no codec / talker / listener. Skip the entire codec
@@ -333,8 +342,17 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   avb_entity_cap_s entity_caps;
   memset(&entity_caps, 0, sizeof(avb_entity_cap_s));
   entity_caps.gptp_supported = true;
-  entity_caps.class_a = true;
-  entity_caps.class_b = false;
+  /* SR class advertised in the entity capabilities. On Wi-Fi-medium
+   * ports the bridge's v1 admission policy admits Class B only, so
+   * the endpoint advertises Class B and not Class A there. On wired
+   * Ethernet we keep the historical Class A advertisement. */
+  if (state->port[0].medium == avb_port_medium_wifi) {
+    entity_caps.class_a = false;
+    entity_caps.class_b = true;
+  } else {
+    entity_caps.class_a = true;
+    entity_caps.class_b = false;
+  }
   entity_caps.aem_supported = true;
   entity_caps.aem_config_index_valid = true;
   entity_caps.aem_identify_control_index_valid = true;
@@ -354,7 +372,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * STRINGS descriptors. */
   memcpy(state->avb_interface.mac_address, state->port[0].internal_mac_addr,
          ETH_ADDR_LEN);
-  state->avb_interface.flags.gptp_gm_supported = true;
+  state->avb_interface.flags.gptp_btc_supported = true;
   state->avb_interface.flags.gptp_supported = true;
   state->avb_interface.flags.srp_supported = true;
   state->avb_interface.domain_number = 0; // gPTP domain 0 per 802.1AS
@@ -454,12 +472,19 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // stream format
   avb_listener_stream_flags_s flags = {0};
   // set any flags here
+  /* Default streams to SR Class B on Wi-Fi-medium ports — the bridge
+   * admission policy on the Wi-Fi egress rejects Class A, so declaring
+   * Class A on a Wi-Fi endpoint creates an MSRP TALKER ADVERTISE ↔
+   * TALKER_FAILED feedback loop that floods the wireless channel.
+   * Wired ports keep the historical Class A default. */
+  bool stream_class_b = (state->port[0].medium == avb_port_medium_wifi);
   aem_stream_info_flags_s info_flags = {.stream_vlan_id_valid = 1,
                                         .stream_format_valid = 1,
                                         .stream_id_valid = 1,
                                         .stream_dest_mac_valid = 1,
                                         .msrp_failure_valid = 1,
-                                        .msrp_acc_lat_valid = 1};
+                                        .msrp_acc_lat_valid = 1,
+                                        .class_b = stream_class_b};
 
   // Build input streams. With audio listener support enabled, stream 0 is
   // AAF/61883 audio and stream 1 is CRF media clock. In talker-only mode, the
@@ -525,12 +550,12 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   state->logo_start = (uint8_t *)logo_png_start;
   state->logo_length = logo_png_end - logo_png_start;
 
-  // Get latest PTP status. Skip on wifi-medium ports where ptpd hasn't
-  // been started yet (Phase 6b — wifi endpoint relies on beacon-IE
-  // FollowUpInformation, not the wired ptpd protocol loop). The
-  // ptpd_status call would otherwise crash on s_state==NULL even with
-  // ptpd_status's own NULL guard — observed under -O2 the guard branch
-  // didn't reliably bypass the s_state-> stores on at least one build.
+  // Get latest PTP status. Skip on wifi-medium ports where ptpd
+  // isn't started — the wifi endpoint syncs via beacon-IE
+  // FollowUpInformation, not the on-wire ptpd loop. The ptpd_status
+  // call would otherwise crash on s_state==NULL even with its own
+  // NULL guard — observed under -O2 the guard branch didn't reliably
+  // bypass the s_state-> stores on at least one build.
   if (state->port[0].medium == avb_port_medium_ethernet) {
     struct ptpd_status_s ptp_status;
     if (ptpd_status(0, &ptp_status) == 0) {
@@ -568,9 +593,8 @@ static int avb_destroy_state(avb_state_s *state) {
 }
 
 /* Get latest PTP status. Same gating as the avb_initialize_state
- * call site: skip on wifi-medium ports (Phase 6b — ptpd isn't
- * started there yet; the wifi endpoint syncs via beacon-IE
- * FollowUpInformation, not the on-wire PTP loop). */
+ * call site: skip on wifi-medium ports — ptpd isn't started there;
+ * the wifi endpoint syncs via beacon-IE FollowUpInformation. */
 static void avb_update_ptp_status(avb_state_s *state) {
   if (state->port[0].medium != avb_port_medium_ethernet) {
     return;
@@ -588,6 +612,13 @@ static int avb_periodic_send(avb_state_s *state) {
   struct timespec time_now;
   struct timespec delta;
   clock_gettime(CLOCK_MONOTONIC, &time_now);
+
+  /* Advance per-port MRP timers (JoinTimer / LeaveAllTimer /
+   * PeriodicTimer). No-op when no attributes are declared — safe
+   * to call before SM-driven origination is wired up. */
+  for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
+    mrp_port_tick(state, p);
+  }
 
   // PTP snapshot for the stream out PLL is no longer needed here — the
   // stream out task now reads the PTP clock directly on Core 1 with a
@@ -613,12 +644,17 @@ static int avb_periodic_send(avb_state_s *state) {
     avb_send_mvrp_vlan_id(state, mrp_attr_event_join_in, false);
   }
 
-  // Send MSRP domain message — use JoinIn when connected
+  /* MSRP domain — SM-driven. mrp_declare_domain is idempotent on
+   * already-active SMs (Join! is a no-op); rate-limiting via the
+   * legacy timestamp keeps it tidy. The SM's PeriodicTimer +
+   * JoinTimer drive the actual MRPDU cadence. */
   timespecsub(&time_now, &state->port[0].last_transmitted_msrp_domain,
                           &delta);
   if (timespec_to_ms(&delta) > MSRP_DOMAIN_INTERVAL_MSEC) {
     state->port[0].last_transmitted_msrp_domain = time_now;
-    avb_send_msrp_domain(state, mrp_attr_event_join_in, false);
+    mrp_declare_domain(state, 0, /*sr_class_id=*/6,
+                       state->msrp_mappings[0].priority,
+                       state->msrp_mappings[0].vlan_id);
   }
 
   // Send MSRP talker and AVTP MAAP announce messages
@@ -634,21 +670,21 @@ static int avb_periodic_send(avb_state_s *state) {
                  ETH_ADDR_LEN) == 0)
         continue;
       uint16_t mfs = avb_compute_tspec_max_frame_size(state, i);
-      // if connected and time to send
-      if (octets_to_uint(state->output_streams[i].connection_count, 2) > 0 &&
-          timespec_to_ms(&delta) > MSRP_TALKER_CONN_INTERVAL_MSEC) {
+      /* MSRP talker — SM-driven. The SM resolves JoinIn vs JoinMt
+       * from its own Registrar state at TX time; we just keep the
+       * declaration alive at a steady cadence. CONN vs IDLE interval
+       * comes from the legacy code; functionally only IDLE matters
+       * now (the SM's Registrar tracks listener presence). */
+      int interval = (octets_to_uint(state->output_streams[i].connection_count,
+                                     2) > 0)
+                         ? MSRP_TALKER_CONN_INTERVAL_MSEC
+                         : MSRP_TALKER_IDLE_INTERVAL_MSEC;
+      if (timespec_to_ms(&delta) > interval) {
         state->port[0].last_transmitted_msrp_talker_adv = time_now;
-        avb_send_msrp_talker(state, mrp_attr_event_join_in, false, false,
-                             &state->output_streams[i].stream_id,
-                             &state->output_streams[i].stream_dest_addr,
-                             state->output_streams[i].vlan_id, mfs);
-        // if idle and time to send
-      } else if (timespec_to_ms(&delta) > MSRP_TALKER_IDLE_INTERVAL_MSEC) {
-        state->port[0].last_transmitted_msrp_talker_adv = time_now;
-        avb_send_msrp_talker(state, mrp_attr_event_join_mt, false, false,
-                             &state->output_streams[i].stream_id,
-                             &state->output_streams[i].stream_dest_addr,
-                             state->output_streams[i].vlan_id, mfs);
+        mrp_declare_talker_advertise(state, 0,
+                                     &state->output_streams[i].stream_id,
+                                     &state->output_streams[i].stream_dest_addr,
+                                     state->output_streams[i].vlan_id, mfs);
       }
     }
     avb_maap_tick(state);
@@ -662,53 +698,18 @@ static int avb_periodic_send(avb_state_s *state) {
       if (state->input_streams[i].connected &&
           timespec_to_ms(&delta) > MSRP_LISTENER_CONN_INTERVAL_MSEC) {
         state->port[0].last_transmitted_msrp_listener = time_now;
-        avb_send_msrp_listener(state, mrp_attr_event_join_in,
-                               msrp_listener_event_ready, false,
-                               &state->input_streams[i].stream_id);
+        /* MSRP listener — SM-driven. */
+        mrp_declare_listener(state, 0, &state->input_streams[i].stream_id,
+                             msrp_listener_event_ready);
       }
     }
   }
 
-  // if time to send leaveAll
-  timespecsub(&time_now, &state->port[0].last_transmitted_msrp_leaveall,
-                          &delta);
-  if (timespec_to_ms(&delta) > MSRP_LEAVEALL_INTERVAL_MSEC) {
-    state->port[0].last_transmitted_msrp_leaveall = time_now;
-    avb_send_msrp_domain(state, mrp_attr_event_join_in, true);
-
-    // After leaveAll, immediately re-declare all active registrations so the
-    // switch doesn't drop stream reservations while waiting for periodic timers
-    if (state->config.talker) {
-      static const uint8_t zero_mac_la[ETH_ADDR_LEN] = {0};
-      for (int i = 0; i < state->num_output_streams; i++) {
-        if (memcmp(state->output_streams[i].stream_dest_addr, zero_mac_la,
-                   ETH_ADDR_LEN) == 0)
-          continue;
-        if (octets_to_uint(state->output_streams[i].connection_count, 2) > 0) {
-          avb_send_msrp_talker(state, mrp_attr_event_join_in, false, false,
-                               &state->output_streams[i].stream_id,
-                               &state->output_streams[i].stream_dest_addr,
-                               state->output_streams[i].vlan_id,
-                               avb_compute_tspec_max_frame_size(state, i));
-        }
-      }
-      state->port[0].last_transmitted_msrp_talker_adv = time_now;
-    }
-    if (state->config.listener) {
-      for (int i = 0; i < state->num_input_streams; i++) {
-        if (state->input_streams[i].connected) {
-          avb_send_msrp_listener(state, mrp_attr_event_join_in,
-                                 msrp_listener_event_ready, false,
-                                 &state->input_streams[i].stream_id);
-        }
-      }
-      // Don't reset last_transmitted_msrp_listener here — let the periodic
-      // path manage its own timer independently from LeaveAll.
-    }
-    // Re-declare MVRP VLAN registration
-    avb_send_mvrp_vlan_id(state, mrp_attr_event_join_in, false);
-    state->port[0].last_transmitted_mvrp_vlan_id = time_now;
-  }
+  /* MSRP LeaveAll is now driven by the SM's per-port LeaveAllTimer
+   * (10–15 s jittered per §10.7.11). The Applicants automatically
+   * re-declare on rLA, so the legacy "send LeaveAll then explicitly
+   * re-decl everything" block is gone. MVRP also gets re-declared by
+   * its own 500 ms periodic above; no separate LeaveAll path needed. */
 
   // Send Unsolicited notifications
   if (state->unsol_notif_enabled) {
@@ -808,42 +809,11 @@ static int avb_process_rx_message(avb_state_s *state, int protocol_idx,
   }
   case MSRP: {
     msrp_msgbuf_s *msg = (msrp_msgbuf_s *)&state->rxbuf[protocol_idx].msrp;
-
-    // Get the first attribute type
-    msrp_attr_header_s header;
-    int offset = 0;
-    int count = 0;
-    memcpy(&header, &msg->messages_raw[offset], sizeof(msrp_attr_header_s));
-
-    // Process all attributes in the message
-    while (header.attr_type != msrp_attr_type_none &&
-           offset < sizeof(msrp_msgbuf_s)) {
-      size_t attr_size = octets_to_uint(header.attr_list_len, 2) +
-                         4; // 4 bytes for the header w/o vechead
-      switch (header.attr_type) {
-      case msrp_attr_type_domain:
-        avb_process_msrp_domain(state, msg, offset, attr_size);
-        break;
-      case msrp_attr_type_talker_advertise:
-        avb_process_msrp_talker(state, msg, offset, attr_size, false,
-                                &src_addr);
-        break;
-      case msrp_attr_type_talker_failed:
-        avb_process_msrp_talker(state, msg, offset, attr_size, true, &src_addr);
-        break;
-      case msrp_attr_type_listener:
-        avb_process_msrp_listener(state, msg, offset, attr_size, &src_addr);
-        break;
-      default:
-        avbinfo("Ignoring unknown MSRP message atribute type: 0x%02x",
-                header.attr_type);
-      }
-      // Next attribute offset
-      offset += attr_size;
-      // Get the next attribute header
-      memcpy(&header, &msg->messages_raw[offset], sizeof(msrp_attr_header_s));
-      count++;
-    }
+    /* Single MSRP RX entry point. mrp_rx_msrp walks the buffer,
+     * dispatches SM events, and calls the legacy avb_process_msrp_*
+     * application reactions for each attribute. */
+    mrp_rx_msrp(state, state->rxport[protocol_idx], msg, (size_t)length,
+                &src_addr);
     break;
   }
     /* VLAN stream data is handled directly by the EMAC RX dispatcher
@@ -995,11 +965,13 @@ static void avb_task(void *task_param) {
   // directly by the registered stream handler in the EMAC RX task.
   while (!state->stop) {
     int protocol_idx;
+    int ingress_port = 0;
     eth_addr_t src_addr;
     /* Use max(AVB_POLL_INTERVAL_MS, one tick) to guarantee yield.
      * With 100Hz ticks, pdMS_TO_TICKS(1) = 0 which busy-loops. */
-    int ret = avb_net_recv_ctrl(state, &protocol_idx, &state->rxbuf[0],
-                                AVB_MAX_MSG_LEN, &src_addr, portTICK_PERIOD_MS);
+    int ret = avb_net_recv_ctrl(state, &protocol_idx, &ingress_port,
+                                &state->rxbuf[0], AVB_MAX_MSG_LEN, &src_addr,
+                                portTICK_PERIOD_MS);
     if (ret > 0 && protocol_idx >= 0 && protocol_idx < AVB_NUM_PROTOCOLS) {
       /* Copy payload and source addr into the protocol-indexed slot so
        * avb_process_rx_message can access them at state->rxbuf[idx] */
@@ -1007,6 +979,7 @@ static void avb_task(void *task_param) {
         memmove(&state->rxbuf[protocol_idx], &state->rxbuf[0], ret);
       }
       memcpy(&state->rxsrc[protocol_idx], &src_addr, ETH_ADDR_LEN);
+      state->rxport[protocol_idx] = (uint8_t)ingress_port;
       avb_process_rx_message(state, protocol_idx, ret);
     }
 
