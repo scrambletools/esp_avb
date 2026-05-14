@@ -316,15 +316,31 @@ static void mrp_sm_step(mrp_sm_state_t *sm, mrp_event_e ev) {
 #define MRP_JOIN_TIMER_US      (200 * 1000)         /* §10.7.11 JoinTime */
 #define MRP_LEAVEALL_TIMER_US  (10 * 1000 * 1000)   /* §10.7.11 LeaveAllTime */
 #define MRP_PERIODIC_TIMER_US  (1 * 1000 * 1000)    /* §10.7.9  PeriodicTime */
+/* Wi-Fi efficiency cut #2: a LeaveAll burst transmits one MRPDU per
+ * attribute on the port and triggers re-declarations on every peer.
+ * On Wi-Fi this is expensive (airtime ∝ table size, no concurrency
+ * with audio frames). Triple the spec floor to 30 s and widen jitter
+ * to 30 s, so the burst lands at 30–60 s instead of 10–15 s. Still
+ * well within the spec's permissive upper bound (§10.7.11 allows
+ * implementer-chosen LeaveAllTime ≥ 600 ms). */
+#define MRP_LEAVEALL_TIMER_WIFI_US     (30 * 1000 * 1000)
+#define MRP_LEAVEALL_JITTER_WIFI_US    (30 * 1000 * 1000)
 
 /* Forward decl — definition in §6c (after the attribute tables). */
 void mrp_tx_flush_port(avb_state_s *state, int port);
 
-/* Spec-allowed jitter spread for LeaveAllTime: 10 s ≤ T ≤ 15 s.
- * Returns an absolute monotonic-µs expiry. */
-static int64_t mrp_leaveall_next_expiry_us(void) {
-  uint32_t jitter_us = (uint32_t)(esp_random() % (5 * 1000 * 1000));
-  return esp_timer_get_time() + MRP_LEAVEALL_TIMER_US + jitter_us;
+/* Spec-allowed jitter spread for LeaveAllTime: 10 s ≤ T ≤ 15 s on
+ * wired ports; 30 s ≤ T ≤ 60 s on Wi-Fi (cut #2 above). Returns an
+ * absolute monotonic-µs expiry. */
+static int64_t mrp_leaveall_next_expiry_us(const avb_port_s *p) {
+  uint32_t base = MRP_LEAVEALL_TIMER_US;
+  uint32_t jitter_span = 5 * 1000 * 1000;
+  if (p->medium == avb_port_medium_wifi) {
+    base = MRP_LEAVEALL_TIMER_WIFI_US;
+    jitter_span = MRP_LEAVEALL_JITTER_WIFI_US;
+  }
+  uint32_t jitter_us = (uint32_t)(esp_random() % jitter_span);
+  return esp_timer_get_time() + base + jitter_us;
 }
 
 /* JoinTimer: random within 0..JoinTime per §10.7.4.3 to avoid collisions
@@ -339,7 +355,7 @@ void mrp_port_init(avb_state_s *state, int port) {
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
   avb_port_s *p = &state->port[port];
   p->mrp_join_timer_us = 0; /* disarmed; armed when first sm->pending_tx set */
-  p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us();
+  p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
   p->mrp_periodic_timer_us = esp_timer_get_time() + MRP_PERIODIC_TIMER_US;
   p->mrp_leaveall_tx_pending = false;
 }
@@ -355,10 +371,25 @@ bool mrp_port_tick(avb_state_s *state, int port) {
   /* LeaveAllTimer: when fires, mark the next PDU to carry LeaveAll
    * and dispatch rLA into every Applicant/Registrar on this port.
    * The dispatch loop is added in cutover; for now only the timer
-   * advances and the flag latches. */
+   * advances and the flag latches.
+   *
+   * Wi-Fi efficiency cut #3: on a wifi AP port with zero associated
+   * STAs, the LeaveAll burst goes nowhere. Roll the timer forward
+   * (so we don't fire instantly when an STA joins) but skip the
+   * dispatch. */
   if (p->mrp_leaveall_timer_us != 0 && now >= p->mrp_leaveall_timer_us) {
-    p->mrp_leaveall_tx_pending = true;
-    p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us();
+    bool suppress = false;
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+    if (p->medium == avb_port_medium_wifi &&
+        p->wifi_mode == avb_port_wifi_mode_ap &&
+        avb_bridge_wifi_ap_sta_count() == 0) {
+      suppress = true;
+    }
+#endif
+    if (!suppress) {
+      p->mrp_leaveall_tx_pending = true;
+    }
+    p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
     fired = true;
     /* TODO (cutover): iterate this port's attribute table and call
      * mrp_applicant_step(..., mrp_event_r_la) and
@@ -421,6 +452,13 @@ typedef struct {
   msrp_attr_type_t attr_type;
   msrp_talker_message_u wire;
   mrp_sm_state_t sm;
+  /* MAP-side state, used on the bridge's ingress port only: the
+   * wire->priority value we last propagated to other bridged ports.
+   * 0 = never propagated; 2 = Class B; 3 = Class A. Lets the MAP code
+   * detect a class change mid-life (Registrar stays IN but wire
+   * content shifts) and trigger a withdraw + re-declare on egress
+   * instead of leaving the egress Applicant stuck on the old class. */
+  uint8_t last_propagated_priority;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -488,6 +526,29 @@ msrp_talker_find_or_insert(int port, const unique_id_t *stream_id,
   return NULL; /* table full */
 }
 
+/* Public query: is the TALKER_ADVERTISE Registrar currently IN for
+ * this (port, stream_id)? Used by the listener-side decl_event
+ * helper so its decision is based on actual SM state, not on a
+ * transition-only cached flag (which misses already-IN bind events). */
+bool mrp_talker_advertise_active(int port, const unique_id_t *stream_id) {
+  msrp_talker_entry_t *e =
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
+  return e != NULL && e->sm.registrar == mrp_registrar_in;
+}
+
+bool mrp_talker_failed_active(int port, const unique_id_t *stream_id,
+                              uint8_t *failure_code_out) {
+  msrp_talker_entry_t *e =
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_failed);
+  if (e == NULL || e->sm.registrar != mrp_registrar_in) {
+    return false;
+  }
+  if (failure_code_out) {
+    *failure_code_out = e->wire.talker_failed.failure_code;
+  }
+  return true;
+}
+
 static msrp_listener_entry_t *msrp_listener_find(int port,
                                                  const unique_id_t *stream_id) {
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
@@ -550,6 +611,470 @@ static msrp_domain_entry_t *msrp_domain_find_or_insert(int port,
  * existing avb_process_msrp_* path below remains active until
  * cutover. */
 
+/* Registrar transition direction for application/MAP dispatch.
+ *
+ * §10.7.8 distinguishes IN (registered), LV (peer leave pending,
+ * LeaveTimer running) and MT (empty). For MAP propagation the only
+ * question is whether the peer's registration is alive *right now*,
+ * so IN is "registered" and {LV, MT} are both "not registered." A
+ * peer Lv (rLv) that takes the Registrar IN→LV must propagate as a
+ * withdraw immediately — waiting for the LeaveTimer to drain to MT
+ * would stall downstream tear-down by up to 1 s. */
+typedef enum {
+  mrp_reg_transition_none = 0,
+  mrp_reg_transition_register,    /* not-IN → IN */
+  mrp_reg_transition_deregister,  /* IN → not-IN */
+} mrp_reg_transition_e;
+
+static inline mrp_reg_transition_e
+mrp_reg_transition(mrp_registrar_state_e before,
+                   mrp_registrar_state_e after) {
+  bool was_in = (before == mrp_registrar_in);
+  bool is_in  = (after  == mrp_registrar_in);
+  if (!was_in && is_in) return mrp_reg_transition_register;
+  if (was_in && !is_in) return mrp_reg_transition_deregister;
+  return mrp_reg_transition_none;
+}
+
+/* Application transition callbacks. Fire on every MSRP RX; the `tr`
+ * argument tells the body whether it's a Registrar register/deregister
+ * edge (for MAP propagation + admission accounting, which must run
+ * once per edge) or just an in-registration update (for endpoint-side
+ * bookkeeping — talker DB refresh, accumulated_latency propagation,
+ * listener msrp_ready / asking_failed tracking, which can run per RX).
+ *
+ * Replaces the legacy per-RX avb_process_msrp_* reactions. The legacy
+ * functions are gone; this is the only consumer of inbound MSRP
+ * attributes outside the SM itself. */
+
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+/* Forward decls — definitions live in §6b (below) but the callbacks
+ * are in §6a (above §6b). */
+extern int avb_srp_admission_try_admit(int port_index, avb_sr_class_e cls,
+                                       uint32_t request_bps);
+extern void avb_srp_admission_release(int port_index, avb_sr_class_e cls,
+                                      uint32_t request_bps);
+#endif
+/* Same forward-decl rationale — used by the domain callback. */
+static uint16_t avb_msrp_mapping_index_for_class_id(uint8_t class_id);
+
+/* ----- Listener-side connection-tracking helpers used by the
+ * listener callback. Operate on the talker-side output_streams[]
+ * table; a peer listener's MSRP declarations drive msrp_ready /
+ * asking_failed flags on the per-stream connected_listeners[] list.
+ * Used to be at the bottom of §6 next to avb_process_msrp_listener;
+ * relocated here so the callback (§6a) can reach them. */
+
+static int find_connected_listener(avb_talker_stream_s *stream,
+                                   eth_addr_t *mac_addr) {
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+    if (memcmp(stream->connected_listeners[i].mac_addr, mac_addr,
+               ETH_ADDR_LEN) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int find_connected_listener_by_entity(avb_talker_stream_s *stream,
+                                             const unique_id_t entity_id) {
+  static const unique_id_t zero_id = {0};
+  if (memcmp(entity_id, zero_id, UNIQUE_ID_LEN) == 0)
+    return -1;
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+    if (memcmp(stream->connected_listeners[i].identity.id, entity_id,
+               UNIQUE_ID_LEN) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static int add_connected_listener(avb_talker_stream_s *stream,
+                                  eth_addr_t *mac_addr) {
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  if (count >= AVB_MAX_NUM_CONNECTED_LISTENERS)
+    return -1;
+  memcpy(stream->connected_listeners[count].mac_addr, mac_addr, ETH_ADDR_LEN);
+  count++;
+  int_to_octets(&count, stream->connection_count, 2);
+  return count - 1;
+}
+
+/* Resolve/merge an MSRP listener declaration (known by source MAC) with any
+ * existing ACMP CONNECT_TX state (known by listener entity_id/uid). Streaming
+ * is allowed only when both halves are present: MSRP Ready + ACMP connected. */
+static int find_or_add_msrp_listener(avb_state_s *state,
+                                     avb_talker_stream_s *stream,
+                                     eth_addr_t *mac_addr) {
+  int idx = find_connected_listener(stream, mac_addr);
+  if (idx >= 0)
+    return idx;
+
+  int listener_idx = avb_find_entity_by_addr(state, mac_addr,
+                                             avb_entity_type_listener);
+  if (listener_idx != NOT_FOUND) {
+    idx = find_connected_listener_by_entity(
+        stream, state->listeners[listener_idx].entity_id);
+    if (idx >= 0) {
+      memcpy(stream->connected_listeners[idx].mac_addr, mac_addr,
+             ETH_ADDR_LEN);
+      return idx;
+    }
+  }
+
+  idx = add_connected_listener(stream, mac_addr);
+  if (idx >= 0 && listener_idx != NOT_FOUND) {
+    memcpy(stream->connected_listeners[idx].identity.id,
+           state->listeners[listener_idx].entity_id, UNIQUE_ID_LEN);
+    memset(stream->connected_listeners[idx].identity.uid, 0, 2);
+  }
+  return idx;
+}
+
+static bool any_listener_ready(avb_talker_stream_s *stream) {
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+    if (stream->connected_listeners[i].msrp_ready) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool any_listener_acmp_connected(avb_talker_stream_s *stream) {
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+    if (stream->connected_listeners[i].acmp_connected) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void mrp_on_talker_registrar_change(
+    avb_state_s *state, int port, msrp_attr_type_t attr_type,
+    const msrp_talker_message_u *wire, mrp_reg_transition_e tr,
+    eth_addr_t *src_addr) {
+  (void)src_addr;
+
+  const talker_adv_info_s *info = &wire->talker.info;
+
+  /* ----- Endpoint-side bookkeeping — runs every RX -----
+   * Updates the local talker discovery DB and the per-input_stream
+   * MSRP state (accumulated_latency, talker_advertised flag, failure
+   * code) used by avb_input_stream_decl_event to drive our outgoing
+   * listener declarations per Milan §5.5. */
+  eth_addr_t talker_addr;
+  memcpy(&talker_addr, info->stream_id, ETH_ADDR_LEN);
+  int idx =
+      avb_find_entity_by_addr(state, &talker_addr, avb_entity_type_talker);
+  if (idx >= 0) {
+    memcpy(&state->talkers[idx].info, info, sizeof(talker_adv_info_s));
+  }
+  /* Mirror the §35.2.2.8.4 failure_code into our input_stream slot
+   * for ATDECC stream_info responses. decl_event derivation in
+   * avb_input_stream_decl_event queries the MRP SM directly, so it
+   * doesn't depend on this mirror — but the AECP GET_STREAM_INFO
+   * path expects a stored value. */
+  bool is_failed_attr = (attr_type == msrp_attr_type_talker_failed);
+  static const uint8_t zero_stream_id[UNIQUE_ID_LEN] = {0};
+  if (memcmp(info->stream_id, zero_stream_id, UNIQUE_ID_LEN) != 0) {
+    for (int i = 0; i < AVB_MAX_NUM_INPUT_STREAMS; i++) {
+      if (memcmp(state->input_streams[i].stream_id, info->stream_id,
+                 UNIQUE_ID_LEN) == 0) {
+        memcpy(state->input_streams[i].msrp_accumulated_latency,
+               info->accumulated_latency, 4);
+        if (tr == mrp_reg_transition_register) {
+          if (is_failed_attr) {
+            state->input_streams[i].msrp_failure_code[0] =
+                wire->talker_failed.failure_code;
+            state->input_streams[i].msrp_failure_code[1] = 0;
+          } else {
+            /* Fresh ADVERTISE clears any stale failure. */
+            state->input_streams[i].msrp_failure_code[0] = 0;
+            state->input_streams[i].msrp_failure_code[1] = 0;
+          }
+        } else if (tr == mrp_reg_transition_deregister && is_failed_attr) {
+          state->input_streams[i].msrp_failure_code[0] = 0;
+          state->input_streams[i].msrp_failure_code[1] = 0;
+        }
+        break;
+      }
+    }
+  }
+
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  /* ----- Bridge MAP propagation -----
+   *
+   * Fires on Registrar transition edges (the common case: peer just
+   * registered or deregistered the attribute), AND on mid-life
+   * class-change events — when the Registrar stays IN but the
+   * wire's priority field shifts (e.g., a controller re-bound the
+   * talker stream from Class A to Class B via ACMP CONNECT_TX). The
+   * SM doesn't transition on a content change, so without the
+   * class-update path the egress Applicant would stay stuck on the
+   * old class indefinitely. */
+  if (state->port[port].type != avb_port_type_bridged) return;
+
+  const unique_id_t *stream_id = (const unique_id_t *)&info->stream_id;
+  const eth_addr_t *dest = &info->stream_dest_addr;
+  const uint8_t *vlan = info->vlan_id;
+  uint16_t mfs = (uint16_t)octets_to_uint(info->tspec_max_frame_size, 2);
+  uint16_t mfi = (uint16_t)octets_to_uint(info->tspec_max_frame_interval, 2);
+  uint8_t new_priority = info->priority;
+  avb_sr_class_e new_cls =
+      (new_priority == 3) ? AVB_SR_CLASS_A : AVB_SR_CLASS_B;
+  uint32_t new_intervals = (new_cls == AVB_SR_CLASS_A) ? 8000u : 4000u;
+  uint32_t new_bps = (uint32_t)mfs * (uint32_t)mfi * new_intervals * 8u;
+  bool is_failed = (attr_type == msrp_attr_type_talker_failed);
+
+  /* Look up the ingress-side entry so we can track and update the
+   * last-propagated priority. The entry was either just inserted or
+   * already existed when msrp_rx_talker_attr stepped its SM. */
+  msrp_talker_entry_t *ingress =
+      msrp_talker_find(port, stream_id, attr_type);
+  uint8_t old_priority = ingress ? ingress->last_propagated_priority : 0;
+  avb_sr_class_e old_cls =
+      (old_priority == 3) ? AVB_SR_CLASS_A : AVB_SR_CLASS_B;
+  uint32_t old_intervals = (old_cls == AVB_SR_CLASS_A) ? 8000u : 4000u;
+  uint32_t old_bps = (uint32_t)mfs * (uint32_t)mfi * old_intervals * 8u;
+
+  /* Decide the kind of MAP work needed. */
+  bool do_release = false;     /* release admission for old_cls/old_bps */
+  bool do_withdraw = false;    /* mrp_withdraw_talker on egress */
+  bool do_admit_declare = false; /* admit + declare with new class */
+
+  if (tr == mrp_reg_transition_register) {
+    do_admit_declare = true;
+  } else if (tr == mrp_reg_transition_deregister) {
+    do_withdraw = true;
+    do_release = (old_priority != 0 && !is_failed);
+  } else /* tr == none */ {
+    if (old_priority != 0 && old_priority != new_priority) {
+      /* Class (or priority) change mid-life — full cycle. */
+      do_release = !is_failed;
+      do_withdraw = true;
+      do_admit_declare = true;
+    } else {
+      return; /* steady-state RX, nothing for MAP to do */
+    }
+  }
+
+  bool propagate_class_b = (new_cls == AVB_SR_CLASS_B);
+
+  for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
+    if (y == port) continue;
+    if (state->port[y].type != avb_port_type_bridged) continue;
+
+    if (do_release) {
+      avb_srp_admission_release(y, old_cls, old_bps);
+    }
+    if (do_withdraw) {
+      mrp_withdraw_talker(state, y, stream_id);
+    }
+    if (!do_admit_declare) {
+      continue;
+    }
+
+    if (is_failed) {
+      /* Pass FAILED through verbatim — admission doesn't apply. */
+      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
+                                wire->talker_failed.failure_code,
+                                propagate_class_b);
+      continue;
+    }
+
+    /* Wi-Fi efficiency cut #1: skip Class A on wifi egress entirely.
+     * Class A requires 125 µs presentation; Wi-Fi can't deliver that
+     * SLA, so no Wi-Fi listener can act on the declaration. Strict
+     * spec would propagate as FAILED with not_available_for_use; we
+     * drop silently — equivalent outcome, less airtime burnt. */
+    if (state->port[y].medium == avb_port_medium_wifi &&
+        new_cls == AVB_SR_CLASS_A) {
+      continue;
+    }
+
+    int adm = avb_srp_admission_try_admit(y, new_cls, new_bps);
+    if (adm == 0) {
+      mrp_declare_talker_advertise(state, y, stream_id, dest, vlan, mfs,
+                                   propagate_class_b);
+    } else {
+      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
+                                insufficient_bandwidth_for_traffic_class,
+                                propagate_class_b);
+    }
+  }
+
+  /* Update the per-stream priority tracker so the next RX can detect
+   * subsequent class changes. */
+  if (ingress) {
+    if (do_admit_declare)
+      ingress->last_propagated_priority = new_priority;
+    else if (do_withdraw)
+      ingress->last_propagated_priority = 0;
+  }
+#else
+  (void)port; (void)attr_type; (void)tr;
+#endif
+}
+
+static void mrp_on_listener_registrar_change(
+    avb_state_s *state, int port, const msrp_listener_message_s *wire,
+    mrp_reg_transition_e tr, eth_addr_t *src_addr) {
+  /* §35.2.2.4.4 listener declaration nibble lives in event_decl_data[1]
+   * event1 (2 bits). Values match msrp_listener_event_t (1=AskingFailed,
+   * 2=Ready, 3=ReadyFailed). */
+  msrp_listener_event_t decl =
+      (msrp_listener_event_t)wire->event_decl_data[1].declaration.event1;
+  int attr_event = 0, unused1 = 0, unused2 = 0;
+  three_pe_to_int(wire->event_decl_data[0].event, &attr_event, &unused1,
+                  &unused2);
+
+  /* ----- Endpoint-side (talker-side) bookkeeping — runs every RX -----
+   * If this listener declaration is for one of our output streams,
+   * update the per-listener msrp_ready / asking_failed flags and
+   * start/stop streaming as appropriate. ACMP DISCONNECT_TX is
+   * authoritative for tearing down the listener entry itself;
+   * MSRP only flips the readiness flags. */
+  for (int i = 0; i < state->num_output_streams; i++) {
+    avb_talker_stream_s *stream = &state->output_streams[i];
+    if (memcmp(wire->stream_id, stream->stream_id, UNIQUE_ID_LEN) != 0)
+      continue;
+
+    /* Listener leaving — wire-level rLv. */
+    if (attr_event == mrp_attr_event_lv) {
+      int lidx = find_connected_listener(stream, src_addr);
+      if (lidx >= 0) {
+        avbinfo("MSRP: listener leaving stream %d", i);
+        stream->connected_listeners[lidx].msrp_ready = false;
+        stream->connected_listeners[lidx].asking_failed = false;
+        bool should_stop = !any_listener_ready(stream) ||
+                           (!state->config.milan_compliant &&
+                            !any_listener_acmp_connected(stream));
+        if (should_stop && stream->streaming) {
+          avb_stop_stream_out(state, i);
+        }
+      }
+      break;
+    }
+
+    /* Listener ready — Plain AVB starts only when both ACMP and MSRP
+     * agree that the listener is connected/ready. Milan Talkers do
+     * not maintain ACMP listener state; MSRP Listener Ready alone
+     * drives streaming. */
+    if (decl == msrp_listener_event_ready) {
+      int lidx = find_or_add_msrp_listener(state, stream, src_addr);
+      if (lidx < 0) {
+        avberr("MSRP: connected_listeners full for stream %d", i);
+        break;
+      }
+      bool was_ready = stream->connected_listeners[lidx].msrp_ready;
+      stream->connected_listeners[lidx].msrp_ready = true;
+      if (!was_ready) {
+        avbinfo("MSRP: listener ready for stream %d (count=%d, acmp=%d)", i,
+                octets_to_uint(stream->connection_count, 2),
+                stream->connected_listeners[lidx].acmp_connected);
+      }
+      stream->connected_listeners[lidx].asking_failed = false;
+      bool should_start =
+          state->config.milan_compliant
+              ? stream->connected_listeners[lidx].msrp_ready
+              : stream->connected_listeners[lidx].acmp_connected;
+      if (should_start && !stream->streaming) {
+        avb_start_stream_out(state, i);
+      }
+      break;
+    }
+
+    /* AskingFailed / ReadyFailed — track per-listener so ACMP
+     * GET_TX_STATE_RESPONSE can set REGISTERING_FAILED per Milan
+     * v1.3 Table 5.23. ready_failed is a transient MRP event with
+     * the same talker-side meaning; treat identically. */
+    if (decl == msrp_listener_event_asking_failed ||
+        decl == msrp_listener_event_ready_failed) {
+      int lidx = find_or_add_msrp_listener(state, stream, src_addr);
+      if (lidx < 0) {
+        avberr("MSRP: connected_listeners full for stream %d", i);
+        break;
+      }
+      if (!stream->connected_listeners[lidx].msrp_ready) {
+        stream->connected_listeners[lidx].msrp_ready = false;
+      }
+      stream->connected_listeners[lidx].asking_failed = true;
+      avbinfo("MSRP: listener %s for stream %d",
+              decl == msrp_listener_event_asking_failed ? "asking_failed"
+                                                         : "ready_failed",
+              i);
+      break;
+    }
+    break;
+  }
+
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  /* ----- Bridge MAP propagation — transition-edge only ----- */
+  if (tr == mrp_reg_transition_none) return;
+  if (state->port[port].type != avb_port_type_bridged) return;
+
+  const unique_id_t *stream_id = (const unique_id_t *)&wire->stream_id;
+  for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
+    if (y == port) continue;
+    if (state->port[y].type != avb_port_type_bridged) continue;
+
+    if (tr == mrp_reg_transition_deregister) {
+      mrp_withdraw_listener(state, y, stream_id);
+    } else {
+      mrp_declare_listener(state, y, stream_id, decl);
+    }
+  }
+#else
+  (void)port; (void)tr;
+#endif
+}
+
+static void mrp_on_domain_registrar_change(
+    avb_state_s *state, int port, const msrp_domain_message_s *wire,
+    mrp_reg_transition_e tr) {
+  /* ----- Endpoint-side validation — runs every RX -----
+   * The network's SR-class VLAN must match our own. Mismatches mean
+   * a configuration drift that will break MSRP path establishment;
+   * log loudly so the operator notices. */
+  uint16_t vid = octets_to_uint(wire->sr_class_vid, 2);
+  uint16_t mapping_index =
+      avb_msrp_mapping_index_for_class_id(wire->sr_class_id);
+  uint16_t our_vid =
+      octets_to_uint(state->msrp_mappings[mapping_index].vlan_id, 2);
+  if ((wire->sr_class_id == 6 || wire->sr_class_id == 5) && vid != our_vid) {
+    avberr("MSRP domain: class %d network VLAN %d != our VLAN %d",
+           wire->sr_class_id, vid, our_vid);
+  }
+
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  /* ----- Bridge MAP propagation — transition-edge only ----- */
+  if (tr == mrp_reg_transition_none) return;
+  if (state->port[port].type != avb_port_type_bridged) return;
+
+  for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
+    if (y == port) continue;
+    if (state->port[y].type != avb_port_type_bridged) continue;
+
+    if (tr == mrp_reg_transition_deregister) {
+      /* No mrp_withdraw_domain API — MSRP domain entries are
+       * essentially static SR-class config (§35.2.2.10). Leave the
+       * propagated copy in place; LeaveAll will eventually cycle it
+       * if it's truly gone. */
+      continue;
+    }
+    mrp_declare_domain(state, y, wire->sr_class_id, wire->sr_class_priority,
+                       wire->sr_class_vid);
+  }
+#else
+  (void)port; (void)tr;
+#endif
+}
+
 /* Dispatch rLA to every SM on this port. Called when a received
  * MRPDU carries the LeaveAll bit. */
 static void msrp_dispatch_leaveall(int port) {
@@ -571,12 +1096,15 @@ static void msrp_dispatch_leaveall(int port) {
 }
 
 /* Process one TALKER_ADVERTISE or TALKER_FAILED attribute, including
- * its 3pe event vector. */
-static void msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
-                                const msrp_talker_message_u *wire) {
+ * its 3pe event vector. Returns the Registrar transition (register
+ * /deregister edge) so the caller can fire the MAP / application
+ * callback only on transition edges, not on every RX. */
+static mrp_reg_transition_e msrp_rx_talker_attr(
+    int port, msrp_attr_type_t attr_type,
+    const msrp_talker_message_u *wire) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, (const unique_id_t *)&wire->talker.info.stream_id, attr_type);
-  if (e == NULL) return; /* table full */
+  if (e == NULL) return mrp_reg_transition_none; /* table full */
   memcpy(&e->wire, wire, sizeof(*wire));
   /* Decode the 3pe vector. event_data[] is at the same offset in
    * both talker_adv and talker_failed (after the per-type info
@@ -587,33 +1115,41 @@ static void msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
   /* For MSRP, num_vals is almost always 1, so only the first event
    * in the first 3pe slot is meaningful. The remaining e2/e3 carry
    * 6 (no-op) per the spec when num_vals < 3. */
+  mrp_registrar_state_e before = e->sm.registrar;
   mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
+  return mrp_reg_transition(before, e->sm.registrar);
 }
 
 /* Process one LISTENER attribute. */
-static void msrp_rx_listener_attr(int port, const msrp_listener_message_s *wire) {
+static mrp_reg_transition_e msrp_rx_listener_attr(
+    int port, const msrp_listener_message_s *wire) {
   msrp_listener_entry_t *e = msrp_listener_find_or_insert(
       port, (const unique_id_t *)&wire->stream_id);
-  if (e == NULL) return;
+  if (e == NULL) return mrp_reg_transition_none;
   memcpy(&e->wire, wire, sizeof(*wire));
   /* event_decl_data[0] carries both the 3pe attribute event and the
    * 4pe listener-declaration nibble. Decode the attribute event. */
   int e1, e2, e3;
   three_pe_to_int(wire->event_decl_data[0].event, &e1, &e2, &e3);
+  mrp_registrar_state_e before = e->sm.registrar;
   mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
   /* The listener-declaration (asking_failed / ready / ready_failed)
    * lives in event_decl_data[1].declaration per the spec; cutover
    * will copy it into e->decl_event. */
+  return mrp_reg_transition(before, e->sm.registrar);
 }
 
 /* Process one DOMAIN attribute. */
-static void msrp_rx_domain_attr(int port, const msrp_domain_message_s *wire) {
+static mrp_reg_transition_e msrp_rx_domain_attr(
+    int port, const msrp_domain_message_s *wire) {
   msrp_domain_entry_t *e = msrp_domain_find_or_insert(port, wire->sr_class_id);
-  if (e == NULL) return;
+  if (e == NULL) return mrp_reg_transition_none;
   memcpy(&e->wire, wire, sizeof(*wire));
   int e1, e2, e3;
   three_pe_to_int(wire->attr_event[0], &e1, &e2, &e3);
+  mrp_registrar_state_e before = e->sm.registrar;
   mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
+  return mrp_reg_transition(before, e->sm.registrar);
 }
 
 /* Walk an inbound MSRP buffer and dispatch SM events + run the
@@ -646,25 +1182,27 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
     case msrp_attr_type_domain: {
       msrp_domain_message_s wire;
       memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      msrp_rx_domain_attr(port, &wire);
-      avb_process_msrp_domain(state, msg, offset, attr_size);
+      mrp_reg_transition_e tr = msrp_rx_domain_attr(port, &wire);
+      /* Fire unconditionally: the callback runs endpoint validation
+       * every RX and gates MAP propagation on `tr` internally. */
+      mrp_on_domain_registrar_change(state, port, &wire, tr);
       break;
     }
     case msrp_attr_type_talker_advertise:
     case msrp_attr_type_talker_failed: {
       msrp_talker_message_u wire;
       memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      msrp_rx_talker_attr(port, header.attr_type, &wire);
-      avb_process_msrp_talker(
-          state, msg, offset, attr_size,
-          header.attr_type == msrp_attr_type_talker_failed, src_addr);
+      mrp_reg_transition_e tr =
+          msrp_rx_talker_attr(port, header.attr_type, &wire);
+      mrp_on_talker_registrar_change(state, port, header.attr_type,
+                                     &wire, tr, src_addr);
       break;
     }
     case msrp_attr_type_listener: {
       msrp_listener_message_s wire;
       memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      msrp_rx_listener_attr(port, &wire);
-      avb_process_msrp_listener(state, msg, offset, attr_size, src_addr);
+      mrp_reg_transition_e tr = msrp_rx_listener_attr(port, &wire);
+      mrp_on_listener_registrar_change(state, port, &wire, tr, src_addr);
       break;
     }
     default:
@@ -688,7 +1226,8 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size) {
+                                  uint16_t max_frame_size,
+                                  bool class_b) {
   memcpy(info->stream_id, stream_id, UNIQUE_ID_LEN);
   memcpy(info->stream_dest_addr, stream_dest_addr, ETH_ADDR_LEN);
   memcpy(info->vlan_id, vlan_id, 2);
@@ -696,13 +1235,15 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
   int_to_octets(&tspec_mfs, info->tspec_max_frame_size, 2);
   int tspec_mfi = 1;
   int_to_octets(&tspec_mfi, info->tspec_max_frame_interval, 2);
-  uint16_t mapping_index = 0;
-  for (uint16_t i = 0; i < state->msrp_mappings_count; i++) {
-    if (memcmp(vlan_id, state->msrp_mappings[i].vlan_id, 2) == 0) {
-      mapping_index = i;
-      break;
-    }
-  }
+  /* SR-class mapping: index 0 = Class A (priority 3), index 1 = Class B
+   * (priority 2) per the §35.2.2.8.2.3 default mappings. Caller passes
+   * class_b explicitly — endpoint origination derives it from the
+   * output_stream's stream_info_flags.class_b (set by the ACMP CONNECT
+   * handler from the CLASS_B flag bit), and bridge MAP derives it from
+   * the inbound TALKER_ADVERTISE priority. The legacy "match by VLAN"
+   * heuristic doesn't work when both classes share a VLAN. */
+  uint16_t mapping_index = class_b ? 1 : 0;
+  if (mapping_index >= state->msrp_mappings_count) mapping_index = 0;
   info->priority = state->msrp_mappings[mapping_index].priority;
   info->rank = 1;
   int accumulated_latency = 15000;
@@ -729,13 +1270,14 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size) {
+                                  uint16_t max_frame_size,
+                                  bool class_b) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, stream_id, msrp_attr_type_talker_advertise);
   if (e == NULL) return;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker.info, stream_id,
-                        stream_dest_addr, vlan_id, max_frame_size);
+                        stream_dest_addr, vlan_id, max_frame_size, class_b);
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_port_arm_join_timer(state, port);
 }
@@ -745,13 +1287,14 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const eth_addr_t *stream_dest_addr,
                                const uint8_t *vlan_id,
                                uint16_t max_frame_size,
-                               uint8_t failure_code) {
+                               uint8_t failure_code,
+                               bool class_b) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, stream_id, msrp_attr_type_talker_failed);
   if (e == NULL) return;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker_failed.info, stream_id,
-                        stream_dest_addr, vlan_id, max_frame_size);
+                        stream_dest_addr, vlan_id, max_frame_size, class_b);
   e->wire.talker_failed.failure_code = failure_code;
   /* failure_bridge_id is left zero — the bridge will populate it when
    * it generates a real TALKER_FAILED. */
@@ -933,6 +1476,11 @@ static void mrp_tx_flush_domain(avb_state_s *state, int port,
   avb_send_msrp_attr(state, &msg, attr_list_len, "domain");
 }
 
+/* MVRP per-port flush, defined in §7. Iterates s_mvrp_vlans[port]
+ * and emits any MVRP attribute SMs with pending TX. */
+static void mrp_tx_flush_mvrp(avb_state_s *state, int port, bool leaveall,
+                              mrp_event_e tx_ev);
+
 /* Walks all per-attribute SMs on this port, fires tx! to drive them
  * through Applicant transitions, and emits PDUs for those that
  * resolve to a non-none TX action. */
@@ -970,6 +1518,10 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
       e->sm.pending_tx = mrp_tx_none;
     }
   }
+
+  /* MVRP attributes share the same per-port LeaveAll flag — the
+   * fan-out happens inside mrp_tx_flush_mvrp using the same tx_ev. */
+  mrp_tx_flush_mvrp(state, port, leaveall, tx_ev);
 
   p->mrp_leaveall_tx_pending = false;
 }
@@ -1014,33 +1566,190 @@ uint32_t cip_sfc_to_sample_rate(uint8_t sfc) {
   }
 }
 
-int avb_send_mvrp_vlan_id(avb_state_s *state, mrp_attr_event_t attr_event,
-                          bool leave_all) {
-  mvrp_vlan_id_message_s msg;
-  struct timespec ts;
-  int ret;
-  uint16_t mapping_index = avb_msrp_mapping_index_for_class(false);
-  memset(&msg, 0, sizeof(msg));
+/* ===== §7  MVRP application =====
+ *
+ * VLAN registration per IEEE 802.1Q-2018 §11. MVRP has a single
+ * attribute type (vlan_identifier), no per-class semantics, and no
+ * admission control — the application layer is dramatically simpler
+ * than MSRP. The same generic MRP SMs (§1) drive Applicant/Registrar
+ * state per VLAN ID per port; the helpers below mirror the §6
+ * pattern for MSRP.
+ *
+ * Wire layout per §11.2.3.2: one MVRP attribute per PDU in the
+ * common case (num_vals=1). MaxNumValues per the spec allows packing
+ * multiple VIDs but our peers don't, so we don't either — keeps the
+ * encode/decode trivial.
+ */
 
-  // Populate the message
+#define MVRP_VLAN_TABLE_SIZE 4 /* small; typical use is 1–2 VLANs */
+
+typedef struct {
+  bool valid;
+  uint8_t vlan_id[2]; /* big-endian, network order */
+  mrp_sm_state_t sm;
+} mvrp_vlan_entry_t;
+
+static mvrp_vlan_entry_t
+    s_mvrp_vlans[CONFIG_ESP_AVB_NUM_PORTS][MVRP_VLAN_TABLE_SIZE];
+
+static bool vlan_id_eq(const uint8_t *a, const uint8_t *b) {
+  return a[0] == b[0] && a[1] == b[1];
+}
+
+static mvrp_vlan_entry_t *mvrp_vlan_find(int port, const uint8_t *vlan_id) {
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
+    mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
+    if (e->valid && vlan_id_eq(e->vlan_id, vlan_id)) return e;
+  }
+  return NULL;
+}
+
+static mvrp_vlan_entry_t *mvrp_vlan_find_or_insert(int port,
+                                                   const uint8_t *vlan_id) {
+  mvrp_vlan_entry_t *e = mvrp_vlan_find(port, vlan_id);
+  if (e != NULL) return e;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
+    mvrp_vlan_entry_t *slot = &s_mvrp_vlans[port][i];
+    if (!slot->valid) {
+      memset(slot, 0, sizeof(*slot));
+      slot->valid = true;
+      memcpy(slot->vlan_id, vlan_id, 2);
+      slot->sm.applicant = mrp_applicant_vo;
+      slot->sm.registrar = mrp_registrar_mt;
+      slot->sm.pending_tx = mrp_tx_none;
+      return slot;
+    }
+  }
+  return NULL; /* table full */
+}
+
+/* Dispatch rLA to every MVRP SM on this port. Called when a received
+ * MVRP MRPDU carries the LeaveAll bit. */
+static void mvrp_dispatch_leaveall(int port) {
+  for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
+    if (s_mvrp_vlans[port][i].valid) {
+      mrp_sm_step(&s_mvrp_vlans[port][i].sm, mrp_event_r_la);
+    }
+  }
+}
+
+/* MAP transition callback for MVRP — parallel to mrp_on_talker_/
+ * listener_/domain_registrar_change in §6a. Fires only on Registrar
+ * register/deregister edges. Bridge mode re-declares VLAN membership
+ * on every other bridged port so a peer's VLAN registration on one
+ * port flows out the other ports as well. No admission gate — MVRP
+ * has no per-class semantics. */
+static void mrp_on_vlan_registrar_change(avb_state_s *state, int port,
+                                         const uint8_t *vlan_id,
+                                         mrp_reg_transition_e tr) {
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  if (state->port[port].type != avb_port_type_bridged) return;
+  for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
+    if (y == port) continue;
+    if (state->port[y].type != avb_port_type_bridged) continue;
+    if (tr == mrp_reg_transition_register) {
+      mrp_declare_vlan(state, y, vlan_id);
+    } else {
+      mrp_withdraw_vlan(state, y, vlan_id);
+    }
+  }
+#else
+  (void)state; (void)port; (void)vlan_id; (void)tr;
+#endif
+}
+
+/* Single MVRP RX entry point. The wire struct as-defined carries one
+ * vlan_id slot, so we treat each PDU as a single attribute (num_vals
+ * effectively forced to 1). avb_process_rx_message calls this for
+ * every MVRP frame; no legacy reaction layer to coexist with.
+ *
+ * The Registrar transition is computed across mrp_sm_step so the MAP
+ * callback only fires on register/deregister edges, not per RX. */
+void mrp_rx_mvrp(avb_state_s *state, int port, mvrp_vlan_id_message_s *msg,
+                 size_t length, eth_addr_t *src_addr) {
+  (void)length; (void)src_addr;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  if (msg->header.attr_type != mvrp_attr_type_vlan_identifier) return;
+
+  if (msg->header.vechead_leaveall) {
+    mvrp_dispatch_leaveall(port);
+  }
+
+  mvrp_vlan_entry_t *e = mvrp_vlan_find_or_insert(port, msg->vlan_id);
+  if (e == NULL) return;
+
+  int e1, e2, e3;
+  three_pe_to_int(msg->attr_event[0], &e1, &e2, &e3);
+  mrp_registrar_state_e before = e->sm.registrar;
+  mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
+  mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
+  if (tr != mrp_reg_transition_none) {
+    mrp_on_vlan_registrar_change(state, port, msg->vlan_id, tr);
+  }
+}
+
+/* SM-driven origination. Idempotent — repeat calls keep the
+ * Applicant alive (Join!), first call seeds it (New!). */
+void mrp_declare_vlan(avb_state_s *state, int port,
+                      const uint8_t *vlan_id) {
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  mvrp_vlan_entry_t *e = mvrp_vlan_find_or_insert(port, vlan_id);
+  if (e == NULL) return;
+  mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
+  mrp_port_arm_join_timer(state, port);
+}
+
+void mrp_withdraw_vlan(avb_state_s *state, int port,
+                       const uint8_t *vlan_id) {
+  mvrp_vlan_entry_t *e = mvrp_vlan_find(port, vlan_id);
+  if (e == NULL) return;
+  mrp_applicant_step(&e->sm, mrp_event_lv);
+  mrp_port_arm_join_timer(state, port);
+}
+
+/* Per-attribute TX builder: emit one MVRP MRPDU for one VLAN entry.
+ * MVRP PDUs only carry one attribute type so each entry maps 1:1 to
+ * its own frame on the wire. */
+static void mvrp_tx_emit(avb_state_s *state, int port, mvrp_vlan_entry_t *e,
+                         bool leaveall) {
+  mvrp_vlan_id_message_s msg;
+  memset(&msg, 0, sizeof(msg));
   msg.protocol_ver = 0;
   msg.header.attr_type = mvrp_attr_type_vlan_identifier;
   msg.header.attr_len = 2;
-  msg.header.vechead_leaveall = leave_all;
-  msg.header.vechead_padding = 0;
+  msg.header.vechead_leaveall = leaveall ? 1 : 0;
   msg.header.vechead_num_vals = 1;
-  memcpy(msg.vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
-  msg.attr_event[0] = int_to_3pe(attr_event, 0, 0);
-  uint16_t msg_len =
-      8 + 2 + 2; // all of the above + end mark list and end mark msg
-
-  // send the message
-  ret = avb_net_send(state, ethertype_mvrp, &msg, msg_len, &ts);
-  if (ret < 0) {
-    avberr("send MVRP VLAN ID failed: %d", errno);
-    return ret;
+  memcpy(msg.vlan_id, e->vlan_id, 2);
+  int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
+  if (pe < 0) return;
+  msg.attr_event[0] = int_to_3pe(pe, 0, 0);
+  if (s_mrp_tx_shadow) {
+    avbinfo("mrp shadow: would TX vlan %s (port %d, pe=%d, vid=%u)",
+            mrp_tx_action_name(e->sm.pending_tx), port, pe,
+            (msg.vlan_id[0] << 8) | msg.vlan_id[1]);
+    return;
   }
-  return OK;
+  /* MVRP MRPDU size, matching the legacy avb_send_mvrp_vlan_id:
+   *   protocol_ver(1) + header(4) + vlan_id(2) + attr_event(1)
+   *   + end-mark-list(2) + end-mark-msg(2) = 12. */
+  struct timespec ts;
+  (void)avb_net_send_on(state, port, ethertype_mvrp, &msg, 12, &ts);
+}
+
+/* Per-port MVRP flush, called from mrp_tx_flush_port (§6c). */
+static void mrp_tx_flush_mvrp(avb_state_s *state, int port, bool leaveall,
+                              mrp_event_e tx_ev) {
+  for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
+    mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
+    if (!e->valid) continue;
+    mrp_applicant_step(&e->sm, tx_ev);
+    if (e->sm.pending_tx != mrp_tx_none) {
+      mvrp_tx_emit(state, port, e, leaveall);
+      e->sm.pending_tx = mrp_tx_none;
+    }
+  }
 }
 
 
@@ -1245,324 +1954,6 @@ void avb_maap_tick(avb_state_s *state) {
   }
 }
 
-/* Process received MSRP domain message */
-int avb_process_msrp_domain(avb_state_s *state, msrp_msgbuf_s *msg, int offset,
-                            size_t length) {
-  msrp_domain_message_s domain;
-  memset(&domain, 0, sizeof(domain));
-  memcpy(&domain, &msg->messages_raw[offset], sizeof(msrp_domain_message_s));
-
-  uint16_t vid = octets_to_uint(domain.sr_class_vid, 2);
-  uint16_t mapping_index =
-      avb_msrp_mapping_index_for_class_id(domain.sr_class_id);
-  uint16_t our_vid = octets_to_uint(state->msrp_mappings[mapping_index].vlan_id, 2);
-
-  /* Log and validate — the network's SR class must match ours */
-  if ((domain.sr_class_id == 6 || domain.sr_class_id == 5) && vid != our_vid) {
-    avberr("MSRP domain: class %d network VLAN %d != our VLAN %d",
-           domain.sr_class_id, vid, our_vid);
-  }
-  return OK;
-}
-
-/* Process received MSRP talker advertise message */
-int avb_process_msrp_talker(avb_state_s *state, msrp_msgbuf_s *msg_data,
-                            int offset, size_t length, bool is_failed,
-                            eth_addr_t *src_addr) {
-  msrp_talker_message_u msg;
-  memset(&msg, 0, sizeof(msrp_talker_message_u));
-  memcpy(&msg, &msg_data->messages_raw[offset], sizeof(msrp_talker_message_u));
-
-  // get the talker addr from the stream id
-  eth_addr_t talker_addr;
-  memcpy(&talker_addr, msg.talker.info.stream_id, ETH_ADDR_LEN);
-
-#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
-  /* Bridge admission control. A TALKER_ADVERTISE arriving on one port
-   * would be re-declared by the bridge MAP on the other port; before
-   * propagating, check that the egress port has the budget for it. If
-   * not, the bridge re-declares as TALKER_FAILED with failure_code =
-   * insufficient_bandwidth_for_traffic_class (IEEE 802.1Q-2018
-   * §35.2.2.8.4 and Table 35-7).
-   *
-   * is_failed=true means the upstream side already gave up; nothing
-   * to admit.
-   *
-   * TODO: derive ingress port from the L2 forwarder so egress is
-   * !ingress instead of always port 1. For now assume worst-case
-   * egress — the Wi-Fi port (port 1 when NUM_PORTS=2). */
-  if (!is_failed && CONFIG_ESP_AVB_NUM_PORTS > 1) {
-    avb_sr_class_e cls =
-        (msg.talker.info.priority == 3) ? AVB_SR_CLASS_A : AVB_SR_CLASS_B;
-    uint16_t mfs =
-        (uint16_t)octets_to_uint(msg.talker.info.tspec_max_frame_size, 2);
-    uint16_t mfi = (uint16_t)octets_to_uint(
-        msg.talker.info.tspec_max_frame_interval, 2);
-    /* Observation interval per SR class:
-     *   Class A = 125 µs → 8000 intervals/s
-     *   Class B = 250 µs → 4000 intervals/s
-     * Bandwidth = max_frame_size × frames_per_interval × intervals/s × 8. */
-    uint32_t intervals_per_sec = (cls == AVB_SR_CLASS_A) ? 8000u : 4000u;
-    uint32_t request_bps =
-        (uint32_t)mfs * (uint32_t)mfi * intervals_per_sec * 8u;
-
-    int egress_port = 1; /* TODO: replace with !ingress_port */
-    int adm = avb_srp_admission_try_admit(egress_port, cls, request_bps);
-    if (adm < 0) {
-      avbwarn("MSRP TALKER over budget on port %d class %s: %u bps; "
-              "re-declaring as TALKER_FAILED",
-              egress_port, (cls == AVB_SR_CLASS_A) ? "A" : "B",
-              (unsigned)request_bps);
-
-      /* Re-declare as TALKER_FAILED on the egress side. Build the
-       * full failed message directly so we can set failure_code =
-       * insufficient_bandwidth_for_traffic_class (the existing
-       * avb_send_msrp_talker hard-codes failure_code = 0). */
-      msrp_talker_message_u failed;
-      memset(&failed, 0, sizeof(failed));
-      failed.header.attr_type = msrp_attr_type_talker_failed;
-      failed.header.attr_len = 34;
-      int attr_list_len = 38;
-      int_to_octets(&attr_list_len, failed.header.attr_list_len, 2);
-      failed.header.vechead_num_vals = 1;
-      memcpy(&failed.talker_failed.info, &msg.talker.info,
-             sizeof(talker_adv_info_s));
-      memcpy(failed.talker_failed.failure_bridge_id,
-             state->port[0].internal_mac_addr, ETH_ADDR_LEN);
-      failed.talker_failed.failure_code =
-          insufficient_bandwidth_for_traffic_class;
-      failed.talker_failed.event_data[0] = int_to_3pe(mrp_attr_event_new, 0, 0);
-      avb_send_msrp_attr(state, &failed, attr_list_len, "Talker Failed");
-      return OK;
-    }
-  }
-#endif /* CONFIG_ESP_AVB_ROLE_BRIDGE */
-
-  // If the talker is known then update talker info
-  int index =
-      avb_find_entity_by_addr(state, &talker_addr, avb_entity_type_talker);
-  if (index >= 0) {
-    memcpy(&state->talkers[index].info, &msg.talker.info,
-           sizeof(talker_adv_info_s));
-  }
-
-  /* Propagate the SRP-accumulated latency onto any listener input_stream
-   * with a matching stream_id. This is the authoritative end-to-end
-   * max_transit_time (talker origination + bridge hops), per
-   * IEEE 802.1Qat / Milan §5.4. avb_start_stream_in reads it at connect
-   * time to size the presentation-time startup fill.
-   * Guard against a zero-stream-id malformed MSRP packet matching an
-   * unconnected slot's zeroed stream_id. */
-  static const uint8_t zero_stream_id[UNIQUE_ID_LEN] = {0};
-  if (memcmp(msg.talker.info.stream_id, zero_stream_id, UNIQUE_ID_LEN) != 0) {
-    for (int i = 0; i < AVB_MAX_NUM_INPUT_STREAMS; i++) {
-      if (memcmp(state->input_streams[i].stream_id, msg.talker.info.stream_id,
-                 UNIQUE_ID_LEN) == 0) {
-        memcpy(state->input_streams[i].msrp_accumulated_latency,
-               msg.talker.info.accumulated_latency, 4);
-        break;
-      }
-    }
-  }
-  return OK;
-}
-
-/* Find a connected listener by MAC address in a stream's listener list.
- * Returns index or -1 if not found. */
-static int find_connected_listener(avb_talker_stream_s *stream,
-                                   eth_addr_t *mac_addr) {
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
-    if (memcmp(stream->connected_listeners[i].mac_addr, mac_addr,
-               ETH_ADDR_LEN) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-static int find_connected_listener_by_entity(avb_talker_stream_s *stream,
-                                             const unique_id_t entity_id) {
-  static const unique_id_t zero_id = {0};
-  if (memcmp(entity_id, zero_id, UNIQUE_ID_LEN) == 0)
-    return -1;
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
-    if (memcmp(stream->connected_listeners[i].identity.id, entity_id,
-               UNIQUE_ID_LEN) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-/* Add a listener to a stream's connected_listeners list.
- * Returns index of added entry, or -1 if full. */
-static int add_connected_listener(avb_talker_stream_s *stream,
-                                  eth_addr_t *mac_addr) {
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  if (count >= AVB_MAX_NUM_CONNECTED_LISTENERS)
-    return -1;
-  memcpy(stream->connected_listeners[count].mac_addr, mac_addr, ETH_ADDR_LEN);
-  count++;
-  int_to_octets(&count, stream->connection_count, 2);
-  return count - 1;
-}
-
-/* Resolve/merge an MSRP listener declaration (known by source MAC) with any
- * existing ACMP CONNECT_TX state (known by listener entity_id/uid).  Streaming
- * is allowed only when both halves are present: MSRP Ready + ACMP connected. */
-static int find_or_add_msrp_listener(avb_state_s *state,
-                                     avb_talker_stream_s *stream,
-                                     eth_addr_t *mac_addr) {
-  int idx = find_connected_listener(stream, mac_addr);
-  if (idx >= 0)
-    return idx;
-
-  int listener_idx = avb_find_entity_by_addr(state, mac_addr,
-                                             avb_entity_type_listener);
-  if (listener_idx != NOT_FOUND) {
-    idx = find_connected_listener_by_entity(
-        stream, state->listeners[listener_idx].entity_id);
-    if (idx >= 0) {
-      memcpy(stream->connected_listeners[idx].mac_addr, mac_addr,
-             ETH_ADDR_LEN);
-      return idx;
-    }
-  }
-
-  idx = add_connected_listener(stream, mac_addr);
-  if (idx >= 0 && listener_idx != NOT_FOUND) {
-    memcpy(stream->connected_listeners[idx].identity.id,
-           state->listeners[listener_idx].entity_id, UNIQUE_ID_LEN);
-    memset(stream->connected_listeners[idx].identity.uid, 0, 2);
-  }
-  return idx;
-}
-
-static bool any_listener_ready(avb_talker_stream_s *stream) {
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
-    if (stream->connected_listeners[i].msrp_ready) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static bool any_listener_acmp_connected(avb_talker_stream_s *stream) {
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
-    if (stream->connected_listeners[i].acmp_connected) {
-      return true;
-    }
-  }
-  return false;
-}
-
-
-/* Process received MSRP listener message.
- * As a talker, this tells us a listener has declared ready/asking_failed
- * for one of our streams. Drives streaming start/stop decisions. */
-int avb_process_msrp_listener(avb_state_s *state, msrp_msgbuf_s *msg,
-                              int offset, size_t length,
-                              eth_addr_t *src_addr) {
-  msrp_listener_message_s listener_msg;
-  memset(&listener_msg, 0, sizeof(listener_msg));
-  memcpy(&listener_msg, &msg->messages_raw[offset],
-         sizeof(msrp_listener_message_s));
-
-  /* Decode the MRP attribute event and listener declaration */
-  int attr_event = 0, unused1 = 0, unused2 = 0;
-  three_pe_to_int(listener_msg.event_decl_data[0].event, &attr_event, &unused1,
-                  &unused2);
-  uint8_t listener_decl = listener_msg.event_decl_data[1].declaration.event1;
-
-  /* Check if this listener declaration is for one of our output streams */
-  for (int i = 0; i < state->num_output_streams; i++) {
-    avb_talker_stream_s *stream = &state->output_streams[i];
-    if (memcmp(listener_msg.stream_id, stream->stream_id, UNIQUE_ID_LEN) != 0)
-      continue;
-
-    /* Listener leaving — clear MSRP readiness, but keep ACMP identity/state.
-     * ACMP DISCONNECT_TX is authoritative for removing the listener entry. */
-    if (attr_event == mrp_attr_event_lv) {
-      int idx = find_connected_listener(stream, src_addr);
-      if (idx >= 0) {
-        avbinfo("MSRP: listener leaving stream %d", i);
-        stream->connected_listeners[idx].msrp_ready = false;
-        stream->connected_listeners[idx].asking_failed = false;
-        bool should_stop = !any_listener_ready(stream) ||
-                           (!state->config.milan_compliant &&
-                            !any_listener_acmp_connected(stream));
-        if (should_stop && stream->streaming) {
-          avb_stop_stream_out(state, i);
-        }
-      }
-      return OK;
-    }
-
-    /* Listener ready — add/merge MSRP state. Only start once ACMP has also
-     * connected this listener. This prevents stale periodic MSRP Ready
-     * re-declarations from restarting a stream after ACMP disconnect/stop. */
-    if (listener_decl == msrp_listener_event_ready) {
-      int idx = find_or_add_msrp_listener(state, stream, src_addr);
-      if (idx < 0) {
-        avberr("MSRP: connected_listeners full for stream %d", i);
-        return OK;
-      }
-      bool was_ready = stream->connected_listeners[idx].msrp_ready;
-      stream->connected_listeners[idx].msrp_ready = true;
-      if (!was_ready) {
-        avbinfo("MSRP: listener ready for stream %d (count=%d, acmp=%d)", i,
-                octets_to_uint(stream->connection_count, 2),
-                stream->connected_listeners[idx].acmp_connected);
-      }
-      /* Clear any stale asking_failed state — the listener moved out of
-       * that declaration and into Ready. */
-      stream->connected_listeners[idx].asking_failed = false;
-      /* Plain AVB starts only when both ACMP and MSRP agree that the listener is
-       * connected/ready. Milan Talkers do not maintain ACMP listener state;
-       * MSRP Listener Ready alone drives streaming. */
-      bool should_start = state->config.milan_compliant
-                              ? stream->connected_listeners[idx].msrp_ready
-                              : stream->connected_listeners[idx].acmp_connected;
-      if (should_start && !stream->streaming) {
-        avb_start_stream_out(state, i);
-      }
-      return OK;
-    }
-
-    /* Listener asking_failed — track per-listener so ACMP
-     * GET_TX_STATE_RESPONSE can set REGISTERING_FAILED per Milan
-     * v1.3 Table 5.23. ready_failed is a transient MRP event with
-     * the same meaning at the talker side; treat identically. */
-    if (listener_decl == msrp_listener_event_asking_failed ||
-        listener_decl == msrp_listener_event_ready_failed) {
-      int idx = find_or_add_msrp_listener(state, stream, src_addr);
-      if (idx < 0) {
-        avberr("MSRP: connected_listeners full for stream %d", i);
-        return OK;
-      }
-      if (!stream->connected_listeners[idx].msrp_ready) {
-        /* New listener arriving directly in a failed state. Track it, but
-         * don't start streaming. */
-        stream->connected_listeners[idx].msrp_ready = false;
-      }
-      stream->connected_listeners[idx].asking_failed = true;
-      avbinfo("MSRP: listener %s for stream %d",
-              listener_decl == msrp_listener_event_asking_failed
-                  ? "asking_failed"
-                  : "ready_failed",
-              i);
-      return OK;
-    }
-    return OK;
-  }
-
-  return OK;
-}
-
 /* Process received AVTP IEC 61883 message */
 int avb_process_iec_61883(avb_state_s *state, iec_61883_6_message_s *msg) {
   return OK;
@@ -1669,10 +2060,11 @@ static avb_admission_class_s
 
 int avb_srp_admission_init(avb_state_s *state) {
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
+    /* Per-port link rate from the new typology. link_speed_mbps is the
+     * nominal PHY-rate cap (1000 for gigabit eth, ~150 for Wi-Fi 6 STA).
+     * Falls back to 0 if unset (admission then rejects all on this port). */
+    uint32_t link_rate = (uint32_t)state->port[p].link_speed_mbps * 1000000u;
     for (int c = 0; c < AVB_SR_CLASS_COUNT; c++) {
-      uint32_t link_rate = (state->port[p].medium == avb_port_medium_ethernet)
-                               ? 1000000000u
-                               : 0u;
       s_admission[p][c].link_rate_bps = link_rate;
       s_admission[p][c].admitted_bps = 0;
       s_admission[p][c].cap_bps = link_rate * 3u / 4u;

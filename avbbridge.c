@@ -26,6 +26,23 @@ static const char *TAG = "avb_bridge";
 static TaskHandle_t s_bridge_task = NULL;
 static volatile bool s_bridge_stop = false;
 
+/* STA-association counter for the SoftAP. The bridge application
+ * (which owns esp_wifi event handling) calls
+ * avb_bridge_set_wifi_ap_sta_count() on WIFI_EVENT_AP_STA{CONNECTED,
+ * DISCONNECTED}; mrp.c's LeaveAll suppression reads it via the getter.
+ * Kept here as an integer counter rather than a Wi-Fi event handler
+ * so esp_avb avoids a hard esp_wifi PRIV_REQUIRES — Wi-Fi headers
+ * stay in the application layer. */
+static volatile unsigned int s_wifi_ap_sta_count = 0;
+
+unsigned int avb_bridge_wifi_ap_sta_count(void) {
+  return s_wifi_ap_sta_count;
+}
+
+void avb_bridge_set_wifi_ap_sta_count(unsigned int count) {
+  s_wifi_ap_sta_count = count;
+}
+
 static void bridge_task(void *arg) {
   avb_state_s *state = (avb_state_s *)arg;
   ESP_LOGI(TAG, "bridge L2 forwarding task started; ports=%d",

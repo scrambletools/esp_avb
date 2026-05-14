@@ -42,6 +42,16 @@ int avb_bridge_init(avb_state_s *state);
  * call from any task context. */
 void avb_bridge_stop(avb_state_s *state);
 
+/* Number of STAs currently associated with the bridge's SoftAP.
+ * Used by the MRP LeaveAll suppression heuristic — there's no point
+ * burning Wi-Fi airtime cycling registrations while no client is
+ * listening. The bridge application (which owns Wi-Fi event handling)
+ * is responsible for keeping this in sync via the setter, typically
+ * incremented on WIFI_EVENT_AP_STACONNECTED and decremented on
+ * WIFI_EVENT_AP_STADISCONNECTED. */
+unsigned int avb_bridge_wifi_ap_sta_count(void);
+void avb_bridge_set_wifi_ap_sta_count(unsigned int count);
+
 /* Per-frame disposition decision computed in avb_bridge_classify().
  * The forwarding integration in avbnet.c (called from the EMAC RX
  * trampoline when CONFIG_ESP_AVB_ROLE_BRIDGE is selected) acts on

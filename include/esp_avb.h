@@ -47,6 +47,35 @@ typedef enum {
   avb_port_medium_wifi = 1,
 } avb_port_medium_e;
 
+/* Port-host-interface. How the port attaches to the host SoC.
+ * Determines timestamp accuracy, latency floor, admission budget.
+ * Mirrors ptp_port_host_if_e in esp_ptp. */
+typedef enum {
+  avb_port_host_if_emac  = 0,   /* on-chip MAC, RMII/RGMII; hardware TS */
+  avb_port_host_if_ahb   = 1,   /* on-chip peripheral (native Wi-Fi) */
+  avb_port_host_if_sdio  = 2,   /* external coprocessor over SDIO */
+  avb_port_host_if_spi   = 3,   /* external Eth/Wi-Fi over SPI */
+  avb_port_host_if_usb   = 4,   /* USB-attached */
+  avb_port_host_if_other = 5,
+} avb_port_host_if_e;
+
+/* Port type — role in the AVB topology. Any port with type=bridged
+ * implies the entity is in bridge mode (mirror of ESP_AVB_ROLE_BRIDGE). */
+typedef enum {
+  avb_port_type_primary  = 0,
+  avb_port_type_failover = 1,
+  avb_port_type_bridged  = 2,
+} avb_port_type_e;
+
+/* Wi-Fi mode for medium=wifi ports. Numeric values match IDF's
+ * WIFI_IF_STA=0 / WIFI_IF_AP=1 so the field doubles as the wifi_if
+ * argument to esp_wifi_internal_tx. NONE is the sentinel for non-wifi. */
+typedef enum {
+  avb_port_wifi_mode_sta  = 0,
+  avb_port_wifi_mode_ap   = 1,
+  avb_port_wifi_mode_none = 0xFF,
+} avb_port_wifi_mode_e;
+
 /* How the port's slave-side time is synchronized. GPTP_WIRED is the
  * historical 802.1AS path (Sync/Follow_Up + Pdelay on-wire). BEACON_IE_WIFI
  * is the wireless variant where Sync rides the AP's 802.11 beacon Vendor IE

@@ -207,6 +207,36 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
 #else
   state->port[0].medium = avb_port_medium_ethernet;
 #endif
+#if defined(CONFIG_ESP_AVB_PORT0_HOST_IF_EMAC)
+  state->port[0].host_if = avb_port_host_if_emac;
+#elif defined(CONFIG_ESP_AVB_PORT0_HOST_IF_AHB)
+  state->port[0].host_if = avb_port_host_if_ahb;
+#elif defined(CONFIG_ESP_AVB_PORT0_HOST_IF_SDIO)
+  state->port[0].host_if = avb_port_host_if_sdio;
+#elif defined(CONFIG_ESP_AVB_PORT0_HOST_IF_SPI)
+  state->port[0].host_if = avb_port_host_if_spi;
+#elif defined(CONFIG_ESP_AVB_PORT0_HOST_IF_USB)
+  state->port[0].host_if = avb_port_host_if_usb;
+#else
+  state->port[0].host_if = avb_port_host_if_other;
+#endif
+#if defined(CONFIG_ESP_AVB_PORT0_TYPE_FAILOVER)
+  state->port[0].type = avb_port_type_failover;
+#elif defined(CONFIG_ESP_AVB_PORT0_TYPE_BRIDGED)
+  state->port[0].type = avb_port_type_bridged;
+#else
+  state->port[0].type = avb_port_type_primary;
+#endif
+#if defined(CONFIG_ESP_AVB_PORT0_WIFI_MODE_AP)
+  state->port[0].wifi_mode = avb_port_wifi_mode_ap;
+#elif defined(CONFIG_ESP_AVB_PORT0_WIFI_MODE_STA)
+  state->port[0].wifi_mode = avb_port_wifi_mode_sta;
+#else
+  state->port[0].wifi_mode = avb_port_wifi_mode_none;
+#endif
+#ifdef CONFIG_ESP_AVB_PORT0_LINK_SPEED_MBPS
+  state->port[0].link_speed_mbps = CONFIG_ESP_AVB_PORT0_LINK_SPEED_MBPS;
+#endif
 #if defined(CONFIG_ESP_AVB_PORT0_TIME_SOURCE_BEACON_IE_WIFI)
   state->port[0].time_source = avb_port_time_source_beacon_ie_wifi;
 #elif defined(CONFIG_ESP_AVB_PORT0_TIME_SOURCE_FTM_ONLY)
@@ -235,6 +265,36 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   state->port[1].medium = avb_port_medium_wifi;
 #else
   state->port[1].medium = avb_port_medium_ethernet;
+#endif
+#if defined(CONFIG_ESP_AVB_PORT1_HOST_IF_EMAC)
+  state->port[1].host_if = avb_port_host_if_emac;
+#elif defined(CONFIG_ESP_AVB_PORT1_HOST_IF_AHB)
+  state->port[1].host_if = avb_port_host_if_ahb;
+#elif defined(CONFIG_ESP_AVB_PORT1_HOST_IF_SDIO)
+  state->port[1].host_if = avb_port_host_if_sdio;
+#elif defined(CONFIG_ESP_AVB_PORT1_HOST_IF_SPI)
+  state->port[1].host_if = avb_port_host_if_spi;
+#elif defined(CONFIG_ESP_AVB_PORT1_HOST_IF_USB)
+  state->port[1].host_if = avb_port_host_if_usb;
+#else
+  state->port[1].host_if = avb_port_host_if_other;
+#endif
+#if defined(CONFIG_ESP_AVB_PORT1_TYPE_FAILOVER)
+  state->port[1].type = avb_port_type_failover;
+#elif defined(CONFIG_ESP_AVB_PORT1_TYPE_BRIDGED)
+  state->port[1].type = avb_port_type_bridged;
+#else
+  state->port[1].type = avb_port_type_primary;
+#endif
+#if defined(CONFIG_ESP_AVB_PORT1_WIFI_MODE_AP)
+  state->port[1].wifi_mode = avb_port_wifi_mode_ap;
+#elif defined(CONFIG_ESP_AVB_PORT1_WIFI_MODE_STA)
+  state->port[1].wifi_mode = avb_port_wifi_mode_sta;
+#else
+  state->port[1].wifi_mode = avb_port_wifi_mode_none;
+#endif
+#ifdef CONFIG_ESP_AVB_PORT1_LINK_SPEED_MBPS
+  state->port[1].link_speed_mbps = CONFIG_ESP_AVB_PORT1_LINK_SPEED_MBPS;
 #endif
 #if defined(CONFIG_ESP_AVB_PORT1_TIME_SOURCE_BEACON_IE_WIFI)
   state->port[1].time_source = avb_port_time_source_beacon_ie_wifi;
@@ -607,6 +667,32 @@ static void avb_update_ptp_status(avb_state_s *state) {
   }
 }
 
+/* Derive the listener decl_event for an input stream per IEEE 802.1Qat
+ * §35.2.4.4.4 / Milan §5.5. The wire codes are:
+ *   1 = AskingFailed — registered but path not yet open (no TALKER_ADVERTISE
+ *                      seen, or ACMP CONNECT_TX pending)
+ *   2 = Ready        — ACMP path open + talker advertising healthy
+ *   3 = ReadyFailed  — talker is TALKER_FAILED upstream (e.g. insufficient
+ *                      bandwidth at a bridge hop).
+ *
+ * Queries the MRP attribute SMs directly via mrp_talker_advertise_active /
+ * mrp_talker_failed_active rather than relying on cached flags. The cached
+ * approach missed the case where the listener binds a stream whose TALKER
+ * Registrar was already IN (no transition fires at bind-time, so a flag
+ * driven from transitions stays stuck at false). Querying the SM state on
+ * each invocation sidesteps the race. */
+msrp_listener_event_t
+avb_input_stream_decl_event(const avb_listener_stream_s *s) {
+  uint8_t failure_code = 0;
+  if (mrp_talker_failed_active(0, &s->stream_id, &failure_code) &&
+      failure_code != 0) {
+    return msrp_listener_event_ready_failed;
+  }
+  if (s->connected && mrp_talker_advertise_active(0, &s->stream_id))
+    return msrp_listener_event_ready;
+  return msrp_listener_event_asking_failed;
+}
+
 /* Send periodic messages */
 static int avb_periodic_send(avb_state_s *state) {
   struct timespec time_now;
@@ -634,14 +720,20 @@ static int avb_periodic_send(avb_state_s *state) {
     }
   }
 
-  // Send MVRP VLAN ID message — always JoinIn so the switch registers
-  // VLAN membership on this port from boot. Required for MSRP Listener
-  // registrations to be accepted by the switch.
+  /* MVRP VLAN — SM-driven. mrp_declare_vlan seeds the Applicant on
+   * first call and keeps it alive on subsequent calls; the SM's
+   * JoinTimer + PeriodicTimer drive the actual MRPDU cadence. The
+   * timestamp guard rate-limits the declare() calls themselves so
+   * we don't thrash the SM.
+   *
+   * Required for MSRP Listener registrations to be accepted by the
+   * switch — declares membership in the SR VLAN. */
   timespecsub(&time_now, &state->port[0].last_transmitted_mvrp_vlan_id,
                           &delta);
   if (timespec_to_ms(&delta) > MVRP_VLAN_ID_INTERVAL_MSEC) {
     state->port[0].last_transmitted_mvrp_vlan_id = time_now;
-    avb_send_mvrp_vlan_id(state, mrp_attr_event_join_in, false);
+    uint16_t mapping_index = 0; /* Class A — same VLAN serves both classes */
+    mrp_declare_vlan(state, 0, state->msrp_mappings[mapping_index].vlan_id);
   }
 
   /* MSRP domain — SM-driven. mrp_declare_domain is idempotent on
@@ -681,10 +773,11 @@ static int avb_periodic_send(avb_state_s *state) {
                          : MSRP_TALKER_IDLE_INTERVAL_MSEC;
       if (timespec_to_ms(&delta) > interval) {
         state->port[0].last_transmitted_msrp_talker_adv = time_now;
-        mrp_declare_talker_advertise(state, 0,
-                                     &state->output_streams[i].stream_id,
-                                     &state->output_streams[i].stream_dest_addr,
-                                     state->output_streams[i].vlan_id, mfs);
+        mrp_declare_talker_advertise(
+            state, 0, &state->output_streams[i].stream_id,
+            &state->output_streams[i].stream_dest_addr,
+            state->output_streams[i].vlan_id, mfs,
+            state->output_streams[i].stream_info_flags.class_b);
       }
     }
     avb_maap_tick(state);
@@ -698,18 +791,22 @@ static int avb_periodic_send(avb_state_s *state) {
       if (state->input_streams[i].connected &&
           timespec_to_ms(&delta) > MSRP_LISTENER_CONN_INTERVAL_MSEC) {
         state->port[0].last_transmitted_msrp_listener = time_now;
-        /* MSRP listener — SM-driven. */
+        /* SM-driven listener declaration. The decl_event reflects
+         * actual ACMP/MSRP state: Ready when path is open and the
+         * talker is advertising healthy; ReadyFailed when the talker
+         * is FAILED upstream; AskingFailed if we haven't heard the
+         * talker's ADVERTISE yet. */
         mrp_declare_listener(state, 0, &state->input_streams[i].stream_id,
-                             msrp_listener_event_ready);
+                             avb_input_stream_decl_event(&state->input_streams[i]));
       }
     }
   }
 
-  /* MSRP LeaveAll is now driven by the SM's per-port LeaveAllTimer
-   * (10–15 s jittered per §10.7.11). The Applicants automatically
-   * re-declare on rLA, so the legacy "send LeaveAll then explicitly
-   * re-decl everything" block is gone. MVRP also gets re-declared by
-   * its own 500 ms periodic above; no separate LeaveAll path needed. */
+  /* MSRP / MVRP LeaveAll are both driven by the SM's per-port
+   * LeaveAllTimer (10–15 s on wired, 30–60 s on Wi-Fi per §10.7.11
+   * + the Phase 2 Wi-Fi cut). The Applicants automatically re-declare
+   * on rLA, so the legacy "send LeaveAll then explicitly re-decl
+   * everything" block is gone. */
 
   // Send Unsolicited notifications
   if (state->unsol_notif_enabled) {
@@ -753,10 +850,17 @@ static int avb_periodic_send(avb_state_s *state) {
   avb_process_inflight_timeouts(state);
 
   /* Attempt fast-connect for any listener stream with a saved binding
-   * that hasn't reconnected yet. Self-throttled per-stream. */
+   * that hasn't reconnected yet. Self-throttled per-stream.
+   *
+   * Disabled in CONFIG_ESP_AVB_DISABLE_FAST_CONNECT builds for Phase 3
+   * class-selection testing — fast-connect re-binds with default (Class A)
+   * flags within milliseconds of any disconnect, which prevents observing
+   * a clean controller-driven Class B connection. */
+#ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
   if (state->config.listener) {
     avb_periodic_fast_connect(state);
   }
+#endif
 
   return OK;
 } // avb_periodic_send
@@ -813,6 +917,16 @@ static int avb_process_rx_message(avb_state_s *state, int protocol_idx,
      * dispatches SM events, and calls the legacy avb_process_msrp_*
      * application reactions for each attribute. */
     mrp_rx_msrp(state, state->rxport[protocol_idx], msg, (size_t)length,
+                &src_addr);
+    break;
+  }
+  case MVRP: {
+    /* Single MVRP RX entry point. Drives the per-VLAN MRP SMs
+     * directly — no legacy reaction layer (MVRP was cut straight
+     * onto the MRP core in Phase 4). */
+    mvrp_vlan_id_message_s *msg =
+        (mvrp_vlan_id_message_s *)&state->rxbuf[protocol_idx].mvrp;
+    mrp_rx_mvrp(state, state->rxport[protocol_idx], msg, (size_t)length,
                 &src_addr);
     break;
   }

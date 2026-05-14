@@ -1707,18 +1707,16 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
   memset(&msrp_msg, 0, sizeof(msrp_msg));
   memcpy(msrp_msg.messages_raw, attr, attr_size);
 
-  int ret = OK;
+  /* CVU is endpoint-only (AVB Lite); MSRP dispatch flows through the
+   * SM-driven RX entry point on port 0. mrp_rx_msrp walks the single
+   * attribute in the wrapped buffer, runs SM transitions, and fires
+   * the endpoint-side bookkeeping callbacks (talker DB, latency,
+   * listener readiness). */
   switch (attr->attr_type) {
   case msrp_attr_type_talker_advertise:
-    ret = avb_process_msrp_talker(state, &msrp_msg, 0, attr_size, false,
-                                  src_addr);
-    break;
   case msrp_attr_type_talker_failed:
-    ret =
-        avb_process_msrp_talker(state, &msrp_msg, 0, attr_size, true, src_addr);
-    break;
   case msrp_attr_type_listener:
-    ret = avb_process_msrp_listener(state, &msrp_msg, 0, attr_size, src_addr);
+    mrp_rx_msrp(state, 0, &msrp_msg, attr_size, src_addr);
     break;
   default:
     avbinfo("CVU: unsupported MSRP attribute type 0x%02x", attr->attr_type);
@@ -1727,8 +1725,7 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
   }
 
   return avb_send_cvu_response(state, msg, src_addr, msg_len,
-                               ret == OK ? aecp_status_success
-                                         : aecp_status_bad_arguments);
+                               aecp_status_success);
 }
 
 /* ---- Milan Vendor Unique (MVU) command handlers ---- */
@@ -3433,6 +3430,35 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
       avb_stop_stream_out(state, talker_uid);
     }
   } else {
+    /* IEEE 1722.1-2021 §8.2.1.16 Table 8-4: CLASS_B is flags bit 15
+     * (flags[0] & 0x80, big-endian). The class is selected per
+     * connection at CONNECT_RX time; one stream can be set up as
+     * either Class A or Class B but cannot be transmitted as both
+     * simultaneously. Gate: lock class only when at least one
+     * ACMP-confirmed listener is bound; subsequent CONNECTs must
+     * match. MSRP-only listener entries (peers that declared
+     * Listener but never completed ACMP CONNECT_TX) do not lock
+     * the class — they're "interested but not committed". */
+    uint16_t cmd_flags = octets_to_uint(msg->flags, 2);
+    bool req_class_b = (cmd_flags & 0x8000) != 0;
+    uint16_t conn_count = octets_to_uint(stream->connection_count, 2);
+    int acmp_locked = 0;
+    for (int i = 0;
+         i < conn_count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+      if (stream->connected_listeners[i].acmp_connected) acmp_locked++;
+    }
+    if (acmp_locked > 0 &&
+        (bool)stream->stream_info_flags.class_b != req_class_b) {
+      avbwarn("ACMP: stream %d class-mismatch CONNECT_TX rejected "
+              "(active class %s, requested %s, acmp_listeners=%d/%u)",
+              talker_uid,
+              stream->stream_info_flags.class_b ? "B" : "A",
+              req_class_b ? "B" : "A", acmp_locked, (unsigned)conn_count);
+      avb_send_acmp_response(state, tx_response_type, msg,
+                             acmp_status_talker_exclusive);
+      return ERROR;
+    }
+
     listener_idx = find_or_add_talker_listener_by_identity(
         stream, msg->listener_entity_id, msg->listener_uid);
     if (listener_idx == NOT_FOUND) {
@@ -3443,9 +3469,20 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     }
     stream->connected_listeners[listener_idx].acmp_connected = true;
     stream->connected_listeners[listener_idx].asking_failed = false;
-    avbinfo("ACMP: listener connected to stream %d (count=%d, msrp=%d)",
+
+    /* First-connection edge stamps the class onto the stream. The
+     * gate above guarantees req_class_b matches the active class for
+     * subsequent connects, so this is idempotent in the steady state. */
+    if (stream->stream_info_flags.class_b != req_class_b) {
+      avbinfo("ACMP: stream %d class set to %s by first connection",
+              talker_uid, req_class_b ? "B" : "A");
+      stream->stream_info_flags.class_b = req_class_b ? 1 : 0;
+    }
+
+    avbinfo("ACMP: listener connected to stream %d (count=%d, msrp=%d, class=%c)",
             talker_uid, octets_to_uint(stream->connection_count, 2),
-            stream->connected_listeners[listener_idx].msrp_ready);
+            stream->connected_listeners[listener_idx].msrp_ready,
+            stream->stream_info_flags.class_b ? 'B' : 'A');
 
     /* If MSRP Ready arrived before ACMP CONNECT_TX, start now that both halves
      * of the connection state are present. */
@@ -3455,7 +3492,8 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     }
   }
 
-  /* Respond with current talker stream state. */
+  /* Respond with current talker stream state. Echo CLASS_B so the
+   * listener mirrors the same bit on its side. */
   memcpy(msg->stream_id, state->output_streams[talker_uid].stream_id,
          UNIQUE_ID_LEN);
   memcpy(msg->stream_dest_addr,
@@ -3463,6 +3501,10 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
   memcpy(msg->stream_vlan_id, state->output_streams[talker_uid].vlan_id, 2);
   memcpy(msg->connection_count,
          state->output_streams[talker_uid].connection_count, 2);
+  uint16_t rsp_flags = octets_to_uint(msg->flags, 2);
+  if (stream->stream_info_flags.class_b) rsp_flags |= 0x8000u;
+  else                                   rsp_flags &= ~0x8000u;
+  int_to_octets(&rsp_flags, msg->flags, 2);
   avb_send_acmp_response(state, tx_response_type, msg, acmp_status_success);
   return ret;
 }
@@ -4066,10 +4108,13 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   // Setting as connected will cause the stream-in handler to start
   stream->connected = true;
 
-  // declare SRP listener ready via the MRP state machine; the Applicant
-  // will emit JoinIn/New on the next JoinTimer fire.
+  /* SM-driven listener declaration. Initial decl_event is decided by
+   * the current talker state — at the moment of CONNECT_TX_RESPONSE
+   * we usually haven't heard the talker's MSRP ADVERTISE yet, so this
+   * will declare AskingFailed; the periodic re-declare flips to Ready
+   * once the talker_advertised flag is set by the MRP RX callback. */
   mrp_declare_listener(state, 0, &state->input_streams[index].stream_id,
-                       msrp_listener_event_ready);
+                       avb_input_stream_decl_event(stream));
 
   return status;
 }

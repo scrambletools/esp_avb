@@ -232,11 +232,23 @@ typedef struct {
   uint8_t messages_raw[200]; // variable length depending on attributes
 } msrp_msgbuf_s;             // 266 bytes limit
 
-/* ===== MVRP send / process ===== */
+/* ===== MVRP — SM-driven API ===== */
 
-int avb_send_mvrp_vlan_id(avb_state_s *state, mrp_attr_event_t attr_event,
-                          bool leave_all);
-int avb_process_mvrp_vlan_id(avb_state_s *state, mvrp_vlan_id_message_s *msg);
+/* RX entry point. avbnet.c's RX dispatcher hands each MVRP MRPDU to
+ * this function; the SMs handle attribute book-keeping. No legacy
+ * reaction layer — MVRP cut straight onto the MRP core. */
+void mrp_rx_mvrp(avb_state_s *state, int port,
+                 mvrp_vlan_id_message_s *msg, size_t length,
+                 eth_addr_t *src_addr);
+
+/* SM-driven origination — replaces the legacy avb_send_mvrp_vlan_id.
+ * Idempotent: first call seeds the Applicant via New!, subsequent
+ * calls bump it via Join!. JoinTimer + PeriodicTimer drive the
+ * MRPDU cadence. */
+void mrp_declare_vlan(avb_state_s *state, int port,
+                      const uint8_t *vlan_id);
+void mrp_withdraw_vlan(avb_state_s *state, int port,
+                       const uint8_t *vlan_id);
 
 /* ===== MRP state machines (IEEE 802.1Q-2018 §10) =====
  *
@@ -368,12 +380,14 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size);
+                                  uint16_t max_frame_size,
+                                  bool class_b);
 void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const unique_id_t *stream_id,
                                const eth_addr_t *stream_dest_addr,
                                const uint8_t *vlan_id,
-                               uint16_t max_frame_size, uint8_t failure_code);
+                               uint16_t max_frame_size, uint8_t failure_code,
+                               bool class_b);
 void mrp_declare_listener(avb_state_s *state, int port,
                           const unique_id_t *stream_id,
                           msrp_listener_event_t decl);
@@ -384,15 +398,13 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
 void mrp_withdraw_listener(avb_state_s *state, int port,
                            const unique_id_t *stream_id);
 
-/* ===== MSRP send / process =====
+/* ===== Other MSRP utilities =====
  *
- * The legacy avb_send_msrp_* origination functions are gone — the
- * SM-driven mrp_declare_* / mrp_withdraw_* entry points (above) are
- * the only path that emits MSRP frames.
- *
- * The avb_process_msrp_* reactions are still called by mrp_rx_msrp
- * internally (per-attribute, after SM dispatch); avb.c no longer
- * dispatches MSRP itself.
+ * The legacy avb_send_msrp_* origination and avb_process_msrp_*
+ * reaction functions are gone. mrp_declare_* / mrp_withdraw_* emit
+ * frames; mrp_rx_msrp consumes them. Endpoint-side bookkeeping
+ * (talker DB, accumulated_latency propagation, listener readiness)
+ * runs inside the SM transition callbacks in mrp.c §6a.
  *
  * Note: avb_send_cvu_srp_attr (CVU SRP-over-AECP transport) lives in
  * avb.h's ATDECC section — same MSRP payload, different envelope.
@@ -400,12 +412,20 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
 
 uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index);
 
-int avb_process_msrp_domain(avb_state_s *state, msrp_msgbuf_s *msg, int offset,
-                            size_t length);
-int avb_process_msrp_talker(avb_state_s *state, msrp_msgbuf_s *msg, int offset,
-                            size_t length, bool is_failed,
-                            eth_addr_t *src_addr);
-int avb_process_msrp_listener(avb_state_s *state, msrp_msgbuf_s *msg,
-                              int offset, size_t length, eth_addr_t *src_addr);
+/* Query the current Registrar state of an upstream MSRP TALKER
+ * attribute. Returns true iff the matching SM is currently IN (i.e.
+ * the peer/bridge has the talker declared on this port). Used by the
+ * listener-side decl_event helper to drive Ready vs AskingFailed
+ * independently of whether the listener saw a fresh transition.
+ *
+ * port: ingress port to query (single-port endpoints pass 0).
+ * stream_id: the 8-byte stream ID to look up. */
+bool mrp_talker_advertise_active(int port, const unique_id_t *stream_id);
+
+/* Like above but for the TALKER_FAILED attribute. Returns true iff
+ * the FAILED Registrar is IN; if it is, *failure_code_out (when not
+ * NULL) is populated with the §35.2.2.8.4 reason code. */
+bool mrp_talker_failed_active(int port, const unique_id_t *stream_id,
+                              uint8_t *failure_code_out);
 
 #endif /* ESP_AVB_MRP_H_ */

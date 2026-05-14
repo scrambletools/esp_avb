@@ -244,7 +244,17 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
      *
      * L2TAP only applies on Ethernet ingress — wifi-port-0 RX (Phase
      * 6b.2) passes eth_handle=NULL and we skip straight to
-     * esp_netif_receive. */
+     * esp_netif_receive.
+     *
+     * The Wi-Fi RX path (eth_handle=NULL) is hooked at link time via
+     * the esp_wifi_remote_channel_rx strong override, so frames can
+     * arrive *before* avb_start() runs and populates s_eth_netif /
+     * s_bridge_state. Drop those — there's nothing to dispatch them
+     * to yet. */
+    if (s_eth_netif == NULL) {
+      free(buf);
+      return ESP_OK;
+    }
     size_t frame_len = len;
     if (eth_handle != NULL) {
       esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, info);
@@ -627,6 +637,94 @@ int avb_net_send(avb_state_s *state, ethertype_t ethertype, void *msg,
     return ERROR;
   }
   return avb_net_send_to(state, ethertype, msg, msg_len, ts, &dest_addr);
+}
+
+/* Forward decl repeated here so endpoint builds (which don't define
+ * CONFIG_ESP_AVB_ROLE_BRIDGE) can still see the symbol. esp_avb avoids
+ * a hard esp_wifi PRIV_REQUIRES; native Wi-Fi or esp_wifi_remote
+ * provides the link symbol when it's actually called. */
+extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
+
+/* Per-port control-plane TX. Routes the frame through the named port's
+ * egress, building it with that port's own source MAC. Dispatch is
+ * uniform across ports: medium picks the egress (eth → L2TAP write,
+ * wifi → esp_wifi_internal_tx) and wifi_mode (sta=0 / ap=1) selects
+ * the IDF Wi-Fi interface — no port-index assumptions and no hardcoded
+ * WIFI_IF. */
+int avb_net_send_on(avb_state_s *state, int port_index,
+                    ethertype_t ethertype, void *msg, uint16_t msg_len,
+                    struct timespec *ts) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS) {
+    avberr("avb_net_send_on: invalid port %d", port_index);
+    return ERROR;
+  }
+  (void)ts;
+
+  avb_port_s *p = &state->port[port_index];
+
+  /* Derive dest_addr, mirroring avb_net_send. */
+  eth_addr_t dest_addr;
+  switch (ethertype) {
+  case ethertype_avtp: {
+    uint8_t subtype;
+    memcpy(&subtype, msg, 1);
+    if (subtype == avtp_subtype_maap) {
+      memcpy(&dest_addr, &MAAP_MCAST_MAC_ADDR, ETH_ADDR_LEN);
+    } else {
+      memcpy(&dest_addr, &BCAST_MAC_ADDR, ETH_ADDR_LEN);
+    }
+    break;
+  }
+  case ethertype_msrp:
+    memcpy(&dest_addr, &LLDP_MCAST_MAC_ADDR, ETH_ADDR_LEN);
+    break;
+  case ethertype_mvrp:
+    memcpy(&dest_addr, &SPANTREE_MAC_ADDR, ETH_ADDR_LEN);
+    break;
+  default:
+    avberr("avb_net_send_on: invalid ethertype %d", ethertype);
+    return ERROR;
+  }
+
+  /* avb_create_eth_frame hardcodes port[0]'s MAC as SA; overwrite
+   * bytes 6..11 with this port's own MAC. */
+  uint8_t eth_frame[msg_len + ETH_HEADER_LEN];
+  avb_create_eth_frame(eth_frame, &dest_addr, state, ethertype, msg, msg_len,
+                       NULL);
+  memcpy(eth_frame + ETH_ADDR_LEN, p->internal_mac_addr, ETH_ADDR_LEN);
+
+  if (p->medium == avb_port_medium_wifi) {
+    /* Use this port's wifi_mode (numerically WIFI_IF_STA=0 or
+     * WIFI_IF_AP=1) as the IDF wifi_if argument. Heap-copy the
+     * buffer — some IDF wifi builds hold a reference until tx_done. */
+    if (p->wifi_mode == avb_port_wifi_mode_none) {
+      avberr("avb_net_send_on: port %d medium=wifi but wifi_mode=none",
+             port_index);
+      return ERROR;
+    }
+    void *buf = malloc(sizeof(eth_frame));
+    if (!buf) return ERROR;
+    memcpy(buf, eth_frame, sizeof(eth_frame));
+    esp_err_t r =
+        esp_wifi_internal_tx((int)p->wifi_mode, buf, sizeof(eth_frame));
+    free(buf);
+    return (r == ESP_OK) ? (int)sizeof(eth_frame) : ERROR;
+  }
+
+  if (p->medium == avb_port_medium_ethernet) {
+    int l2if;
+    switch (ethertype) {
+    case ethertype_avtp: l2if = p->l2if[AVTP]; break;
+    case ethertype_msrp: l2if = p->l2if[MSRP]; break;
+    case ethertype_mvrp: l2if = p->l2if[MVRP]; break;
+    default:
+      avberr("avb_net_send_on: invalid ethertype %d", ethertype);
+      return ERROR;
+    }
+    return write(l2if, eth_frame, sizeof(eth_frame));
+  }
+
+  return ERROR;
 }
 
 /* Receive next control frame from the unified EMAC RX dispatcher.

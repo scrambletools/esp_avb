@@ -100,35 +100,41 @@ menu "AVB Configuration"
     # ----------------------------------------------------------------
     # Per-port topology — derived from esp_ptp's taxonomy.
     #
-    # esp_ptp owns the user-facing per-port configuration (NUM_PORTS,
-    # MEDIUM, TYPE, WIFI_ROLE) because gPTP is mandatory for AVB and
-    # every AVB port is by definition a gPTP port (IEEE 802.1AS clause
-    # 12). The ESP_AVB_* port symbols below are mirrors that auto-track
-    # the ESP_PTP_* selections so the two components cannot drift.
+    # esp_ptp owns the user-facing per-port configuration because gPTP
+    # is mandatory for AVB and every AVB port is a gPTP port (IEEE
+    # 802.1AS clause 12). The ESP_AVB_* port symbols below are mirrors
+    # that auto-track ESP_PTP_* selections so the two components cannot
+    # drift.
+    #
+    # Five orthogonal per-port knobs (see esp_ptp Kconfig for details):
+    #   MEDIUM     ethernet | wifi
+    #   HOST_IF    emac | ahb | sdio | spi | usb | other
+    #   TYPE       primary | failover | bridged
+    #   WIFI_MODE  ap | sta            (only when MEDIUM=wifi)
+    #   LINK_SPEED_MBPS                (nominal PHY-rate cap)
     #
     # Mapping rules:
     #   ESP_AVB_NUM_PORTS                ← ESP_PTP_NUM_PORTS
-    #   ESP_AVB_PORTn_MEDIUM_ETHERNET    ← ESP_PTP_PORTn_MEDIUM_ETHERNET
-    #   ESP_AVB_PORTn_MEDIUM_WIFI        ← ESP_PTP_PORTn_MEDIUM_WIFI
-    #                                      || ESP_PTP_PORTn_MEDIUM_WIFI_CP
-    #   ESP_AVB_PORTn_TIME_SOURCE_GPTP_WIRED
-    #                                    ← ESP_PTP_PORTn_MEDIUM_ETHERNET
-    #   ESP_AVB_PORTn_TIME_SOURCE_BEACON_IE_WIFI
-    #                                    ← ESP_PTP_PORTn_MEDIUM_WIFI[_CP]
-    #                                      (publisher when WIFI_ROLE_AP,
-    #                                       consumer when WIFI_ROLE_STA)
+    #   ESP_AVB_PORTn_MEDIUM_*           ← ESP_PTP_PORTn_MEDIUM_*
+    #   ESP_AVB_PORTn_HOST_IF_*          ← ESP_PTP_PORTn_HOST_IF_*
+    #   ESP_AVB_PORTn_TYPE_*             ← ESP_PTP_PORTn_TYPE_*
+    #   ESP_AVB_PORTn_WIFI_MODE_*        ← ESP_PTP_PORTn_WIFI_MODE_*
+    #   ESP_AVB_PORTn_LINK_SPEED_MBPS    ← ESP_PTP_PORTn_LINK_SPEED_MBPS
+    #   ESP_AVB_PORTn_TIME_SOURCE_GPTP_WIRED      ← MEDIUM=ethernet
+    #   ESP_AVB_PORTn_TIME_SOURCE_BEACON_IE_WIFI  ← MEDIUM=wifi
     #   ESP_AVB_ROLE_BRIDGE              ← any port has TYPE_BRIDGED
-    #   ESP_AVB_ROLE_ENDPOINT_WIRELESS   ← port0 PRIMARY + WIFI[_CP] + STA
+    #   ESP_AVB_ROLE_ENDPOINT_WIRELESS   ← port0 PRIMARY + WIFI + STA
     #   ESP_AVB_ROLE_ENDPOINT_WIRED      ← port0 PRIMARY + ETHERNET
     #
-    # To change topology, edit the ESP_PTP_* settings (in menuconfig
-    # under "PTP Daemon Configuration") — these symbols follow.
+    # To change topology, edit ESP_PTP_* under "PTP Daemon Configuration".
     # ----------------------------------------------------------------
 
     config ESP_AVB_NUM_PORTS
         int
         default ESP_PTP_NUM_PORTS
         depends on ESP_AVB
+
+    # ----- Port 0 -----
 
     config ESP_AVB_PORT0_MEDIUM_ETHERNET
         bool
@@ -137,7 +143,67 @@ menu "AVB Configuration"
 
     config ESP_AVB_PORT0_MEDIUM_WIFI
         bool
-        default y if ESP_PTP_PORT0_MEDIUM_WIFI || ESP_PTP_PORT0_MEDIUM_WIFI_CP
+        default y if ESP_PTP_PORT0_MEDIUM_WIFI
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_HOST_IF_EMAC
+        bool
+        default y if ESP_PTP_PORT0_HOST_IF_EMAC
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_HOST_IF_AHB
+        bool
+        default y if ESP_PTP_PORT0_HOST_IF_AHB
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_HOST_IF_SDIO
+        bool
+        default y if ESP_PTP_PORT0_HOST_IF_SDIO
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_HOST_IF_SPI
+        bool
+        default y if ESP_PTP_PORT0_HOST_IF_SPI
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_HOST_IF_USB
+        bool
+        default y if ESP_PTP_PORT0_HOST_IF_USB
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_HOST_IF_OTHER
+        bool
+        default y if ESP_PTP_PORT0_HOST_IF_OTHER
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_TYPE_PRIMARY
+        bool
+        default y if ESP_PTP_PORT0_TYPE_PRIMARY
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_TYPE_FAILOVER
+        bool
+        default y if ESP_PTP_PORT0_TYPE_FAILOVER
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_TYPE_BRIDGED
+        bool
+        default y if ESP_PTP_PORT0_TYPE_BRIDGED
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_WIFI_MODE_AP
+        bool
+        default y if ESP_PTP_PORT0_WIFI_MODE_AP
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_WIFI_MODE_STA
+        bool
+        default y if ESP_PTP_PORT0_WIFI_MODE_STA
+        depends on ESP_AVB
+
+    config ESP_AVB_PORT0_LINK_SPEED_MBPS
+        int
+        default ESP_PTP_PORT0_LINK_SPEED_MBPS
         depends on ESP_AVB
 
     config ESP_AVB_PORT0_TIME_SOURCE_GPTP_WIRED
@@ -147,8 +213,10 @@ menu "AVB Configuration"
 
     config ESP_AVB_PORT0_TIME_SOURCE_BEACON_IE_WIFI
         bool
-        default y if ESP_PTP_PORT0_MEDIUM_WIFI || ESP_PTP_PORT0_MEDIUM_WIFI_CP
+        default y if ESP_PTP_PORT0_MEDIUM_WIFI
         depends on ESP_AVB
+
+    # ----- Port 1 -----
 
     config ESP_AVB_PORT1_MEDIUM_ETHERNET
         bool
@@ -157,7 +225,67 @@ menu "AVB Configuration"
 
     config ESP_AVB_PORT1_MEDIUM_WIFI
         bool
-        default y if ESP_PTP_PORT1_MEDIUM_WIFI || ESP_PTP_PORT1_MEDIUM_WIFI_CP
+        default y if ESP_PTP_PORT1_MEDIUM_WIFI
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_HOST_IF_EMAC
+        bool
+        default y if ESP_PTP_PORT1_HOST_IF_EMAC
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_HOST_IF_AHB
+        bool
+        default y if ESP_PTP_PORT1_HOST_IF_AHB
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_HOST_IF_SDIO
+        bool
+        default y if ESP_PTP_PORT1_HOST_IF_SDIO
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_HOST_IF_SPI
+        bool
+        default y if ESP_PTP_PORT1_HOST_IF_SPI
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_HOST_IF_USB
+        bool
+        default y if ESP_PTP_PORT1_HOST_IF_USB
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_HOST_IF_OTHER
+        bool
+        default y if ESP_PTP_PORT1_HOST_IF_OTHER
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_TYPE_PRIMARY
+        bool
+        default y if ESP_PTP_PORT1_TYPE_PRIMARY
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_TYPE_FAILOVER
+        bool
+        default y if ESP_PTP_PORT1_TYPE_FAILOVER
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_TYPE_BRIDGED
+        bool
+        default y if ESP_PTP_PORT1_TYPE_BRIDGED
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_WIFI_MODE_AP
+        bool
+        default y if ESP_PTP_PORT1_WIFI_MODE_AP
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_WIFI_MODE_STA
+        bool
+        default y if ESP_PTP_PORT1_WIFI_MODE_STA
+        depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
+
+    config ESP_AVB_PORT1_LINK_SPEED_MBPS
+        int
+        default ESP_PTP_PORT1_LINK_SPEED_MBPS
         depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
 
     config ESP_AVB_PORT1_TIME_SOURCE_GPTP_WIRED
@@ -167,7 +295,7 @@ menu "AVB Configuration"
 
     config ESP_AVB_PORT1_TIME_SOURCE_BEACON_IE_WIFI
         bool
-        default y if ESP_PTP_PORT1_MEDIUM_WIFI || ESP_PTP_PORT1_MEDIUM_WIFI_CP
+        default y if ESP_PTP_PORT1_MEDIUM_WIFI
         depends on ESP_AVB && ESP_PTP_NUM_PORTS = 2
 
     config ESP_AVB_ROLE_BRIDGE
@@ -177,7 +305,7 @@ menu "AVB Configuration"
 
     config ESP_AVB_ROLE_ENDPOINT_WIRELESS
         bool
-        default y if ESP_PTP_PORT0_TYPE_PRIMARY && (ESP_PTP_PORT0_MEDIUM_WIFI || ESP_PTP_PORT0_MEDIUM_WIFI_CP) && ESP_PTP_PORT0_WIFI_ROLE_STA
+        default y if ESP_PTP_PORT0_TYPE_PRIMARY && ESP_PTP_PORT0_MEDIUM_WIFI && ESP_PTP_PORT0_WIFI_MODE_STA
         depends on ESP_AVB && !ESP_AVB_ROLE_BRIDGE
 
     config ESP_AVB_ROLE_ENDPOINT_WIRED
@@ -197,5 +325,18 @@ menu "AVB Configuration"
             this to y and the same FollowUpInformation byte format will
             ride the FTM action frame as IEEE 802.1AS-2020 §12.7
             prescribes. Reserved for future; not implemented in this build.
+
+    config ESP_AVB_DISABLE_FAST_CONNECT
+        bool "Disable listener fast-connect (test builds only)"
+        default n
+        depends on ESP_AVB
+        help
+            Skip the per-tick avb_periodic_fast_connect retry loop on the
+            listener side. Intended for test builds where a controller-driven
+            CONNECT is fighting the listener's own NVS-restored binding —
+            specifically the Phase 3 class-selection demo where fast-connect
+            re-binds with default (Class A) flags within milliseconds of
+            controller-initiated disconnect, preventing observation of a
+            clean Class B path. Keep default n in production builds.
 
 endmenu # ESP_AVB Configuration

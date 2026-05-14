@@ -459,7 +459,11 @@ typedef struct {
   uint8_t vlan_id[2];                        // vlan ID
   avtp_stream_format_s stream_format;        // stream format
   uint8_t msrp_accumulated_latency[4];       // msrp accumulated latency
-  uint8_t msrp_failure_code[2];              // msrp failure code
+  uint8_t msrp_failure_code[2];              // msrp failure code (kept in
+                                             // sync by the MRP talker callback
+                                             // for ATDECC stream_info responses;
+                                             // decl_event derivation queries
+                                             // the SM directly instead)
   bool connected;                            // status as connected
   bool pending_connection;                   // status as pending connection
   /* Timestamp of last fast-connect (CONNECT_TX) attempt. Runtime-only,
@@ -558,6 +562,10 @@ typedef struct {
   /* Configuration. */
   bool enabled;
   avb_port_medium_e medium;
+  avb_port_host_if_e host_if;       /* how this port attaches to the SoC */
+  avb_port_type_e type;             /* primary / failover / bridged */
+  avb_port_wifi_mode_e wifi_mode;   /* ap/sta for wifi, none otherwise */
+  uint32_t link_speed_mbps;         /* nominal PHY-rate cap */
   avb_port_time_source_e time_source;
   char eth_interface[16];
 
@@ -812,6 +820,14 @@ int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
                          eth_addr_t *dest_addr, uint8_t *vlan_id);
 int avb_net_send(avb_state_s *state, ethertype_t ethertype, void *msg,
                  uint16_t msg_len, struct timespec *t);
+/* Per-port variant of avb_net_send. Identical to avb_net_send for
+ * port 0. For port > 0 the frame is built with the egress port's own
+ * source MAC and dispatched via that port's medium — esp_wifi_internal_tx
+ * (WIFI_IF_AP) for the bridge SoftAP, L2TAP for a second Ethernet port.
+ * Used by bridge MAP to route SM TX flushes to the right port. */
+int avb_net_send_on(avb_state_s *state, int port_index,
+                    ethertype_t ethertype, void *msg, uint16_t msg_len,
+                    struct timespec *ts);
 int avb_net_recv_ctrl(avb_state_s *state, int *protocol_idx, int *ingress_port,
                       void *msg,
                       uint16_t msg_len, eth_addr_t *src_addr, int timeout_ms);
@@ -858,6 +874,13 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
 /* Identify tone */
 void avb_identify_tone(avb_state_s *state, uint32_t duration_ms);
 
+
+/* Listener decl_event derivation. Returns the msrp_listener_event_t
+ * code (AskingFailed / Ready / ReadyFailed) that an input_stream
+ * should declare based on its ACMP connection state and the upstream
+ * talker's MSRP state. See avb.c for the rule. */
+msrp_listener_event_t
+avb_input_stream_decl_event(const avb_listener_stream_s *s);
 
 /* Stream functions */
 int avb_start_stream_in(avb_state_s *state, uint16_t index);
