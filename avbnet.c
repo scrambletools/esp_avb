@@ -40,6 +40,22 @@ static esp_netif_t *s_eth_netif = NULL;
 static esp_netif_t *s_wifi_netif = NULL;
 #endif
 
+/* Bridge forwarding counters. Bumped inside avb_bridge_forward (bridge
+ * builds only); on endpoint builds they stay zero and the accessor
+ * still links. Diagnoses wired<->Wi-Fi multicast forwarding asymmetry. */
+static volatile uint32_t s_fwd_eth_ok, s_fwd_eth_fail;
+static volatile uint32_t s_fwd_wifi_ok, s_fwd_wifi_fail, s_fwd_wifi_oom;
+
+void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
+                              uint32_t *wifi_ok, uint32_t *wifi_fail,
+                              uint32_t *wifi_oom) {
+  if (eth_ok)    *eth_ok    = s_fwd_eth_ok;
+  if (eth_fail)  *eth_fail  = s_fwd_eth_fail;
+  if (wifi_ok)   *wifi_ok   = s_fwd_wifi_ok;
+  if (wifi_fail) *wifi_fail = s_fwd_wifi_fail;
+  if (wifi_oom)  *wifi_oom  = s_fwd_wifi_oom;
+}
+
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 /* esp_wifi_internal_tx forward decl. Same rationale as the equivalent
  * decl above avb_net_transmit_raw further down — declared locally so
@@ -92,8 +108,9 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
 
   if (p->medium == avb_port_medium_ethernet) {
     if (s_bridge_state->config.eth_handle) {
-      (void)esp_eth_transmit(s_bridge_state->config.eth_handle, (void *)frame,
-                             len);
+      esp_err_t r = esp_eth_transmit(s_bridge_state->config.eth_handle,
+                                     (void *)frame, len);
+      if (r == ESP_OK) s_fwd_eth_ok++; else s_fwd_eth_fail++;
     }
     return;
   }
@@ -101,12 +118,14 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
   if (p->medium == avb_port_medium_wifi) {
     void *buf = malloc(len);
     if (!buf) {
+      s_fwd_wifi_oom++;
       return;
     }
     memcpy(buf, frame, len);
     /* WIFI_IF_AP=1 — the bridge's SoftAP. */
-    (void)esp_wifi_internal_tx(1 /* WIFI_IF_AP */, buf, len);
+    esp_err_t r = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, buf, len);
     free(buf);
+    if (r == ESP_OK) s_fwd_wifi_ok++; else s_fwd_wifi_fail++;
     return;
   }
 }
@@ -120,6 +139,25 @@ static volatile uint32_t s_stream_rx_drops = 0;
  * can compare against ptpd's own rx_sync counter. */
 static volatile uint32_t s_ptp_rx_seen = 0;
 uint32_t avb_net_ptp_rx_seen(void) { return s_ptp_rx_seen; }
+
+/* RX-into-avb_unified_rx_cb breakdown — every frame that enters the
+ * unified dispatcher gets tallied so we can localize where a frame is
+ * dropped (esp_wifi RX vs. classifier vs. handler). */
+static volatile uint32_t s_rx_total = 0;
+static volatile uint32_t s_rx_avtp = 0;
+static volatile uint32_t s_rx_msrp = 0;
+static volatile uint32_t s_rx_mvrp = 0;
+static volatile uint32_t s_rx_vlan = 0;
+static volatile uint32_t s_rx_other = 0;
+void avb_net_rx_breakdown(uint32_t *total, uint32_t *avtp, uint32_t *msrp,
+                          uint32_t *mvrp, uint32_t *vlan, uint32_t *other) {
+  if (total) *total = s_rx_total;
+  if (avtp)  *avtp  = s_rx_avtp;
+  if (msrp)  *msrp  = s_rx_msrp;
+  if (mvrp)  *mvrp  = s_rx_mvrp;
+  if (vlan)  *vlan  = s_rx_vlan;
+  if (other) *other = s_rx_other;
+}
 
 /* Unified EMAC RX callback — dispatches ALL incoming Ethernet frames.
  * Runs in the EMAC RX FreeRTOS task context (not ISR).
@@ -146,6 +184,16 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
    * to identify where in the path PTP frames are being lost. */
   if (ethertype == 0x88f7) {
     s_ptp_rx_seen++;
+  }
+
+  /* Per-ethertype RX breakdown into the dispatcher. */
+  s_rx_total++;
+  switch (ethertype) {
+    case 0x22f0: s_rx_avtp++; break;
+    case 0x22ea: s_rx_msrp++; break;
+    case 0x88f5: s_rx_mvrp++; break;
+    case 0x8100: s_rx_vlan++; break;
+    default:     s_rx_other++; break;
   }
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE

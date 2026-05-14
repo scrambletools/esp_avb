@@ -855,6 +855,21 @@ uint32_t avb_net_stream_rx_drops(void);
  * split where drops occur. */
 uint32_t avb_net_ptp_rx_seen(void);
 
+/* Per-ethertype RX counters into avb_unified_rx_cb. Used to confirm that
+ * frames actually arrive on a given port's Wi-Fi/EMAC ingress, separate
+ * from whether any specific handler later acts on them. Counters are
+ * monotonic. */
+void avb_net_rx_breakdown(uint32_t *total, uint32_t *avtp, uint32_t *msrp,
+                          uint32_t *mvrp, uint32_t *vlan, uint32_t *other);
+
+/* Bridge forwarding stats — per-direction OK / fail / OOM counters
+ * bumped inside avb_bridge_forward. Used to diagnose missing
+ * wired->Wi-Fi or Wi-Fi->wired multicast traffic. Zero on non-bridge
+ * builds (the forwarder isn't compiled in). */
+void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
+                              uint32_t *wifi_ok, uint32_t *wifi_fail,
+                              uint32_t *wifi_oom);
+
 /* AVB send functions */
 
 /* MVRP and MSRP send functions live in mrp.h. */

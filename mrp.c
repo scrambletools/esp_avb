@@ -1353,7 +1353,7 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
 
 /* Forward decl — definition is below in §6, after the periodic
  * declare helpers. */
-static int avb_send_msrp_attr(avb_state_s *state, void *attr,
+static int avb_send_msrp_attr(avb_state_s *state, int port, void *attr,
                               int attr_list_len, const char *label);
 
 /* Resolve an Applicant TX action to a concrete 3pe event value (0..5)
@@ -1393,7 +1393,7 @@ static void mrp_tx_flush_talker(avb_state_s *state, int port,
   } else {
     msg.talker_failed.event_data[0] = int_to_3pe(pe, 0, 0);
   }
-  avb_send_msrp_attr(state, &msg, attr_list_len,
+  avb_send_msrp_attr(state, port, &msg, attr_list_len,
                      (e->attr_type == msrp_attr_type_talker_advertise)
                          ? "talker advertise"
                          : "talker failed");
@@ -1418,7 +1418,7 @@ static void mrp_tx_flush_listener(avb_state_s *state, int port,
   msg.event_decl_data[1].declaration.event2 = 0;
   msg.event_decl_data[1].declaration.event3 = 0;
   msg.event_decl_data[1].declaration.event4 = 0;
-  avb_send_msrp_attr(state, &msg, attr_list_len, "listener");
+  avb_send_msrp_attr(state, port, &msg, attr_list_len, "listener");
 }
 
 static void mrp_tx_flush_domain(avb_state_s *state, int port,
@@ -1434,7 +1434,7 @@ static void mrp_tx_flush_domain(avb_state_s *state, int port,
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
   if (pe < 0) return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
-  avb_send_msrp_attr(state, &msg, attr_list_len, "domain");
+  avb_send_msrp_attr(state, port, &msg, attr_list_len, "domain");
 }
 
 /* MVRP per-port flush, defined in §7. Iterates s_mvrp_vlans[port]
@@ -1741,7 +1741,7 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
   return (uint16_t)(14 /*ETH*/ + 4 /*VLAN*/ + avtp_hdr + payload);
 }
 
-static int avb_send_msrp_attr(avb_state_s *state, void *attr,
+static int avb_send_msrp_attr(avb_state_s *state, int port, void *attr,
                               int attr_list_len, const char *label) {
   size_t attr_size = 4 + attr_list_len; /* attr hdr w/o vechead + attr list */
   struct timespec ts;
@@ -1757,7 +1757,10 @@ static int avb_send_msrp_attr(avb_state_s *state, void *attr,
   memcpy(msrp_msg.messages_raw, attr, attr_size);
   uint16_t msg_len = 5 + attr_list_len + 2; // header + attr_list_len + end mark
 
-  ret = avb_net_send(state, ethertype_msrp, &msrp_msg, msg_len, &ts);
+  /* Route to the named port's egress so bridge MAP re-declarations land on
+   * the correct port (port 0 = Ethernet, port 1 = Wi-Fi AP). Endpoints have
+   * only port 0 so the behavior matches avb_net_send. */
+  ret = avb_net_send_on(state, port, ethertype_msrp, &msrp_msg, msg_len, &ts);
   if (ret < 0) {
     avberr("send MSRP %s failed: %d", label, errno);
   }

@@ -44,7 +44,7 @@ void avb_bridge_set_wifi_ap_sta_count(unsigned int count) {
 }
 
 static void bridge_task(void *arg) {
-  avb_state_s *state = (avb_state_s *)arg;
+  (void)arg;
   ESP_LOGI(TAG, "bridge L2 forwarding task started; ports=%d",
            CONFIG_ESP_AVB_NUM_PORTS);
 

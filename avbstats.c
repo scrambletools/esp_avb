@@ -171,6 +171,17 @@ static void avb_cpu_stats_tick(void) {
   avbinfo("  ====> PTP frames seen in emac_rx_cb this window: %u", dptp);
   s_prev_ptp_rx_seen = cur_ptp;
 
+  /* Per-ethertype RX breakdown into avb_unified_rx_cb (monotonic totals).
+   * Diagnostic for SoftAP→STA delivery: if total stays flat on a Wi-Fi
+   * endpoint while the bridge's fwd-wifi counter is climbing, the
+   * SoftAP isn't actually putting our frames OTA (or the STA filter
+   * is rejecting them). */
+  uint32_t rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other;
+  avb_net_rx_breakdown(&rx_total, &rx_avtp, &rx_msrp, &rx_mvrp, &rx_vlan,
+                       &rx_other);
+  avbinfo("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
+          rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other);
+
   /* EMAC DMA hardware missed-frame counter. missed_fc counts frames the
    * DMA discarded because the Host Receive Buffer was unavailable (the
    * RX descriptor ring was full). overflow_fc counts frames lost inside
