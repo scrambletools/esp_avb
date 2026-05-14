@@ -43,10 +43,6 @@
  *
  * IEEE 802.1Q-2018 §10.7. Per-attribute Applicant + Registrar.
  *
- * The existing direct-call MSRP path (avb_send_msrp_*,
- * avb_process_msrp_*) below in §6 remains the active path until
- * cutover. These SMs are not yet wired into RX/TX.
- *
  * Convention: the [sJ] optional send from observer states (relevant
  * only in point-to-point Ethernet links) is treated as a no-op here.
  * AVB SoftAP, Wi-Fi STA, and shared-media Ethernet are all "shared"
@@ -429,11 +425,11 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port) {
 
 /* ===== §6  MSRP application =====
  *
- * Existing direct-call path (avb_send_msrp_* / avb_process_msrp_*)
- * is below. Above that: SM-driven attribute tables, populated by
- * mrp_declare_* and mrp_rx() once the cutover happens. The two paths
- * coexist; cutover replaces the direct-call origination sites in
- * avb.c and the RX dispatch in avbnet.c.
+ * Origination via mrp_declare_* drives per-attribute Applicants in
+ * the typed tables defined below; RX flows through mrp_rx_msrp and
+ * dispatches to the on_*_registrar_change callbacks in §6a. The
+ * legacy direct-call avb_send_msrp_* / avb_process_msrp_* surface is
+ * gone — these SMs are the only path.
  */
 
 /* Per-port attribute tables. Linear-scan find/insert; tables are
@@ -607,9 +603,9 @@ static msrp_domain_entry_t *msrp_domain_find_or_insert(int port,
 /* ----- §6a  SM-driven RX entry point -----
  *
  * Walks an MSRP message buffer, dispatches peer events into the
- * matching per-attribute SMs. Not yet wired into the RX path; the
- * existing avb_process_msrp_* path below remains active until
- * cutover. */
+ * matching per-attribute SMs and fires the on_*_registrar_change
+ * application callbacks below for both endpoint bookkeeping and
+ * bridge MAP propagation. */
 
 /* Registrar transition direction for application/MAP dispatch.
  *
@@ -661,9 +657,7 @@ static uint16_t avb_msrp_mapping_index_for_class_id(uint8_t class_id);
 /* ----- Listener-side connection-tracking helpers used by the
  * listener callback. Operate on the talker-side output_streams[]
  * table; a peer listener's MSRP declarations drive msrp_ready /
- * asking_failed flags on the per-stream connected_listeners[] list.
- * Used to be at the bottom of §6 next to avb_process_msrp_listener;
- * relocated here so the callback (§6a) can reach them. */
+ * asking_failed flags on the per-stream connected_listeners[] list. */
 
 static int find_connected_listener(avb_talker_stream_s *stream,
                                    eth_addr_t *mac_addr) {
@@ -1152,10 +1146,10 @@ static mrp_reg_transition_e msrp_rx_domain_attr(
   return mrp_reg_transition(before, e->sm.registrar);
 }
 
-/* Walk an inbound MSRP buffer and dispatch SM events + run the
- * legacy application bookkeeping (avb_process_msrp_*) for each
- * attribute. This is the single MSRP RX entry point — the legacy
- * dispatch loop in avb_process_rx_message is gone. */
+/* Walk an inbound MSRP buffer and dispatch SM events + fire the
+ * on_*_registrar_change application callbacks for each attribute.
+ * Single MSRP RX entry point — avb_process_rx_message just calls
+ * here. */
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
                  size_t length, eth_addr_t *src_addr) {
   (void)length;
@@ -1252,8 +1246,8 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
 
 /* If the Applicant is already actively declaring (non-observer state),
  * a repeated call is treated as a refresh (Join!), not a fresh New!.
- * This matches the legacy direct-call path's periodic re-tx behavior
- * without resetting the SM's anxious/quiet cycle. */
+ * Lets the periodic-send loop call mrp_declare_* idempotently without
+ * resetting the SM's anxious/quiet cycle. */
 static mrp_event_e mrp_declare_event(const mrp_sm_state_t *sm) {
   switch (sm->applicant) {
   case mrp_applicant_vo:
@@ -1355,29 +1349,12 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
  *
  * Called from mrp_port_tick() when the JoinTimer expires. Walks each
  * attribute table, fires tx! into the Applicant SMs, and emits any
- * resulting pending TX actions as single-attribute MRPDUs.
- *
- * Cutover staging: while s_mrp_tx_shadow is true, the flush helpers
- * log what they would TX instead of calling avb_net_send. Flipped to
- * false after shadow-mode validation passed on ESP2 (2026-05-12);
- * SMs now actually transmit. With the legacy avb_send_msrp_* periodic
- * calls still in place this means doubled MSRP traffic — intentional
- * to let us compare wire frame counts. The next cutover step removes
- * the legacy calls. */
-static bool s_mrp_tx_shadow = false;
+ * resulting pending TX actions as single-attribute MRPDUs. */
 
-/* Forward decl — definition is in the existing direct-call section. */
+/* Forward decl — definition is below in §6, after the periodic
+ * declare helpers. */
 static int avb_send_msrp_attr(avb_state_s *state, void *attr,
                               int attr_list_len, const char *label);
-
-static const char *mrp_tx_action_name(mrp_tx_action_e a) {
-  switch (a) {
-  case mrp_tx_new: return "sN";
-  case mrp_tx_join: return "sJ";
-  case mrp_tx_leave: return "sL";
-  default: return "?";
-  }
-}
 
 /* Resolve an Applicant TX action to a concrete 3pe event value (0..5)
  * given the current Registrar state. sJ → JoinIn (1) if Registrar IN,
@@ -1416,12 +1393,6 @@ static void mrp_tx_flush_talker(avb_state_s *state, int port,
   } else {
     msg.talker_failed.event_data[0] = int_to_3pe(pe, 0, 0);
   }
-  if (s_mrp_tx_shadow) {
-    avbinfo("mrp shadow: would TX talker_%s %s (port %d, pe=%d)",
-            (e->attr_type == msrp_attr_type_talker_advertise) ? "adv" : "failed",
-            mrp_tx_action_name(e->sm.pending_tx), port, pe);
-    return;
-  }
   avb_send_msrp_attr(state, &msg, attr_list_len,
                      (e->attr_type == msrp_attr_type_talker_advertise)
                          ? "talker advertise"
@@ -1447,11 +1418,6 @@ static void mrp_tx_flush_listener(avb_state_s *state, int port,
   msg.event_decl_data[1].declaration.event2 = 0;
   msg.event_decl_data[1].declaration.event3 = 0;
   msg.event_decl_data[1].declaration.event4 = 0;
-  if (s_mrp_tx_shadow) {
-    avbinfo("mrp shadow: would TX listener %s (port %d, pe=%d, decl=%d)",
-            mrp_tx_action_name(e->sm.pending_tx), port, pe, e->decl_event);
-    return;
-  }
   avb_send_msrp_attr(state, &msg, attr_list_len, "listener");
 }
 
@@ -1468,11 +1434,6 @@ static void mrp_tx_flush_domain(avb_state_s *state, int port,
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
   if (pe < 0) return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
-  if (s_mrp_tx_shadow) {
-    avbinfo("mrp shadow: would TX domain %s (port %d, pe=%d, class=%u)",
-            mrp_tx_action_name(e->sm.pending_tx), port, pe, e->wire.sr_class_id);
-    return;
-  }
   avb_send_msrp_attr(state, &msg, attr_list_len, "domain");
 }
 
@@ -1725,15 +1686,8 @@ static void mvrp_tx_emit(avb_state_s *state, int port, mvrp_vlan_entry_t *e,
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
   if (pe < 0) return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
-  if (s_mrp_tx_shadow) {
-    avbinfo("mrp shadow: would TX vlan %s (port %d, pe=%d, vid=%u)",
-            mrp_tx_action_name(e->sm.pending_tx), port, pe,
-            (msg.vlan_id[0] << 8) | msg.vlan_id[1]);
-    return;
-  }
-  /* MVRP MRPDU size, matching the legacy avb_send_mvrp_vlan_id:
-   *   protocol_ver(1) + header(4) + vlan_id(2) + attr_event(1)
-   *   + end-mark-list(2) + end-mark-msg(2) = 12. */
+  /* MVRP MRPDU size: protocol_ver(1) + header(4) + vlan_id(2) +
+   * attr_event(1) + end-mark-list(2) + end-mark-msg(2) = 12. */
   struct timespec ts;
   (void)avb_net_send_on(state, port, ethertype_mvrp, &msg, 12, &ts);
 }
@@ -2042,13 +1996,13 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
  * 75 % of the port bandwidth, and Class B shares that 75 % budget.
  * The bridge tracks per-port-per-class running bandwidth and rejects
  * a TALKER_ADVERTISE propagation when admitted + new would exceed the
- * cap. Hooked into avb_process_msrp_talker so an over-budget request
- * propagates as TALKER_FAILED with failure_code =
- * insufficient_bandwidth_for_traffic_class (avb.h:407).
+ * cap. Hooked into mrp_on_talker_registrar_change (§6a) so an
+ * over-budget request propagates as TALKER_FAILED with failure_code
+ * = insufficient_bandwidth_for_traffic_class.
  *
- * On Wi-Fi the bridge admits Class B only; Class A reservations
- * propagating from the wired side onto the wireless egress are
- * rejected at admission rather than dropped at forwarding time.
+ * On Wi-Fi the bridge skips Class A entirely (Wi-Fi efficiency
+ * cut #1) — no listener can honor the 125 µs SLA. Class B is
+ * admitted normally.
  *
  * Excluded from endpoint builds via CONFIG_ESP_AVB_ROLE_BRIDGE.
  * ====================================================================== */
