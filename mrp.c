@@ -461,6 +461,12 @@ typedef struct {
   bool valid;
   msrp_listener_message_s wire;
   msrp_listener_event_t decl_event; /* asking_failed / ready / ready_failed */
+  /* Peer's most recent declaration on this port, populated by
+   * msrp_rx_listener_attr. Distinct from decl_event (which records
+   * what WE declare on egress) so a bridge can read each port's
+   * peer-side decl independently when computing the §35.2.4.4.3
+   * merged value for the talker-facing port. */
+  msrp_listener_event_t peer_decl;
   mrp_sm_state_t sm;
 } msrp_listener_entry_t;
 
@@ -915,9 +921,54 @@ static void mrp_on_talker_registrar_change(
 #endif
 }
 
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+/* IEEE 802.1Q-2018 §35.2.4.4.3 — merge listener declarations from
+ * every bridged port except `exclude_port` for `stream_id`. Returns
+ * true and writes *out if at least one downstream listener has its
+ * Registrar IN for this stream; false otherwise (caller should
+ * withdraw on the egress port).
+ *
+ *   any Ready Failed                       -> Ready Failed
+ *   any Ready + any Asking Failed          -> Ready Failed
+ *   any Ready, no failed                   -> Ready
+ *   only Asking Failed                     -> Asking Failed
+ *
+ * Only Registrar=IN entries contribute; LV/MT means the peer's
+ * declaration is no longer live and must not pin the merged value. */
+static bool msrp_merge_listener_decls(int exclude_port,
+                                      const unique_id_t *stream_id,
+                                      msrp_listener_event_t *out) {
+  bool any_ready = false;
+  bool any_asking = false;
+  bool any_ready_failed = false;
+  for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
+    if (p == exclude_port) continue;
+    msrp_listener_entry_t *e = msrp_listener_find(p, stream_id);
+    if (e == NULL) continue;
+    if (e->sm.registrar != mrp_registrar_in) continue;
+    switch (e->peer_decl) {
+    case msrp_listener_event_ready:        any_ready = true; break;
+    case msrp_listener_event_asking_failed: any_asking = true; break;
+    case msrp_listener_event_ready_failed:  any_ready_failed = true; break;
+    default: break;
+    }
+  }
+  if (!any_ready && !any_asking && !any_ready_failed) return false;
+  if (any_ready_failed || (any_ready && any_asking)) {
+    *out = msrp_listener_event_ready_failed;
+  } else if (any_ready) {
+    *out = msrp_listener_event_ready;
+  } else {
+    *out = msrp_listener_event_asking_failed;
+  }
+  return true;
+}
+#endif
+
 static void mrp_on_listener_registrar_change(
     avb_state_s *state, int port, const msrp_listener_message_s *wire,
-    mrp_reg_transition_e tr, eth_addr_t *src_addr) {
+    mrp_reg_transition_e tr, bool peer_decl_changed,
+    eth_addr_t *src_addr) {
   /* §35.2.2.4.4 listener declaration nibble lives in event_decl_data[1]
    * event1 (2 bits). Values match msrp_listener_event_t (1=AskingFailed,
    * 2=Ready, 3=ReadyFailed). */
@@ -1008,8 +1059,13 @@ static void mrp_on_listener_registrar_change(
   }
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
-  /* ----- Bridge MAP propagation — transition-edge only ----- */
-  if (tr == mrp_reg_transition_none) return;
+  /* ----- Bridge MAP propagation with §35.2.4.4.3 merging -----
+   * Fire when the peer's Registrar transitioned (join/leave edge)
+   * OR when the peer's declaration nibble changed mid-registration
+   * (e.g. Ready -> AskingFailed). For each other bridged port,
+   * recompute the merged value across all remaining peers and
+   * re-declare only when the merged decl actually changes. */
+  if (tr == mrp_reg_transition_none && !peer_decl_changed) return;
   if (state->port[port].type != avb_port_type_bridged) return;
 
   const unique_id_t *stream_id = (const unique_id_t *)&wire->stream_id;
@@ -1017,14 +1073,24 @@ static void mrp_on_listener_registrar_change(
     if (y == port) continue;
     if (state->port[y].type != avb_port_type_bridged) continue;
 
-    if (tr == mrp_reg_transition_deregister) {
-      mrp_withdraw_listener(state, y, stream_id);
+    msrp_listener_event_t merged;
+    bool has_merged = msrp_merge_listener_decls(y, stream_id, &merged);
+    msrp_listener_entry_t *egress = msrp_listener_find(y, stream_id);
+    bool currently_declaring =
+        (egress != NULL && egress->sm.applicant != mrp_applicant_vo);
+
+    if (!has_merged) {
+      if (currently_declaring) {
+        mrp_withdraw_listener(state, y, stream_id);
+      }
     } else {
-      mrp_declare_listener(state, y, stream_id, decl);
+      if (!currently_declaring || egress->decl_event != merged) {
+        mrp_declare_listener(state, y, stream_id, merged);
+      }
     }
   }
 #else
-  (void)port; (void)tr;
+  (void)port; (void)tr; (void)peer_decl_changed;
 #endif
 }
 
@@ -1116,10 +1182,14 @@ static mrp_reg_transition_e msrp_rx_talker_attr(
 
 /* Process one LISTENER attribute. */
 static mrp_reg_transition_e msrp_rx_listener_attr(
-    int port, const msrp_listener_message_s *wire) {
+    int port, const msrp_listener_message_s *wire,
+    bool *peer_decl_changed_out) {
   msrp_listener_entry_t *e = msrp_listener_find_or_insert(
       port, (const unique_id_t *)&wire->stream_id);
-  if (e == NULL) return mrp_reg_transition_none;
+  if (e == NULL) {
+    if (peer_decl_changed_out) *peer_decl_changed_out = false;
+    return mrp_reg_transition_none;
+  }
   memcpy(&e->wire, wire, sizeof(*wire));
   /* event_decl_data[0] carries both the 3pe attribute event and the
    * 4pe listener-declaration nibble. Decode the attribute event. */
@@ -1127,9 +1197,16 @@ static mrp_reg_transition_e msrp_rx_listener_attr(
   three_pe_to_int(wire->event_decl_data[0].event, &e1, &e2, &e3);
   mrp_registrar_state_e before = e->sm.registrar;
   mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
-  /* The listener-declaration (asking_failed / ready / ready_failed)
-   * lives in event_decl_data[1].declaration per the spec; cutover
-   * will copy it into e->decl_event. */
+  /* Track the peer's declaration nibble (asking_failed / ready /
+   * ready_failed) separately from our outbound decl_event. Bridge
+   * MAP needs the peer-side value to compute §35.2.4.4.3 merges
+   * across ports without confusing it with our own egress decl. */
+  msrp_listener_event_t new_peer_decl =
+      (msrp_listener_event_t)wire->event_decl_data[1].declaration.event1;
+  if (peer_decl_changed_out) {
+    *peer_decl_changed_out = (new_peer_decl != e->peer_decl);
+  }
+  e->peer_decl = new_peer_decl;
   return mrp_reg_transition(before, e->sm.registrar);
 }
 
@@ -1195,8 +1272,11 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
     case msrp_attr_type_listener: {
       msrp_listener_message_s wire;
       memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      mrp_reg_transition_e tr = msrp_rx_listener_attr(port, &wire);
-      mrp_on_listener_registrar_change(state, port, &wire, tr, src_addr);
+      bool peer_decl_changed = false;
+      mrp_reg_transition_e tr =
+          msrp_rx_listener_attr(port, &wire, &peer_decl_changed);
+      mrp_on_listener_registrar_change(state, port, &wire, tr,
+                                       peer_decl_changed, src_addr);
       break;
     }
     default:
@@ -1353,7 +1433,7 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
 
 /* Forward decl — definition is below in §6, after the periodic
  * declare helpers. */
-static int avb_send_msrp_attr(avb_state_s *state, int port, void *attr,
+static int mrp_send_attr(avb_state_s *state, int port, void *attr,
                               int attr_list_len, const char *label);
 
 /* Resolve an Applicant TX action to a concrete 3pe event value (0..5)
@@ -1393,7 +1473,7 @@ static void mrp_tx_flush_talker(avb_state_s *state, int port,
   } else {
     msg.talker_failed.event_data[0] = int_to_3pe(pe, 0, 0);
   }
-  avb_send_msrp_attr(state, port, &msg, attr_list_len,
+  mrp_send_attr(state, port, &msg, attr_list_len,
                      (e->attr_type == msrp_attr_type_talker_advertise)
                          ? "talker advertise"
                          : "talker failed");
@@ -1418,7 +1498,7 @@ static void mrp_tx_flush_listener(avb_state_s *state, int port,
   msg.event_decl_data[1].declaration.event2 = 0;
   msg.event_decl_data[1].declaration.event3 = 0;
   msg.event_decl_data[1].declaration.event4 = 0;
-  avb_send_msrp_attr(state, port, &msg, attr_list_len, "listener");
+  mrp_send_attr(state, port, &msg, attr_list_len, "listener");
 }
 
 static void mrp_tx_flush_domain(avb_state_s *state, int port,
@@ -1434,7 +1514,7 @@ static void mrp_tx_flush_domain(avb_state_s *state, int port,
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
   if (pe < 0) return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
-  avb_send_msrp_attr(state, port, &msg, attr_list_len, "domain");
+  mrp_send_attr(state, port, &msg, attr_list_len, "domain");
 }
 
 /* MVRP per-port flush, defined in §7. Iterates s_mvrp_vlans[port]
@@ -1741,7 +1821,7 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
   return (uint16_t)(14 /*ETH*/ + 4 /*VLAN*/ + avtp_hdr + payload);
 }
 
-static int avb_send_msrp_attr(avb_state_s *state, int port, void *attr,
+static int mrp_send_attr(avb_state_s *state, int port, void *attr,
                               int attr_list_len, const char *label) {
   size_t attr_size = 4 + attr_list_len; /* attr hdr w/o vechead + attr list */
   struct timespec ts;
