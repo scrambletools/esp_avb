@@ -56,6 +56,30 @@ void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
   if (wifi_oom)  *wifi_oom  = s_fwd_wifi_oom;
 }
 
+/* Ingress-port lookup by medium. Populated once at avb_net_init from
+ * the per-port topology (state->port[].medium) so the RX callback
+ * doesn't need to know whether it's running on a bridge (port[0]=eth,
+ * port[1]=wifi) or an endpoint (single port, either medium). -1 means
+ * "no port configured for this medium" — RX from that medium is
+ * dropped. */
+static int s_eth_port_idx = -1;
+static int s_wifi_port_idx = -1;
+
+static void avb_net_cache_port_indices(avb_state_s *state) {
+  s_eth_port_idx = -1;
+  s_wifi_port_idx = -1;
+  for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
+    if (!state->port[p].enabled) continue;
+    if (state->port[p].medium == avb_port_medium_ethernet &&
+        s_eth_port_idx < 0) {
+      s_eth_port_idx = p;
+    } else if (state->port[p].medium == avb_port_medium_wifi &&
+               s_wifi_port_idx < 0) {
+      s_wifi_port_idx = p;
+    }
+  }
+}
+
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 /* esp_wifi_internal_tx forward decl. Same rationale as the equivalent
  * decl above avb_net_transmit_raw further down — declared locally so
@@ -263,10 +287,18 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
         pkt.protocol_idx = AVTP;
         break;
       }
-      /* Ingress port: 0 = Ethernet (eth_handle non-NULL), 1 = Wi-Fi shim
-       * (eth_handle == NULL). On endpoint builds NUM_PORTS == 1 so it
-       * always lands at 0. */
-      pkt.ingress_port = (eth_handle == NULL) ? 1 : 0;
+      /* Ingress port is derived from the medium that delivered the
+       * frame: EMAC -> the port configured as ethernet, Wi-Fi
+       * (eth_handle NULL) -> the port configured as wifi. Indices are
+       * looked up once at init in avb_net_init so neither callback
+       * needs to know the bridge vs. endpoint topology. -1 means
+       * "no port configured for this medium" — drop the frame. */
+      int ingress = (eth_handle == NULL) ? s_wifi_port_idx : s_eth_port_idx;
+      if (ingress < 0) {
+        free(buf);
+        return ESP_OK;
+      }
+      pkt.ingress_port = (uint8_t)ingress;
       /* Copy source MAC from offset 6 */
       memcpy(pkt.src_addr, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
       /* Copy payload (strip ETH header) */
@@ -415,6 +447,10 @@ static int avb_net_init_port_l2tap(avb_state_s *state, int port_index) {
  * for the bridge's SoftAP).
  */
 int avb_net_init(avb_state_s *state) {
+  /* Cache RX port indices by medium so the unified RX callback can
+   * tag ingress without knowing the bridge/endpoint topology. */
+  avb_net_cache_port_indices(state);
+
   /* ---------- Port 0 ---------- */
   if (state->port[0].medium == avb_port_medium_ethernet) {
     /* L2TAP fds are kept even on the bridge build: the per-protocol

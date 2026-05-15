@@ -146,9 +146,13 @@ avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
       d.shaped = false;
       return d;
     }
-    /* Class A → Wi-Fi: dropped per v1 plan (Wi-Fi admits Class B
-     * only). egress_port == 1 means "Wi-Fi" here because the bridge
-     * is wired as port[0] = Ethernet, port[1] = Wi-Fi. */
+    /* Class A → Wi-Fi: dropped at the data plane as defense in depth.
+     * The MAP propagation in mrp.c already declares TALKER_FAILED for
+     * Class A streams egressing a Wi-Fi port, which keeps any
+     * conformant talker from emitting onto VLAN A in the first place
+     * (no Listener Ready ever reaches them). A non-conformant talker
+     * that streams anyway gets caught here. egress_port == 1 means
+     * "Wi-Fi" — bridge wires port[0] = Ethernet, port[1] = Wi-Fi. */
     if (d.sr_class == AVB_SR_CLASS_A && d.egress_port == 1) {
       d.verdict = AVB_BRIDGE_DROP;
       return d;

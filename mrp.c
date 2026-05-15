@@ -230,21 +230,22 @@ void mrp_registrar_step(mrp_sm_state_t *sm, mrp_event_e ev) {
   switch (ev) {
   case mrp_event_r_new:
   case mrp_event_r_join_in:
+  case mrp_event_r_join_mt:
   case mrp_event_r_in:
-    /* Peer is here. From any state → IN, cancel LeaveTimer. */
+    /* All Join-bearing receive events register the peer per §10.7.8
+     * Table 10-4. rJoinIn vs rJoinMt differ only in the *sender's*
+     * Registrar state — both encode an active Join action that the
+     * receiver must register. rIn is informational (sender Applicant
+     * in observer state, but Registrar IN) — register too, since the
+     * peer has the attribute. From any state → IN, cancel LeaveTimer. */
     next = mrp_registrar_in;
     leave_timer = 0;
     break;
 
-  case mrp_event_r_join_mt:
   case mrp_event_r_mt:
-    /* Peer is not registered (but their Applicant is alive). Go MT
-     * immediately if not currently leaving; if leaving, let the
-     * LeaveTimer run out. */
-    if (r != mrp_registrar_lv) {
-      next = mrp_registrar_mt;
-      leave_timer = 0;
-    }
+    /* rMt is purely informational: sender's Applicant is in observer
+     * state and their Registrar is empty. Not a Join, not a Leave;
+     * leave our Registrar where it is. */
     break;
 
   case mrp_event_r_lv:
@@ -785,19 +786,28 @@ static void mrp_on_talker_registrar_change(
     for (int i = 0; i < AVB_MAX_NUM_INPUT_STREAMS; i++) {
       if (memcmp(state->input_streams[i].stream_id, info->stream_id,
                  UNIQUE_ID_LEN) == 0) {
+        /* msrp_accumulated_latency and msrp_failure_code reflect the
+         * wire's CURRENT content and must be refreshed on every RX,
+         * not only on Registrar transition edges — otherwise an ACMP
+         * CONNECT that binds input_streams[i].stream_id AFTER the
+         * peer's first TALKER_FAILED arrival would miss the register
+         * edge and never record the failure code (steady-state
+         * subsequent RX is tr=none and would not fire the edge). */
         memcpy(state->input_streams[i].msrp_accumulated_latency,
                info->accumulated_latency, 4);
-        if (tr == mrp_reg_transition_register) {
-          if (is_failed_attr) {
-            state->input_streams[i].msrp_failure_code[0] =
-                wire->talker_failed.failure_code;
-            state->input_streams[i].msrp_failure_code[1] = 0;
-          } else {
-            /* Fresh ADVERTISE clears any stale failure. */
-            state->input_streams[i].msrp_failure_code[0] = 0;
-            state->input_streams[i].msrp_failure_code[1] = 0;
-          }
-        } else if (tr == mrp_reg_transition_deregister && is_failed_attr) {
+        if (is_failed_attr) {
+          state->input_streams[i].msrp_failure_code[0] =
+              wire->talker_failed.failure_code;
+          state->input_streams[i].msrp_failure_code[1] = 0;
+        } else {
+          /* Fresh TALKER_ADVERTISE supersedes any stale failure. */
+          state->input_streams[i].msrp_failure_code[0] = 0;
+          state->input_streams[i].msrp_failure_code[1] = 0;
+        }
+        /* Talker left a previously-failed registration: wipe the
+         * code so AECP doesn't keep reporting a stale failure after
+         * the talker is gone. */
+        if (tr == mrp_reg_transition_deregister && is_failed_attr) {
           state->input_streams[i].msrp_failure_code[0] = 0;
           state->input_streams[i].msrp_failure_code[1] = 0;
         }
@@ -887,13 +897,20 @@ static void mrp_on_talker_registrar_change(
       continue;
     }
 
-    /* Wi-Fi efficiency cut #1: skip Class A on wifi egress entirely.
-     * Class A requires 125 µs presentation; Wi-Fi can't deliver that
-     * SLA, so no Wi-Fi listener can act on the declaration. Strict
-     * spec would propagate as FAILED with not_available_for_use; we
-     * drop silently — equivalent outcome, less airtime burnt. */
+    /* Class A on Wi-Fi egress: 125 µs presentation budget cannot be
+     * met by any 802.11 medium, so the stream is not admissible. Per
+     * 802.1Q-2018 §35.2.4.3, declare TALKER_FAILED with
+     * insufficient_bandwidth_for_traffic_class so the downstream
+     * listener sees ReadyFailed and reports the problem upward. The
+     * earlier "silent skip" looked equivalent but actually masked the
+     * failure — ACMP/MSRP both reported SUCCESS while no audio could
+     * ever flow, because the talker never learned the path was
+     * broken. */
     if (state->port[y].medium == avb_port_medium_wifi &&
         new_cls == AVB_SR_CLASS_A) {
+      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
+                                insufficient_bandwidth_for_traffic_class,
+                                propagate_class_b);
       continue;
     }
 
