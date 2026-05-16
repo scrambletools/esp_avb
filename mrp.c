@@ -357,6 +357,10 @@ void mrp_port_init(avb_state_s *state, int port) {
   p->mrp_leaveall_tx_pending = false;
 }
 
+/* LeaveTimer dispatch helper — implementation after the §6/§7
+ * attribute tables it walks. Returns true if any Registrar fired. */
+static bool mrp_port_dispatch_leave_timers(int port, int64_t now);
+
 /* Called from avb_periodic / avb main loop on every tick. Fires
  * expired port-scoped timers. Returns true if anything fired. */
 bool mrp_port_tick(avb_state_s *state, int port) {
@@ -409,6 +413,14 @@ bool mrp_port_tick(avb_state_s *state, int port) {
     p->mrp_join_timer_us = 0; /* disarm; rearm when next state change */
     fired = true;
     mrp_tx_flush_port(state, port);
+  }
+
+  /* LeaveTimer dispatch — implementation below in §7 (after the
+   * MSRP / MVRP tables are declared). Without this, a peer that
+   * goes silent without rLv (yanked cable, crashed talker) holds
+   * its IN-state Registrar forever and keeps admission allocated. */
+  if (mrp_port_dispatch_leave_timers(port, now)) {
+    fired = true;
   }
 
   return fired;
@@ -1663,6 +1675,51 @@ typedef struct {
 
 static mvrp_vlan_entry_t
     s_mvrp_vlans[CONFIG_ESP_AVB_NUM_PORTS][MVRP_VLAN_TABLE_SIZE];
+
+/* LeaveTimer dispatch — declared in §1b above mrp_port_tick. The
+ * Registrar SM (§1) handles mrp_event_leave_timer (LV → MT)
+ * correctly; this loop is what actually delivers the event when
+ * the per-Registrar leave_timer_us expires. mrp_sm_step dispatches
+ * into both Applicant and Registrar; the Applicant ignores the
+ * leave-timer event so the cost of the unconditional dispatch on
+ * each entry is small. */
+static bool mrp_port_dispatch_leave_timers(int port, int64_t now) {
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return false;
+  bool fired = false;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
+    msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
+    if (!e->valid) continue;
+    if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      fired = true;
+    }
+  }
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; ++i) {
+    msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
+    if (!e->valid) continue;
+    if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      fired = true;
+    }
+  }
+  for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; ++i) {
+    msrp_domain_entry_t *e = &s_msrp_domains[port][i];
+    if (!e->valid) continue;
+    if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      fired = true;
+    }
+  }
+  for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; ++i) {
+    mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
+    if (!e->valid) continue;
+    if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      fired = true;
+    }
+  }
+  return fired;
+}
 
 static bool vlan_id_eq(const uint8_t *a, const uint8_t *b) {
   return a[0] == b[0] && a[1] == b[1];
