@@ -468,6 +468,13 @@ typedef struct {
    * content shifts) and trigger a withdraw + re-declare on egress
    * instead of leaving the egress Applicant stuck on the old class. */
   uint8_t last_propagated_priority;
+  /* TSpec snapshot at last propagation. Same purpose as
+   * last_propagated_priority but for stream-format / bps changes
+   * (SET_STREAM_FORMAT mid-life, e.g. 8ch→16ch or 48k→96k). Zero
+   * before first propagation; rewritten alongside the priority on
+   * every admit-declare. */
+  uint16_t last_propagated_mfs;
+  uint16_t last_propagated_mfi;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -900,15 +907,22 @@ static void mrp_on_talker_registrar_change(
   bool is_failed = (attr_type == msrp_attr_type_talker_failed);
 
   /* Look up the ingress-side entry so we can track and update the
-   * last-propagated priority. The entry was either just inserted or
-   * already existed when msrp_rx_talker_attr stepped its SM. */
+   * last-propagated priority + TSpec snapshot. The entry was either
+   * just inserted or already existed when msrp_rx_talker_attr
+   * stepped its SM. */
   msrp_talker_entry_t *ingress =
       msrp_talker_find(port, stream_id, attr_type);
   uint8_t old_priority = ingress ? ingress->last_propagated_priority : 0;
+  uint16_t old_mfs = ingress ? ingress->last_propagated_mfs : 0;
+  uint16_t old_mfi = ingress ? ingress->last_propagated_mfi : 0;
   avb_sr_class_e old_cls =
       (old_priority == 3) ? AVB_SR_CLASS_A : AVB_SR_CLASS_B;
   uint32_t old_intervals = (old_cls == AVB_SR_CLASS_A) ? 8000u : 4000u;
-  uint32_t old_bps = (uint32_t)mfs * (uint32_t)mfi * old_intervals * 8u;
+  /* Use the snapshotted TSpec for old_bps so a §35-mid-life
+   * SET_STREAM_FORMAT (mfs / mfi change) is detected even when the
+   * Registrar stays IN and class doesn't change. */
+  uint32_t old_bps =
+      (uint32_t)old_mfs * (uint32_t)old_mfi * old_intervals * 8u;
 
   /* Decide the kind of MAP work needed. */
   bool do_release = false;     /* release admission for old_cls/old_bps */
@@ -921,8 +935,13 @@ static void mrp_on_talker_registrar_change(
     do_withdraw = true;
     do_release = (old_priority != 0 && !is_failed);
   } else /* tr == none */ {
-    if (old_priority != 0 && old_priority != new_priority) {
-      /* Class (or priority) change mid-life — full cycle. */
+    bool priority_changed =
+        (old_priority != 0 && old_priority != new_priority);
+    bool tspec_changed = (old_priority != 0 && !is_failed &&
+                          (old_mfs != mfs || old_mfi != mfi));
+    if (priority_changed || tspec_changed) {
+      /* Mid-life change — full cycle to release old admission, withdraw
+       * stale advertise/failed, and re-admit at the new bps. */
       do_release = !is_failed;
       do_withdraw = true;
       do_admit_declare = true;
@@ -994,13 +1013,18 @@ static void mrp_on_talker_registrar_change(
     }
   }
 
-  /* Update the per-stream priority tracker so the next RX can detect
-   * subsequent class changes. */
+  /* Update the per-stream propagation snapshot so the next RX can
+   * detect subsequent class / TSpec changes. */
   if (ingress) {
-    if (do_admit_declare)
+    if (do_admit_declare) {
       ingress->last_propagated_priority = new_priority;
-    else if (do_withdraw)
+      ingress->last_propagated_mfs = mfs;
+      ingress->last_propagated_mfi = mfi;
+    } else if (do_withdraw) {
       ingress->last_propagated_priority = 0;
+      ingress->last_propagated_mfs = 0;
+      ingress->last_propagated_mfi = 0;
+    }
   }
 #else
   (void)port; (void)attr_type; (void)tr;
