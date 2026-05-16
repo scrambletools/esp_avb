@@ -747,6 +747,43 @@ static int find_or_add_msrp_listener(avb_state_s *state,
   return idx;
 }
 
+/* §35.2.2.8.6 helper — bridge's own forwarding-latency contribution
+ * for one egress port, in nanoseconds. Aggregated onto the inbound
+ * accumulated_latency at MAP propagation time. Estimate is worst-
+ * case full-MFS serialization at link rate plus a small bridge
+ * processing constant; refine when we have real per-egress queue
+ * measurements. Wi-Fi gets a much larger constant — variance is
+ * dominated by CSMA backoff and beacon-driven scheduling rather
+ * than nominal link rate. */
+static uint32_t avb_port_forwarding_latency_ns(const avb_port_s *p) {
+  const uint32_t bridge_proc_ns = 30000u; /* ~30 µs SoC proc + queue */
+  if (p->medium == avb_port_medium_wifi_ftm) {
+    return 500000u + bridge_proc_ns; /* ~500 µs Wi-Fi worst case */
+  }
+  uint32_t link_mbps = p->link_speed_mbps ? p->link_speed_mbps : 100u;
+  /* Serialization time = bits / link_rate. 1500 B = 12000 bits.
+   * 12000 ns/Mbps × 1000 = 12,000,000 / link_mbps ns per MFS. */
+  uint32_t ser_ns = 12000000u / link_mbps;
+  return ser_ns + bridge_proc_ns;
+}
+
+/* Patch the just-declared egress entry's accumulated_latency to the
+ * aggregated value (inbound + bridge contribution). Done AFTER
+ * mrp_declare_*_advertise / _failed because mrp_build_talker_info
+ * always rebuilds the field from a port-local default; the bridge
+ * propagation needs to override with the cumulative path latency
+ * per §35.2.2.8.6. */
+static void mrp_patch_egress_accumulated_latency(
+    int port, const unique_id_t *stream_id, msrp_attr_type_t attr_type,
+    uint32_t total_ns) {
+  msrp_talker_entry_t *eg = msrp_talker_find(port, stream_id, attr_type);
+  if (eg == NULL) return;
+  uint8_t *field = (attr_type == msrp_attr_type_talker_failed)
+                       ? eg->wire.talker_failed.info.accumulated_latency
+                       : eg->wire.talker.info.accumulated_latency;
+  int_to_octets(&total_ns, field, 4);
+}
+
 static bool any_listener_ready(avb_talker_stream_s *stream) {
   uint16_t count = octets_to_uint(stream->connection_count, 2);
   for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
@@ -841,6 +878,15 @@ static void mrp_on_talker_registrar_change(
    * old class indefinitely. */
   if (state->port[port].type != avb_port_type_bridged) return;
 
+  /* §35.2.2.8.6 accumulated_latency must aggregate the bridge's own
+   * forwarding contribution onto the inbound value as we propagate
+   * port→port. Inbound value lives in the wire info we just RX'd;
+   * the per-port forwarding-latency estimate comes from the link
+   * speed and medium (worst-case serialization for one full MFS
+   * frame plus a queueing/processing constant). */
+  uint32_t inbound_lat_ns =
+      (uint32_t)octets_to_uint(info->accumulated_latency, 4);
+
   const unique_id_t *stream_id = (const unique_id_t *)&info->stream_id;
   const eth_addr_t *dest = &info->stream_dest_addr;
   const uint8_t *vlan = info->vlan_id;
@@ -901,11 +947,16 @@ static void mrp_on_talker_registrar_change(
       continue;
     }
 
+    uint32_t egress_lat_ns =
+        inbound_lat_ns + avb_port_forwarding_latency_ns(&state->port[y]);
+
     if (is_failed) {
       /* Pass FAILED through verbatim — admission doesn't apply. */
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 wire->talker_failed.failure_code,
                                 propagate_class_b);
+      mrp_patch_egress_accumulated_latency(
+          y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
       continue;
     }
 
@@ -923,6 +974,8 @@ static void mrp_on_talker_registrar_change(
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b);
+      mrp_patch_egress_accumulated_latency(
+          y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
       continue;
     }
 
@@ -930,10 +983,14 @@ static void mrp_on_talker_registrar_change(
     if (adm == 0) {
       mrp_declare_talker_advertise(state, y, stream_id, dest, vlan, mfs,
                                    propagate_class_b);
+      mrp_patch_egress_accumulated_latency(
+          y, stream_id, msrp_attr_type_talker_advertise, egress_lat_ns);
     } else {
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b);
+      mrp_patch_egress_accumulated_latency(
+          y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
     }
   }
 
