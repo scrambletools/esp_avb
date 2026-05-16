@@ -382,12 +382,18 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const uint8_t *vlan_id,
                                   uint16_t max_frame_size,
                                   bool class_b);
+/* src_bridge_id: 8 bytes of the bridge that originally detected the
+ * failure (preserved on multi-bridge propagation per §35.2.4 cascade
+ * semantics). Pass NULL when *this* bridge / endpoint is the source
+ * of the failure; the function will then derive an EUI-64 from
+ * port[0]'s MAC. */
 void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const unique_id_t *stream_id,
                                const eth_addr_t *stream_dest_addr,
                                const uint8_t *vlan_id,
                                uint16_t max_frame_size, uint8_t failure_code,
-                               bool class_b);
+                               bool class_b,
+                               const uint8_t *src_bridge_id);
 void mrp_declare_listener(avb_state_s *state, int port,
                           const unique_id_t *stream_id,
                           msrp_listener_event_t decl);

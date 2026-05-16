@@ -970,10 +970,14 @@ static void mrp_on_talker_registrar_change(
         inbound_lat_ns + avb_port_forwarding_latency_ns(&state->port[y]);
 
     if (is_failed) {
-      /* Pass FAILED through verbatim — admission doesn't apply. */
+      /* Pass FAILED through verbatim — admission doesn't apply, and
+       * §35.2.4 cascade semantics require us to preserve the upstream
+       * bridge's failure_bridge_id rather than overwrite it with our
+       * own. */
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 wire->talker_failed.failure_code,
-                                propagate_class_b);
+                                propagate_class_b,
+                                wire->talker_failed.failure_bridge_id);
       mrp_patch_egress_accumulated_latency(
           y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
       continue;
@@ -992,7 +996,7 @@ static void mrp_on_talker_registrar_change(
         new_cls == AVB_SR_CLASS_A) {
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
-                                propagate_class_b);
+                                propagate_class_b, NULL);
       mrp_patch_egress_accumulated_latency(
           y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
       continue;
@@ -1007,7 +1011,7 @@ static void mrp_on_talker_registrar_change(
     } else {
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
-                                propagate_class_b);
+                                propagate_class_b, NULL);
       mrp_patch_egress_accumulated_latency(
           y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
     }
@@ -1472,7 +1476,8 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const uint8_t *vlan_id,
                                uint16_t max_frame_size,
                                uint8_t failure_code,
-                               bool class_b) {
+                               bool class_b,
+                               const uint8_t *src_bridge_id) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, stream_id, msrp_attr_type_talker_failed);
   if (e == NULL) return;
@@ -1481,21 +1486,27 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
   e->wire.talker_failed.failure_code = failure_code;
   /* §35.2.2.8.5 failure_bridge_id: 8-byte EUI-64 of the bridge that
-   * detected the failure, so listeners can identify *which* bridge
-   * along the path refused admission. EUI-64 from MAC per 802.1AS
-   * §8.5.2.2: insert 0xff:0xfe between bytes 3 and 4 of the 48-bit
-   * MAC. Use port[0]'s interface MAC (EMAC) — same value the gPTP
-   * daemon uses for clockIdentity, so a listener can cross-reference
-   * TALKER_FAILED's source against the GM hierarchy. */
-  const uint8_t *m = (const uint8_t *)state->port[0].internal_mac_addr;
-  e->wire.talker_failed.failure_bridge_id[0] = m[0];
-  e->wire.talker_failed.failure_bridge_id[1] = m[1];
-  e->wire.talker_failed.failure_bridge_id[2] = m[2];
-  e->wire.talker_failed.failure_bridge_id[3] = 0xff;
-  e->wire.talker_failed.failure_bridge_id[4] = 0xfe;
-  e->wire.talker_failed.failure_bridge_id[5] = m[3];
-  e->wire.talker_failed.failure_bridge_id[6] = m[4];
-  e->wire.talker_failed.failure_bridge_id[7] = m[5];
+   * originally detected the failure. On propagation through a
+   * cascade of bridges, the field must preserve the upstream's
+   * identity, not be overwritten by each transit bridge — otherwise
+   * the listener loses sight of which hop refused admission. The
+   * caller passes the upstream's id when propagating (bridge MAP);
+   * passes NULL when *this* node is the origin (endpoint or this
+   * bridge's own admission refusal). EUI-64 from MAC per 802.1AS
+   * §8.5.2.2: insert 0xff:0xfe between bytes 3 and 4. */
+  if (src_bridge_id != NULL) {
+    memcpy(e->wire.talker_failed.failure_bridge_id, src_bridge_id, 8);
+  } else {
+    const uint8_t *m = (const uint8_t *)state->port[0].internal_mac_addr;
+    e->wire.talker_failed.failure_bridge_id[0] = m[0];
+    e->wire.talker_failed.failure_bridge_id[1] = m[1];
+    e->wire.talker_failed.failure_bridge_id[2] = m[2];
+    e->wire.talker_failed.failure_bridge_id[3] = 0xff;
+    e->wire.talker_failed.failure_bridge_id[4] = 0xfe;
+    e->wire.talker_failed.failure_bridge_id[5] = m[3];
+    e->wire.talker_failed.failure_bridge_id[6] = m[4];
+    e->wire.talker_failed.failure_bridge_id[7] = m[5];
+  }
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_port_arm_join_timer(state, port);
 }
