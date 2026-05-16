@@ -332,7 +332,7 @@ void mrp_tx_flush_port(avb_state_s *state, int port);
 static int64_t mrp_leaveall_next_expiry_us(const avb_port_s *p) {
   uint32_t base = MRP_LEAVEALL_TIMER_US;
   uint32_t jitter_span = 5 * 1000 * 1000;
-  if (p->medium == avb_port_medium_wifi) {
+  if (p->medium == avb_port_medium_wifi_ftm) {
     base = MRP_LEAVEALL_TIMER_WIFI_US;
     jitter_span = MRP_LEAVEALL_JITTER_WIFI_US;
   }
@@ -381,7 +381,7 @@ bool mrp_port_tick(avb_state_s *state, int port) {
   if (p->mrp_leaveall_timer_us != 0 && now >= p->mrp_leaveall_timer_us) {
     bool suppress = false;
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
-    if (p->medium == avb_port_medium_wifi &&
+    if (p->medium == avb_port_medium_wifi_ftm &&
         p->wifi_mode == avb_port_wifi_mode_ap &&
         avb_bridge_wifi_ap_sta_count() == 0) {
       suppress = true;
@@ -988,7 +988,7 @@ static void mrp_on_talker_registrar_change(
      * failure — ACMP/MSRP both reported SUCCESS while no audio could
      * ever flow, because the talker never learned the path was
      * broken. */
-    if (state->port[y].medium == avb_port_medium_wifi &&
+    if (state->port[y].medium == avb_port_medium_wifi_ftm &&
         new_cls == AVB_SR_CLASS_A) {
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
