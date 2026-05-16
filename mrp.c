@@ -1387,8 +1387,22 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
   mrp_build_talker_info(state, &e->wire.talker_failed.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
   e->wire.talker_failed.failure_code = failure_code;
-  /* failure_bridge_id is left zero — the bridge will populate it when
-   * it generates a real TALKER_FAILED. */
+  /* §35.2.2.8.5 failure_bridge_id: 8-byte EUI-64 of the bridge that
+   * detected the failure, so listeners can identify *which* bridge
+   * along the path refused admission. EUI-64 from MAC per 802.1AS
+   * §8.5.2.2: insert 0xff:0xfe between bytes 3 and 4 of the 48-bit
+   * MAC. Use port[0]'s interface MAC (EMAC) — same value the gPTP
+   * daemon uses for clockIdentity, so a listener can cross-reference
+   * TALKER_FAILED's source against the GM hierarchy. */
+  const uint8_t *m = (const uint8_t *)state->port[0].internal_mac_addr;
+  e->wire.talker_failed.failure_bridge_id[0] = m[0];
+  e->wire.talker_failed.failure_bridge_id[1] = m[1];
+  e->wire.talker_failed.failure_bridge_id[2] = m[2];
+  e->wire.talker_failed.failure_bridge_id[3] = 0xff;
+  e->wire.talker_failed.failure_bridge_id[4] = 0xfe;
+  e->wire.talker_failed.failure_bridge_id[5] = m[3];
+  e->wire.talker_failed.failure_bridge_id[6] = m[4];
+  e->wire.talker_failed.failure_bridge_id[7] = m[5];
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_port_arm_join_timer(state, port);
 }
