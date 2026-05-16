@@ -41,10 +41,16 @@ typedef enum {
   avb_role_bridge = 2,
 } avb_role_e;
 
-/* Per-port physical medium. */
+/* Per-port medium + timing-mechanism. Mirrors ptp_port_medium_e in
+ * esp_ptp:
+ *   eth_hwts — Ethernet medium with IEEE 1588 HW timestamping and
+ *              on-wire 802.1AS Pdelay.
+ *   wifi_ftm — Wi-Fi medium with IEEE 802.11mc FTM peer-delay and
+ *              Sync transported in the SoftAP's 802.11 Beacon Vendor
+ *              IE. */
 typedef enum {
-  avb_port_medium_ethernet = 0,
-  avb_port_medium_wifi = 1,
+  avb_port_medium_eth_hwts = 0,
+  avb_port_medium_wifi_ftm = 1,
 } avb_port_medium_e;
 
 /* Port-host-interface. How the port attaches to the host SoC.

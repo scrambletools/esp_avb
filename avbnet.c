@@ -70,10 +70,10 @@ static void avb_net_cache_port_indices(avb_state_s *state) {
   s_wifi_port_idx = -1;
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
     if (!state->port[p].enabled) continue;
-    if (state->port[p].medium == avb_port_medium_ethernet &&
+    if (state->port[p].medium == avb_port_medium_eth_hwts &&
         s_eth_port_idx < 0) {
       s_eth_port_idx = p;
-    } else if (state->port[p].medium == avb_port_medium_wifi &&
+    } else if (state->port[p].medium == avb_port_medium_wifi_ftm &&
                s_wifi_port_idx < 0) {
       s_wifi_port_idx = p;
     }
@@ -130,7 +130,7 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
   }
   avb_port_s *p = &s_bridge_state->port[egress_port];
 
-  if (p->medium == avb_port_medium_ethernet) {
+  if (p->medium == avb_port_medium_eth_hwts) {
     if (s_bridge_state->config.eth_handle) {
       esp_err_t r = esp_eth_transmit(s_bridge_state->config.eth_handle,
                                      (void *)frame, len);
@@ -139,7 +139,7 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
     return;
   }
 
-  if (p->medium == avb_port_medium_wifi) {
+  if (p->medium == avb_port_medium_wifi_ftm) {
     void *buf = malloc(len);
     if (!buf) {
       s_fwd_wifi_oom++;
@@ -452,7 +452,7 @@ int avb_net_init(avb_state_s *state) {
   avb_net_cache_port_indices(state);
 
   /* ---------- Port 0 ---------- */
-  if (state->port[0].medium == avb_port_medium_ethernet) {
+  if (state->port[0].medium == avb_port_medium_eth_hwts) {
     /* L2TAP fds are kept even on the bridge build: the per-protocol
      * fds are used by the TX path (avb_net_send_to writes the frame
      * via write(l2if[ethertype], ...) which routes to esp_eth_transmit).
@@ -472,7 +472,7 @@ int avb_net_init(avb_state_s *state) {
     }
     esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR,
                   &state->port[0].internal_mac_addr);
-  } else if (state->port[0].medium == avb_port_medium_wifi) {
+  } else if (state->port[0].medium == avb_port_medium_wifi_ftm) {
     /* Wi-Fi endpoint or AP. No L2TAP — esp_vfs_l2tap is Ethernet-only
      * in IDF. MAC + netif handle come from esp_netif (medium-agnostic);
      * data-plane RX/TX is wired further down via esp_wifi_internal_*. */
@@ -499,7 +499,7 @@ int avb_net_init(avb_state_s *state) {
 
   /* ---------- Port 1+ : Wi-Fi (or other media) ---------- */
 #if CONFIG_ESP_AVB_NUM_PORTS > 1
-  if (state->port[1].medium == avb_port_medium_wifi) {
+  if (state->port[1].medium == avb_port_medium_wifi_ftm) {
     /* Wi-Fi: skip L2TAP (esp_vfs_l2tap is Ethernet-only in IDF) and
      * mirror the port[0]-wifi path — resolve the netif by if_key, pull
      * the MAC via esp_netif. RX/TX wiring happens further down via
@@ -523,7 +523,7 @@ int avb_net_init(avb_state_s *state) {
             state->port[1].internal_mac_addr[3],
             state->port[1].internal_mac_addr[4],
             state->port[1].internal_mac_addr[5]);
-  } else if (state->port[1].medium == avb_port_medium_ethernet) {
+  } else if (state->port[1].medium == avb_port_medium_eth_hwts) {
     /* Second Ethernet — same setup pattern as port 0 (not exercised
      * in current bridge designs). */
     if (avb_net_init_port_l2tap(state, 1) != OK) {
@@ -544,7 +544,7 @@ int avb_net_init(avb_state_s *state) {
    * the EMAC's input-path hook; on Wi-Fi (c6 endpoint) it's the
    * esp_wifi_internal_reg_rxcb shim that adapts the Wi-Fi RX buffer
    * ownership model and re-enters avb_unified_rx_cb. */
-  if (state->port[0].medium == avb_port_medium_ethernet) {
+  if (state->port[0].medium == avb_port_medium_eth_hwts) {
     s_eth_netif = esp_netif_get_handle_from_ifkey(state->config.eth_interface);
     esp_eth_update_input_path_info(state->config.eth_handle, avb_unified_rx_cb,
                                    s_eth_netif);
@@ -571,7 +571,7 @@ int avb_net_init(avb_state_s *state) {
    * via esp_wifi_remote_channel_rx → avb_wifi_rx_cb → avb_unified_rx_cb
    * with eth_handle=NULL (= ingress_port 1). */
 #if CONFIG_ESP_AVB_NUM_PORTS > 1
-  if (state->port[1].medium == avb_port_medium_wifi) {
+  if (state->port[1].medium == avb_port_medium_wifi_ftm) {
     avbinfo("Bridge L2 forwarder armed: Eth(port0) <-> Wi-Fi-AP(port1) "
             "(via esp_wifi_remote_channel_rx override)");
   } else {
@@ -625,7 +625,7 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
 
   /* Wi-Fi port: L2TAP is Ethernet-only, so we bypass the per-ethertype
    * fds and push the frame straight at the Wi-Fi driver. */
-  if (state->port[0].medium == avb_port_medium_wifi) {
+  if (state->port[0].medium == avb_port_medium_wifi_ftm) {
     return (avb_net_transmit_raw(NULL, eth_frame, sizeof(eth_frame)) == ESP_OK)
                ? (int)sizeof(eth_frame)
                : ERROR;
@@ -666,7 +666,7 @@ int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
                        vlan_id);
 
   /* Wi-Fi port: L2TAP is Ethernet-only — go straight to wifi raw TX. */
-  if (state->port[0].medium == avb_port_medium_wifi) {
+  if (state->port[0].medium == avb_port_medium_wifi_ftm) {
     return (avb_net_transmit_raw(NULL, eth_frame, sizeof(eth_frame)) == ESP_OK)
                ? (int)sizeof(eth_frame)
                : ERROR;
@@ -777,7 +777,7 @@ int avb_net_send_on(avb_state_s *state, int port_index,
                        NULL);
   memcpy(eth_frame + ETH_ADDR_LEN, p->internal_mac_addr, ETH_ADDR_LEN);
 
-  if (p->medium == avb_port_medium_wifi) {
+  if (p->medium == avb_port_medium_wifi_ftm) {
     /* Use this port's wifi_mode (numerically WIFI_IF_STA=0 or
      * WIFI_IF_AP=1) as the IDF wifi_if argument. Heap-copy the
      * buffer — some IDF wifi builds hold a reference until tx_done. */
@@ -795,7 +795,7 @@ int avb_net_send_on(avb_state_s *state, int port_index,
     return (r == ESP_OK) ? (int)sizeof(eth_frame) : ERROR;
   }
 
-  if (p->medium == avb_port_medium_ethernet) {
+  if (p->medium == avb_port_medium_eth_hwts) {
     int l2if;
     switch (ethertype) {
     case ethertype_avtp: l2if = p->l2if[AVTP]; break;

@@ -202,10 +202,10 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * last_transmitted_* timers) lives in state->port[0] and is
    * populated by avb_net_init and the periodic-send paths. */
   state->port[0].enabled = true;
-#if defined(CONFIG_ESP_AVB_PORT0_MEDIUM_WIFI)
-  state->port[0].medium = avb_port_medium_wifi;
+#if defined(CONFIG_ESP_AVB_PORT0_MEDIUM_WIFI_FTM)
+  state->port[0].medium = avb_port_medium_wifi_ftm;
 #else
-  state->port[0].medium = avb_port_medium_ethernet;
+  state->port[0].medium = avb_port_medium_eth_hwts;
 #endif
 #if defined(CONFIG_ESP_AVB_PORT0_HOST_IF_EMAC)
   state->port[0].host_if = avb_port_host_if_emac;
@@ -261,10 +261,10 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * (internal_mac_addr, l2if[], last_transmitted_*) is populated by
    * avb_net_init's per-port loop. */
   state->port[1].enabled = true;
-#if defined(CONFIG_ESP_AVB_PORT1_MEDIUM_WIFI)
-  state->port[1].medium = avb_port_medium_wifi;
+#if defined(CONFIG_ESP_AVB_PORT1_MEDIUM_WIFI_FTM)
+  state->port[1].medium = avb_port_medium_wifi_ftm;
 #else
-  state->port[1].medium = avb_port_medium_ethernet;
+  state->port[1].medium = avb_port_medium_eth_hwts;
 #endif
 #if defined(CONFIG_ESP_AVB_PORT1_HOST_IF_EMAC)
   state->port[1].host_if = avb_port_host_if_emac;
@@ -406,7 +406,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * ports the bridge's v1 admission policy admits Class B only, so
    * the endpoint advertises Class B and not Class A there. On wired
    * Ethernet we keep the historical Class A advertisement. */
-  if (state->port[0].medium == avb_port_medium_wifi) {
+  if (state->port[0].medium == avb_port_medium_wifi_ftm) {
     entity_caps.class_a = false;
     entity_caps.class_b = true;
   } else {
@@ -537,7 +537,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * Class A on a Wi-Fi endpoint creates an MSRP TALKER ADVERTISE ↔
    * TALKER_FAILED feedback loop that floods the wireless channel.
    * Wired ports keep the historical Class A default. */
-  bool stream_class_b = (state->port[0].medium == avb_port_medium_wifi);
+  bool stream_class_b = (state->port[0].medium == avb_port_medium_wifi_ftm);
   aem_stream_info_flags_s info_flags = {.stream_vlan_id_valid = 1,
                                         .stream_format_valid = 1,
                                         .stream_id_valid = 1,
@@ -616,7 +616,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // call would otherwise crash on s_state==NULL even with its own
   // NULL guard — observed under -O2 the guard branch didn't reliably
   // bypass the s_state-> stores on at least one build.
-  if (state->port[0].medium == avb_port_medium_ethernet) {
+  if (state->port[0].medium == avb_port_medium_eth_hwts) {
     struct ptpd_status_s ptp_status;
     if (ptpd_status(0, &ptp_status) == 0) {
       state->ptp_status = ptp_status;
@@ -656,7 +656,7 @@ static int avb_destroy_state(avb_state_s *state) {
  * call site: skip on wifi-medium ports — ptpd isn't started there;
  * the wifi endpoint syncs via beacon-IE FollowUpInformation. */
 static void avb_update_ptp_status(avb_state_s *state) {
-  if (state->port[0].medium != avb_port_medium_ethernet) {
+  if (state->port[0].medium != avb_port_medium_eth_hwts) {
     return;
   }
   struct ptpd_status_s ptp_status;

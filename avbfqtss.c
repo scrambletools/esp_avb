@@ -161,7 +161,7 @@ int avb_fqtss_init(avb_state_s *state) {
      * at 0 (unknown) until set_idle_slope is called with the
      * negotiated MCS rate. */
     int64_t link_bps =
-        (state->port[p].medium == avb_port_medium_ethernet) ? 1000000000LL : 0LL;
+        (state->port[p].medium == avb_port_medium_eth_hwts) ? 1000000000LL : 0LL;
     for (int cl = 0; cl < AVB_SR_CLASS_COUNT; cl++) {
       fqtss_class_state_t *cs = &s_class[p][cl];
       cs->link_rate_bps = link_bps;
