@@ -10,6 +10,7 @@
  */
 
 #include "avb.h"
+#include "avbbridge.h"
 #include "audio_codec_if.h"
 #include "esp_codec_dev.h"
 #include "esp_timer.h"
@@ -328,6 +329,16 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
     mrp_port_init(state, p);
   }
 
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  /* Initialize per-port SRP admission caps (75 % of link rate per SR
+   * class). Must run after state->port[*].link_speed_mbps is set
+   * above; otherwise cap_bps stays 0 and every MAP propagation that
+   * goes through the admission branch (i.e. not is_failed and not
+   * Class A → Wi-Fi) returns -ENOSPC and the bridge emits
+   * TalkerFailed for every well-formed Talker Advertise. */
+  avb_srp_admission_init(state);
+#endif
+
 #if defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   /* Bridge has no codec / talker / listener. Skip the entire codec
    * caps + sample-rate / bits-per-sample intersection block. */
@@ -442,15 +453,28 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   uint16_t port_number = state->config.port_id;
   int_to_octets(&port_number, state->avb_interface.port_number, 2);
 
-  // Set default MSRP mappings (class A and class B)
+  // Set default MSRP mappings (class A and class B).
+  //
+  // IEEE 802.1Q-2018 §35.2.2.8.2.3 Table 35-7 recommends one VLAN per
+  // SR class (Class A = VLAN 2, Class B = VLAN 3). MOTU's AVB switch
+  // enforces this strictly: declaring Class B on the Class A VLAN
+  // causes MOTU to rewrite priority back to Class A on forwarding,
+  // even when the talker also declares a Class B Domain attribute on
+  // that VLAN. The VIDs are configurable so projects on networks that
+  // allow class-mixing can collapse them to a single VID.
   state->msrp_mappings_count = 2;
   state->msrp_mappings[0].traffic_class = 1;
   state->msrp_mappings[0].priority = CONFIG_ESP_AVB_VLAN_PRIO_CLASS_A;
-  uint16_t msrp_vlan_id = CONFIG_ESP_AVB_STREAM_VLAN_ID;
-  int_to_octets(&msrp_vlan_id, state->msrp_mappings[0].vlan_id, 2);
+  uint16_t class_a_vlan = state->config.class_a_vlan_id
+                              ? state->config.class_a_vlan_id
+                              : CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_A;
+  uint16_t class_b_vlan = state->config.class_b_vlan_id
+                              ? state->config.class_b_vlan_id
+                              : CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_B;
+  int_to_octets(&class_a_vlan, state->msrp_mappings[0].vlan_id, 2);
   state->msrp_mappings[1].traffic_class = 0;
   state->msrp_mappings[1].priority = CONFIG_ESP_AVB_VLAN_PRIO_CLASS_B;
-  int_to_octets(&msrp_vlan_id, state->msrp_mappings[1].vlan_id, 2);
+  int_to_octets(&class_b_vlan, state->msrp_mappings[1].vlan_id, 2);
 
   // Set talker sources and capabilities
   if (config->talker) {
@@ -732,14 +756,28 @@ static int avb_periodic_send(avb_state_s *state) {
                           &delta);
   if (timespec_to_ms(&delta) > MVRP_VLAN_ID_INTERVAL_MSEC) {
     state->port[0].last_transmitted_mvrp_vlan_id = time_now;
-    uint16_t mapping_index = 0; /* Class A — same VLAN serves both classes */
-    mrp_declare_vlan(state, 0, state->msrp_mappings[mapping_index].vlan_id);
+    /* Declare each SR class's VLAN separately. Class A and Class B
+     * may share a VID or use separate ones (see msrp_mappings init);
+     * the SM dedups identical declarations, so this is safe either
+     * way. */
+    for (int m = 0; m < state->msrp_mappings_count; m++) {
+      mrp_declare_vlan(state, 0, state->msrp_mappings[m].vlan_id);
+    }
   }
 
   /* MSRP domain — SM-driven. mrp_declare_domain is idempotent on
    * already-active SMs (Join! is a no-op); rate-limiting via the
    * legacy timestamp keeps it tidy. The SM's PeriodicTimer +
-   * JoinTimer drive the actual MRPDU cadence. */
+   * JoinTimer drive the actual MRPDU cadence.
+   *
+   * Declare BOTH Class A (sr_class_id=6) and Class B (sr_class_id=5)
+   * per §35.2.2.7 Domain Discovery, so SR-aware switches accept
+   * Class B TalkerAdvertise from us. With only the Class A Domain
+   * announced, MOTU's SRP layer treated incoming Class B advertises
+   * as out-of-domain and rewrote priority to 3 (Class A) before
+   * forwarding, which made the bridge correctly refuse Class A →
+   * Wi-Fi propagation and breaks the streaming path. The class_id
+   * values are the IEEE 802.1Q-2018 Table 35-7 defaults. */
   timespecsub(&time_now, &state->port[0].last_transmitted_msrp_domain,
                           &delta);
   if (timespec_to_ms(&delta) > MSRP_DOMAIN_INTERVAL_MSEC) {
@@ -747,6 +785,11 @@ static int avb_periodic_send(avb_state_s *state) {
     mrp_declare_domain(state, 0, /*sr_class_id=*/6,
                        state->msrp_mappings[0].priority,
                        state->msrp_mappings[0].vlan_id);
+    if (state->msrp_mappings_count > 1) {
+      mrp_declare_domain(state, 0, /*sr_class_id=*/5,
+                         state->msrp_mappings[1].priority,
+                         state->msrp_mappings[1].vlan_id);
+    }
   }
 
   // Send MSRP talker and AVTP MAAP announce messages

@@ -174,6 +174,8 @@ typedef struct {
   uint8_t allowed_bits_per_sample[8];        // app policy filter for bits/sample
   int16_t default_mic_gain_tenth_db;         // default mic gain in tenths of dB
   int16_t default_speaker_vol_tenth_db;      // default speaker volume in tenths of dB
+  uint16_t class_a_vlan_id;                  // SR Class A VID; 0 = use CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_A
+  uint16_t class_b_vlan_id;                  // SR Class B VID; 0 = use CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_B
 } avb_config_s;
 
 /* AVB status information structure */

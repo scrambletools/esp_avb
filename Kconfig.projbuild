@@ -31,16 +31,30 @@ menu "AVB Configuration"
         help
             Set the priority for the AVB task.
 
-    config ESP_AVB_STREAM_VLAN_ID
-        int "AVB stream VLAN ID"
+    config ESP_AVB_STREAM_VLAN_ID_CLASS_A
+        int "AVB Class A stream VLAN ID"
         default 2
         range 1 4094
         depends on ESP_AVB
         help
-            Set VLAN ID for AVB streams.
-            According to IEEE 802.1Q-2018, the default VLAN ID for AVB is 2.
-            SR Class A and SR Class B traffic must use priority tagged VLANs.
-            Values 1-4094 are valid, but VLAN 2 is commonly used for AVB.
+            VLAN ID for SR Class A streams (the default AVB VLAN).
+            IEEE 802.1Q-2018 §35.2.2.8.2.3 Table 35-7 recommends VLAN 2
+            for Class A. Many AVB switches (notably MOTU) enforce
+            one-class-per-VLAN and rewrite the priority of any stream
+            advertised with a different class on this VLAN.
+
+    config ESP_AVB_STREAM_VLAN_ID_CLASS_B
+        int "AVB Class B stream VLAN ID"
+        default 3
+        range 1 4094
+        depends on ESP_AVB
+        help
+            VLAN ID for SR Class B streams. Per IEEE 802.1Q-2018 §35.2.2.8.2.3
+            Table 35-7 the recommended Class B VLAN is 3 (one higher than
+            Class A). Configure separately because strict AVB switches map
+            each SR class to its own VLAN and rewrite priority otherwise.
+            May be set equal to the Class A VLAN if the network supports
+            both classes on the same VID (the IEEE spec allows it).
 
     config ESP_AVB_VLAN_PRIO_CLASS_A
         int "AVB Class A VLAN Priority"

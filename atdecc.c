@@ -3472,11 +3472,20 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
 
     /* First-connection edge stamps the class onto the stream. The
      * gate above guarantees req_class_b matches the active class for
-     * subsequent connects, so this is idempotent in the steady state. */
+     * subsequent connects, so this is idempotent in the steady state.
+     * Also re-derive vlan_id from msrp_mappings[mapping_index] —
+     * Class A and Class B may live on different VIDs (strict AVB
+     * switches enforce one-class-per-VLAN), so the per-stream vlan_id
+     * has to follow the class flip. */
     if (stream->stream_info_flags.class_b != req_class_b) {
       avbinfo("ACMP: stream %d class set to %s by first connection",
               talker_uid, req_class_b ? "B" : "A");
       stream->stream_info_flags.class_b = req_class_b ? 1 : 0;
+      uint16_t mapping_index = req_class_b ? 1 : 0;
+      if (mapping_index < state->msrp_mappings_count) {
+        memcpy(stream->vlan_id,
+               state->msrp_mappings[mapping_index].vlan_id, 2);
+      }
     }
 
     avbinfo("ACMP: listener connected to stream %d (count=%d, msrp=%d, class=%c)",
