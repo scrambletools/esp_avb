@@ -359,7 +359,9 @@ void mrp_port_init(avb_state_s *state, int port) {
 
 /* LeaveTimer dispatch helper — implementation after the §6/§7
  * attribute tables it walks. Returns true if any Registrar fired. */
-static bool mrp_port_dispatch_leave_timers(int port, int64_t now);
+static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
+                                           int64_t now);
+static void mrp_port_dispatch_periodic(int port);
 
 /* Called from avb_periodic / avb main loop on every tick. Fires
  * expired port-scoped timers. Returns true if anything fired. */
@@ -398,12 +400,26 @@ bool mrp_port_tick(avb_state_s *state, int port) {
   }
 
   /* PeriodicTimer: every 1 s, drive periodic! into active Applicants
-   * to bump them out of Quiet states. */
+   * to bump them out of Quiet states. Without this, Applicants land
+   * in QA on first JoinTimer and stay there silent until the next
+   * LeaveAll cycle (~10 s). On a Wi-Fi egress the listener-side
+   * Registrar's LeaveTimer (~1 s) expires well before then, so the
+   * listener loses sight of the talker and its decl flaps between
+   * Ready and AskingFailed — which the bridge MAP merger then
+   * propagates backward as a flapping listener decl. */
   if (p->mrp_periodic_timer_us != 0 && now >= p->mrp_periodic_timer_us) {
     p->mrp_periodic_timer_us = now + MRP_PERIODIC_TIMER_US;
     fired = true;
-    /* TODO (cutover): for each attribute on this port,
-     * mrp_applicant_step(..., mrp_event_periodic). */
+    mrp_port_dispatch_periodic(port);
+    /* Periodic transitions QA/QO/QP → AA/AO/AP. The Applicant SM
+     * sets pending_tx on the next tx_ev (JoinTimer expiry), so we
+     * arm the JoinTimer here unconditionally — tx_flush_port is a
+     * cheap no-op for Applicants that don't end up with pending_tx.
+     * The shared JoinTimer fires across all attribute tables on
+     * the port, so one arm covers them all. */
+    if (p->mrp_join_timer_us == 0) {
+      p->mrp_join_timer_us = mrp_join_next_expiry_us();
+    }
   }
 
   /* JoinTimer: armed when a state-change leaves an Applicant with a
@@ -419,7 +435,7 @@ bool mrp_port_tick(avb_state_s *state, int port) {
    * MSRP / MVRP tables are declared). Without this, a peer that
    * goes silent without rLv (yanked cable, crashed talker) holds
    * its IN-state Registrar forever and keeps admission allocated. */
-  if (mrp_port_dispatch_leave_timers(port, now)) {
+  if (mrp_port_dispatch_leave_timers(state, port, now)) {
     fired = true;
   }
 
@@ -991,9 +1007,17 @@ static void mrp_on_talker_registrar_change(
      * earlier "silent skip" looked equivalent but actually masked the
      * failure — ACMP/MSRP both reported SUCCESS while no audio could
      * ever flow, because the talker never learned the path was
-     * broken. */
+     * broken.
+     *
+     * Bench-experiment escape hatch: allow_class_a_over_wifi lets a
+     * deployment opt into propagating Class A onto Wi-Fi anyway, at
+     * the cost of giving up the Milan §5.6 latency guarantee. The
+     * audio will glitch / underrun under load but the SRP state
+     * machine completes, which is enough to validate the rest of
+     * the data plane end-to-end. */
     if (state->port[y].medium == avb_port_medium_wifi_ftm &&
-        new_cls == AVB_SR_CLASS_A) {
+        new_cls == AVB_SR_CLASS_A &&
+        !state->config.allow_class_a_over_wifi) {
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
@@ -1775,14 +1799,28 @@ static mvrp_vlan_entry_t
  * into both Applicant and Registrar; the Applicant ignores the
  * leave-timer event so the cost of the unconditional dispatch on
  * each entry is small. */
-static bool mrp_port_dispatch_leave_timers(int port, int64_t now) {
+static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
+                                           int64_t now) {
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return false;
   bool fired = false;
+  /* Each Registrar that expires LV→MT crosses a deregister transition
+   * that the application layer must see — endpoint bookkeeping clears
+   * the per-stream MSRP failure_code, bridge MAP releases the admitted
+   * bandwidth and withdraws the propagated declaration. Without these
+   * callbacks, every LeaveAll cycle leaks admission on the bridge
+   * (every rJoin after expiry fires a fresh register+admit, but the
+   * matching release never happens). */
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
     if (!e->valid) continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
+      if (tr != mrp_reg_transition_none) {
+        mrp_on_talker_registrar_change(state, port, e->attr_type, &e->wire,
+                                       tr, NULL);
+      }
       fired = true;
     }
   }
@@ -1790,7 +1828,13 @@ static bool mrp_port_dispatch_leave_timers(int port, int64_t now) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
     if (!e->valid) continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
+      if (tr != mrp_reg_transition_none) {
+        mrp_on_listener_registrar_change(state, port, &e->wire, tr,
+                                         /*peer_decl_changed=*/true, NULL);
+      }
       fired = true;
     }
   }
@@ -1798,7 +1842,12 @@ static bool mrp_port_dispatch_leave_timers(int port, int64_t now) {
     msrp_domain_entry_t *e = &s_msrp_domains[port][i];
     if (!e->valid) continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
+      mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
+      mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
+      if (tr != mrp_reg_transition_none) {
+        mrp_on_domain_registrar_change(state, port, &e->wire, tr);
+      }
       fired = true;
     }
   }
@@ -1811,6 +1860,33 @@ static bool mrp_port_dispatch_leave_timers(int port, int64_t now) {
     }
   }
   return fired;
+}
+
+/* PeriodicTimer dispatch — drives every valid Applicant through a
+ * periodic! event so that Quiet states (QA/QO/QP) re-arm to the
+ * matching Anxious state, ensuring re-transmission of attributes
+ * on the next JoinTimer expiry. Without this, an Applicant lands in
+ * QA on first sJ and stays silent until the next LeaveAll cycle
+ * (~10 s), which is longer than the Registrar LeaveTimer (~1 s) on
+ * the receiving side — causing peer Registrars to flap. */
+static void mrp_port_dispatch_periodic(int port) {
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
+    msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
+    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+  }
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; ++i) {
+    msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
+    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+  }
+  for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; ++i) {
+    msrp_domain_entry_t *e = &s_msrp_domains[port][i];
+    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+  }
+  for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; ++i) {
+    mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
+    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+  }
 }
 
 static bool vlan_id_eq(const uint8_t *a, const uint8_t *b) {

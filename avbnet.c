@@ -89,6 +89,47 @@ static void avb_net_cache_port_indices(avb_state_s *state) {
  * avb_bridge_forward. */
 extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
 
+/* Zero-copy TX path: tx_by_ref hands ownership of the buffer to Wi-Fi
+ * and IDF releases it later via the registered netstack-buf callbacks.
+ * Saves the IDF-internal memcpy that esp_wifi_internal_tx() does. */
+typedef void (*wifi_netstack_buf_ref_cb_t)(void *netstack_buf);
+typedef void (*wifi_netstack_buf_free_cb_t)(void *netstack_buf);
+extern esp_err_t esp_wifi_internal_tx_by_ref(int wifi_if, void *buffer,
+                                             size_t len, void *netstack_buf);
+extern esp_err_t esp_wifi_internal_reg_netstack_buf_cb(
+    wifi_netstack_buf_ref_cb_t ref, wifi_netstack_buf_free_cb_t free);
+/* lwIP's registered handlers, exported by esp_netif. We chain through
+ * to them for non-tagged netstack_buf (i.e. genuine lwIP pbufs) so the
+ * non-bridge data path keeps working. */
+extern void esp_netif_netstack_buf_ref(void *netstack_buf);
+extern void esp_netif_netstack_buf_free(void *netstack_buf);
+
+/* Low bit of netstack_buf is our discriminator. Pointers from malloc()
+ * are at least 8-byte aligned on this platform; lwIP pbufs are 4-byte
+ * aligned at minimum; the low bit is therefore free for tagging. */
+#define BRIDGE_BUF_TAG  ((uintptr_t)1)
+
+static void avb_bridge_netstack_buf_ref(void *nb) {
+  if (((uintptr_t)nb & BRIDGE_BUF_TAG) != 0) return;
+  esp_netif_netstack_buf_ref(nb);
+}
+
+static void avb_bridge_netstack_buf_free(void *nb) {
+  if (((uintptr_t)nb & BRIDGE_BUF_TAG) != 0) {
+    free((void *)((uintptr_t)nb & ~BRIDGE_BUF_TAG));
+    return;
+  }
+  esp_netif_netstack_buf_free(nb);
+}
+
+/* Public init: install our chained netstack-buf callbacks. Must be
+ * called after Wi-Fi/netif init so lwIP's prior registration is in
+ * place before we wrap it. */
+void avb_bridge_install_zero_copy_tx(void) {
+  esp_wifi_internal_reg_netstack_buf_cb(avb_bridge_netstack_buf_ref,
+                                        avb_bridge_netstack_buf_free);
+}
+
 /* avb_state_s pointer for the bridge RX path. Set during avb_net_init,
  * read by the EMAC + Wi-Fi RX callbacks to dispatch egress sends. */
 static avb_state_s *s_bridge_state = NULL;
@@ -140,15 +181,11 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
   }
 
   if (p->medium == avb_port_medium_wifi_ftm) {
-    void *buf = malloc(len);
-    if (!buf) {
-      s_fwd_wifi_oom++;
-      return;
-    }
-    memcpy(buf, frame, len);
-    /* WIFI_IF_AP=1 — the bridge's SoftAP. */
-    esp_err_t r = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, buf, len);
-    free(buf);
+    /* esp_wifi_internal_tx copies the buffer into its own DMA-aligned
+     * TX queue and returns; the caller can free immediately. Skip the
+     * redundant local malloc+memcpy+free that used to sit here — a
+     * measurable CPU win on the EMAC RX task at 8000 fps. */
+    esp_err_t r = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, (void *)frame, len);
     if (r == ESP_OK) s_fwd_wifi_ok++; else s_fwd_wifi_fail++;
     return;
   }
@@ -203,6 +240,53 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
   /* Read ethertype at offset 12-13 (big-endian) */
   uint16_t ethertype = (buf[12] << 8) | buf[13];
 
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  /* Hot-path fast-cut for VLAN-tagged AVTP from EMAC → Wi-Fi.
+   *
+   * This is the highest-rate flow on the bridge (8000 fps for Class A)
+   * and runs entirely inside the EMAC RX task. Bypassing the per-frame
+   * stats updates, the classifier function call, the disposition struct
+   * and the verdict switch trims ~20 instructions per frame; at 8000 pps
+   * that recovers measurable CPU on the RX core. The non-fast paths
+   * (PTP, MSRP, MVRP, control AVTP, Wi-Fi RX) still get full instrumentation
+   * below.
+   *
+   * Recognised pattern: ingress from EMAC (eth_handle != NULL) AND
+   * ethertype 0x8100 (VLAN-tagged frame, which on this network is always
+   * AVTP stream data). Egress is the other port (Wi-Fi, port 1).
+   *
+   * Class A → Wi-Fi is dropped at the data plane (defense-in-depth for
+   * the MAP §35.2.4.3 rule) unless allow_class_a_over_wifi is set.
+   * Reading PCP is one shift+mask of buf[14]; cheaper than a function
+   * call. */
+  if (s_bridge_state != NULL && eth_handle != NULL && ethertype == 0x8100 &&
+      len >= 16) {
+    if (!s_bridge_state->config.allow_class_a_over_wifi) {
+      uint8_t pcp = (buf[14] >> 5) & 0x07;
+      if (pcp == CONFIG_ESP_AVB_VLAN_PRIO_CLASS_A) {
+        free(buf);
+        return ESP_OK;
+      }
+    }
+    /* Zero-copy hand-off: pass buf to Wi-Fi by reference with the low
+     * bit of netstack_buf set as our discriminator. Our chained free
+     * callback (avb_bridge_netstack_buf_free) recognises the tag and
+     * frees the buffer once Wi-Fi finishes the actual TX. Saves the
+     * IDF-internal memcpy that esp_wifi_internal_tx() would do.
+     *
+     * On error we deliberately do NOT free here — IDF documents
+     * esp_wifi_internal_tx_by_ref as "firstly increases the ref
+     * counter, then forwards", meaning the registered free callback
+     * has already been promised the buffer. Errors are rare; the
+     * counter tracks them. */
+    void *nb = (void *)((uintptr_t)buf | BRIDGE_BUF_TAG);
+    esp_err_t r = esp_wifi_internal_tx_by_ref(1 /* WIFI_IF_AP */,
+                                              (void *)buf, len, nb);
+    if (r == ESP_OK) s_fwd_wifi_ok++; else s_fwd_wifi_fail++;
+    return ESP_OK;
+  }
+#endif
+
   /* Count ALL PTP frames (0x88f7) at entry — before any switch branch
    * and before any early-return. Compared against ptpd's own rx counters
    * to identify where in the path PTP frames are being lost. */
@@ -221,12 +305,9 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
   }
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
-  /* Bridge dispatch — runs on every ingress (EMAC for port 0, Wi-Fi
-   * AP for port 1). The ingress port is derived from the eth_handle:
-   * non-NULL means EMAC ingress (port 0), NULL means the Wi-Fi RX
-   * shim (port 1). This holds because the v1 bridge topology is
-   * fixed at port[0]=ethernet, port[1]=wifi. The classifier picks the
-   * other port as egress. */
+  /* Bridge dispatch for everything the fast-cut above didn't catch
+   * — Wi-Fi ingress, plus EMAC ingress of non-VLAN ethertypes
+   * (ATDECC control, MSRP, MVRP, anything else needing classification). */
   if (s_bridge_state != NULL) {
     uint8_t pcp = 0;
     if (ethertype == 0x8100 && len >= 16) {

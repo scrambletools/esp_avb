@@ -72,6 +72,18 @@ typedef struct {
   bool shaped;             /* if true, route via FQTSS instead of raw TX */
 } avb_bridge_disposition_t;
 
+/* Opt the data-plane forwarder into propagating Class A onto Wi-Fi
+ * egress. Off by default — Wi-Fi can't meet the §5.6 budget. Mirror
+ * of avb_config_s.allow_class_a_over_wifi for the MAP-layer reject. */
+void avb_bridge_set_allow_class_a_over_wifi(bool allow);
+
+/* Install chained netstack-buf ref/free callbacks so the bridge can
+ * pass EMAC RX buffers to esp_wifi_internal_tx_by_ref(). lwIP's prior
+ * registration (for its own pbufs) is preserved via a discriminator
+ * in the low bit of netstack_buf — must be called after Wi-Fi/netif
+ * init. */
+void avb_bridge_install_zero_copy_tx(void);
+
 /* Classify a frame by its (ingress_port, ethertype, vlan_pcp). Pure
  * function, no side effects — feeds the forwarder. The vlan_pcp
  * argument is used only when ethertype == 0x8100 (VLAN-tagged AVTP);

@@ -176,6 +176,7 @@ typedef struct {
   int16_t default_speaker_vol_tenth_db;      // default speaker volume in tenths of dB
   uint16_t class_a_vlan_id;                  // SR Class A VID; 0 = use CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_A
   uint16_t class_b_vlan_id;                  // SR Class B VID; 0 = use CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_B
+  bool allow_class_a_over_wifi;              // bridge MAP: allow Class A egress on Wi-Fi (off by default; the 125 us Milan §5.6 budget can't be met on 802.11, so this is opt-in for bench experiments)
 } avb_config_s;
 
 /* AVB status information structure */

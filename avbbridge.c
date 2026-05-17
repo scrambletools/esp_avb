@@ -104,6 +104,12 @@ void avb_bridge_stop(avb_state_s *state) {
 #define ETHERTYPE_MVRP 0x88f5
 #define ETHERTYPE_VLAN 0x8100
 
+static bool s_allow_class_a_over_wifi;
+
+void avb_bridge_set_allow_class_a_over_wifi(bool allow) {
+  s_allow_class_a_over_wifi = allow;
+}
+
 avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
                                              uint16_t ethertype,
                                              uint8_t vlan_pcp) {
@@ -152,8 +158,11 @@ avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
      * conformant talker from emitting onto VLAN A in the first place
      * (no Listener Ready ever reaches them). A non-conformant talker
      * that streams anyway gets caught here. egress_port == 1 means
-     * "Wi-Fi" — bridge wires port[0] = Ethernet, port[1] = Wi-Fi. */
-    if (d.sr_class == AVB_SR_CLASS_A && d.egress_port == 1) {
+     * "Wi-Fi" — bridge wires port[0] = Ethernet, port[1] = Wi-Fi.
+     * Skipped when allow_class_a_over_wifi is set so the MAP and the
+     * data plane stay consistent. */
+    if (d.sr_class == AVB_SR_CLASS_A && d.egress_port == 1 &&
+        !s_allow_class_a_over_wifi) {
       d.verdict = AVB_BRIDGE_DROP;
       return d;
     }

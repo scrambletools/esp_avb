@@ -337,6 +337,15 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * Class A → Wi-Fi) returns -ENOSPC and the bridge emits
    * TalkerFailed for every well-formed Talker Advertise. */
   avb_srp_admission_init(state);
+  /* Mirror the Class-A-over-Wi-Fi opt-in onto the L2 forwarder so
+   * the MAP layer and the data plane stay aligned. Off by default;
+   * see avb_config_s comment. */
+  avb_bridge_set_allow_class_a_over_wifi(state->config.allow_class_a_over_wifi);
+  /* Override IDF's netstack-buf callbacks with a chained pair so the
+   * Wi-Fi-egress hot path can hand the EMAC RX buffer over by
+   * reference (saves the IDF-internal memcpy). lwIP's pbuf path is
+   * preserved by chaining through on non-tagged netstack_buf. */
+  avb_bridge_install_zero_copy_tx();
 #endif
 
 #if defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
