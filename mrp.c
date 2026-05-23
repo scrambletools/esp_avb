@@ -301,14 +301,9 @@ static void mrp_sm_step(mrp_sm_state_t *sm, mrp_event_e ev) {
   mrp_registrar_step(sm, ev);
 }
 
-/* ===== §1b  Per-port MRP timer machinery =====
- *
- * Per-port (not per-attribute) timers per IEEE 802.1Q-2018 §10.7.11.
- * The actual event dispatch into the per-attribute SMs happens
- * during cutover (§6 will iterate its attribute tables when these
- * fire). For now mrp_port_tick() advances the timers and sets the
- * tx-pending / LeaveAll-pending flags; no attribute events fire yet.
- */
+/* §1b — per-port MRP timers per IEEE 802.1Q-2018 §10.7.11.
+ * mrp_port_tick() advances them and sets tx-pending / LeaveAll-pending
+ * flags; §6 iterates the attribute tables on dispatch. */
 
 #define MRP_JOIN_TIMER_US      (200 * 1000)         /* §10.7.11 JoinTime */
 #define MRP_LEAVEALL_TIMER_US  (10 * 1000 * 1000)   /* §10.7.11 LeaveAllTime */
@@ -371,15 +366,11 @@ bool mrp_port_tick(avb_state_s *state, int port) {
   int64_t now = esp_timer_get_time();
   bool fired = false;
 
-  /* LeaveAllTimer: when fires, mark the next PDU to carry LeaveAll
-   * and dispatch rLA into every Applicant/Registrar on this port.
-   * The dispatch loop is added in cutover; for now only the timer
-   * advances and the flag latches.
+  /* LeaveAllTimer: on fire, mark the next PDU to carry LeaveAll and
+   * dispatch rLA into every Applicant/Registrar on this port.
    *
-   * Wi-Fi efficiency cut #3: on a wifi AP port with zero associated
-   * STAs, the LeaveAll burst goes nowhere. Roll the timer forward
-   * (so we don't fire instantly when an STA joins) but skip the
-   * dispatch. */
+   * Wi-Fi efficiency: on a Wi-Fi AP with zero associated STAs the
+   * burst goes nowhere — roll the timer forward but skip dispatch. */
   if (p->mrp_leaveall_timer_us != 0 && now >= p->mrp_leaveall_timer_us) {
     bool suppress = false;
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
@@ -394,9 +385,8 @@ bool mrp_port_tick(avb_state_s *state, int port) {
     }
     p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
     fired = true;
-    /* TODO (cutover): iterate this port's attribute table and call
-     * mrp_applicant_step(..., mrp_event_r_la) and
-     * mrp_registrar_step(..., mrp_event_r_la) on each entry. */
+    /* TODO: iterate this port's attribute table and step
+     * applicant + registrar with mrp_event_r_la on each entry. */
   }
 
   /* PeriodicTimer: every 1 s, drive periodic! into active Applicants
@@ -452,14 +442,10 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port) {
   }
 }
 
-/* ===== §6  MSRP application =====
- *
- * Origination via mrp_declare_* drives per-attribute Applicants in
- * the typed tables defined below; RX flows through mrp_rx_msrp and
- * dispatches to the on_*_registrar_change callbacks in §6a. The
- * legacy direct-call avb_send_msrp_* / avb_process_msrp_* surface is
- * gone — these SMs are the only path.
- */
+/* §6 — MSRP application. Origination via mrp_declare_* drives
+ * per-attribute Applicants in the typed tables below; RX flows
+ * through mrp_rx_msrp and dispatches into on_*_registrar_change
+ * callbacks in §6a. */
 
 /* Per-port attribute tables. Linear-scan find/insert; tables are
  * small (≤10 entries) so the O(N) cost is fine. */
@@ -674,16 +660,12 @@ mrp_reg_transition(mrp_registrar_state_e before,
   return mrp_reg_transition_none;
 }
 
-/* Application transition callbacks. Fire on every MSRP RX; the `tr`
- * argument tells the body whether it's a Registrar register/deregister
- * edge (for MAP propagation + admission accounting, which must run
- * once per edge) or just an in-registration update (for endpoint-side
- * bookkeeping — talker DB refresh, accumulated_latency propagation,
- * listener msrp_ready / asking_failed tracking, which can run per RX).
- *
- * Replaces the legacy per-RX avb_process_msrp_* reactions. The legacy
- * functions are gone; this is the only consumer of inbound MSRP
- * attributes outside the SM itself. */
+/* Application transition callbacks fire on every MSRP RX. The `tr`
+ * argument distinguishes Registrar register/deregister EDGES (which
+ * drive MAP propagation + admission accounting once per edge) from
+ * in-registration updates (endpoint bookkeeping — talker DB,
+ * accumulated_latency propagation, listener readiness — that can
+ * run per RX). */
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 /* Forward decls — definitions live in §6b (below) but the callbacks
@@ -1430,10 +1412,9 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
  * listener subscribes, etc.). Drives the matching Applicant via
  * the appropriate local-origin event and arms the JoinTimer. */
 
-/* Build the TALKER ADVERTISE wire struct from individual fields the
- * way the legacy avb_send_msrp_talker does. Used by both mrp_declare_
- * entry points; the SM-driven TX flush re-uses these fields verbatim
- * when assembling the outbound MRPDU. */
+/* Build the TALKER ADVERTISE wire struct from individual fields.
+ * Used by both mrp_declare_ entry points; the SM-driven TX flush
+ * re-uses these fields verbatim. */
 static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
@@ -1447,13 +1428,10 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
   int_to_octets(&tspec_mfs, info->tspec_max_frame_size, 2);
   int tspec_mfi = 1;
   int_to_octets(&tspec_mfi, info->tspec_max_frame_interval, 2);
-  /* SR-class mapping: index 0 = Class A (priority 3), index 1 = Class B
-   * (priority 2) per the §35.2.2.8.2.3 default mappings. Caller passes
-   * class_b explicitly — endpoint origination derives it from the
-   * output_stream's stream_info_flags.class_b (set by the ACMP CONNECT
-   * handler from the CLASS_B flag bit), and bridge MAP derives it from
-   * the inbound TALKER_ADVERTISE priority. The legacy "match by VLAN"
-   * heuristic doesn't work when both classes share a VLAN. */
+  /* SR-class mapping: index 0 = Class A (priority 3), index 1 =
+   * Class B (priority 2) per §35.2.2.8.2.3 defaults. Caller passes
+   * class_b explicitly because matching by VLAN doesn't work when
+   * both classes share one. */
   uint16_t mapping_index = class_b ? 1 : 0;
   if (mapping_index >= state->msrp_mappings_count) mapping_index = 0;
   info->priority = state->msrp_mappings[mapping_index].priority;
@@ -1957,13 +1935,10 @@ static void mrp_on_vlan_registrar_change(avb_state_s *state, int port,
 #endif
 }
 
-/* Single MVRP RX entry point. The wire struct as-defined carries one
- * vlan_id slot, so we treat each PDU as a single attribute (num_vals
- * effectively forced to 1). avb_process_rx_message calls this for
- * every MVRP frame; no legacy reaction layer to coexist with.
- *
- * The Registrar transition is computed across mrp_sm_step so the MAP
- * callback only fires on register/deregister edges, not per RX. */
+/* Single MVRP RX entry point. The wire struct carries one vlan_id
+ * slot, so each PDU is one attribute (num_vals=1). The Registrar
+ * transition is computed across mrp_sm_step so the MAP callback
+ * fires only on register/deregister edges. */
 void mrp_rx_mvrp(avb_state_s *state, int port, mvrp_vlan_id_message_s *msg,
                  size_t length, eth_addr_t *src_addr) {
   (void)length; (void)src_addr;
@@ -2328,23 +2303,11 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
   return OK;
 }
 
-/* ======================================================================
- * Bridge-only: MSRP admission control with 75 % link-rate cap per SR class
- *
- * Per IEEE 802.1Q-2018 §35.2.2.8.4, SR Class A is allotted at most
- * 75 % of the port bandwidth, and Class B shares that 75 % budget.
- * The bridge tracks per-port-per-class running bandwidth and rejects
- * a TALKER_ADVERTISE propagation when admitted + new would exceed the
- * cap. Hooked into mrp_on_talker_registrar_change (§6a) so an
- * over-budget request propagates as TALKER_FAILED with failure_code
- * = insufficient_bandwidth_for_traffic_class.
- *
- * On Wi-Fi the bridge skips Class A entirely (Wi-Fi efficiency
- * cut #1) — no listener can honor the 125 µs SLA. Class B is
- * admitted normally.
- *
- * Excluded from endpoint builds via CONFIG_ESP_AVB_ROLE_BRIDGE.
- * ====================================================================== */
+/* Bridge MSRP admission control: per IEEE 802.1Q-2018 §35.2.2.8.4,
+ * SR Class A is allotted at most 75 % of port bandwidth; Class B
+ * shares that budget. Over-budget TALKER_ADVERTISE propagates as
+ * TALKER_FAILED (insufficient_bandwidth_for_traffic_class). Wi-Fi
+ * skips Class A entirely — no listener can honor the 125 µs SLA. */
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 

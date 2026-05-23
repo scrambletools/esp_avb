@@ -234,17 +234,15 @@ typedef struct {
 
 /* ===== MVRP — SM-driven API ===== */
 
-/* RX entry point. avbnet.c's RX dispatcher hands each MVRP MRPDU to
- * this function; the SMs handle attribute book-keeping. No legacy
- * reaction layer — MVRP cut straight onto the MRP core. */
+/* RX entry point. avbnet.c hands each MVRP MRPDU here; the SMs
+ * handle attribute book-keeping. */
 void mrp_rx_mvrp(avb_state_s *state, int port,
                  mvrp_vlan_id_message_s *msg, size_t length,
                  eth_addr_t *src_addr);
 
-/* SM-driven origination — replaces the legacy avb_send_mvrp_vlan_id.
- * Idempotent: first call seeds the Applicant via New!, subsequent
- * calls bump it via Join!. JoinTimer + PeriodicTimer drive the
- * MRPDU cadence. */
+/* Idempotent SM-driven origination: first call seeds the Applicant
+ * via New!, subsequent calls via Join!. JoinTimer + PeriodicTimer
+ * drive the MRPDU cadence. */
 void mrp_declare_vlan(avb_state_s *state, int port,
                       const uint8_t *vlan_id);
 void mrp_withdraw_vlan(avb_state_s *state, int port,
@@ -358,24 +356,16 @@ bool mrp_port_tick(avb_state_s *state, int port);
  * non-none pending_tx. */
 void mrp_port_arm_join_timer(avb_state_s *state, int port);
 
-/* ===== SM-driven MSRP RX entry point (§6a) =====
- *
- * Walks an inbound MSRP buffer, decodes 3pe events, dispatches the
- * corresponding peer events into the per-attribute SMs, AND runs the
- * legacy application bookkeeping (avb_process_msrp_*) for each
- * attribute. This is the single MSRP RX entry point after Phase 1
- * cutover — avb_process_rx_message no longer dispatches MSRP itself.
- */
+/* SM-driven MSRP RX entry point (§6a). Walks an inbound MSRP
+ * buffer, decodes 3pe events, dispatches into per-attribute SMs,
+ * and runs application bookkeeping for each. */
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
                  size_t length, eth_addr_t *src_addr);
 
-/* ===== SM-driven MSRP origination entry points (§6b) =====
- *
- * Called by avb.c when local stream state changes — replaces the
- * direct avb_send_msrp_* calls after the cutover. Each fills in a
- * typed wire struct in the matching attribute table entry, drives
- * the Applicant via the appropriate local-origin event, and arms
- * the JoinTimer. */
+/* SM-driven MSRP origination (§6b). Called by avb.c on local
+ * stream-state changes; each fills a typed wire struct in the
+ * matching attribute table, drives the Applicant via the
+ * appropriate local-origin event, and arms the JoinTimer. */
 void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
@@ -404,17 +394,13 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
 void mrp_withdraw_listener(avb_state_s *state, int port,
                            const unique_id_t *stream_id);
 
-/* ===== Other MSRP utilities =====
+/* Other MSRP utilities. mrp_declare_* / mrp_withdraw_* emit;
+ * mrp_rx_msrp consumes. Endpoint bookkeeping (talker DB,
+ * accumulated_latency, listener readiness) runs inside the SM
+ * transition callbacks in mrp.c §6a.
  *
- * The legacy avb_send_msrp_* origination and avb_process_msrp_*
- * reaction functions are gone. mrp_declare_* / mrp_withdraw_* emit
- * frames; mrp_rx_msrp consumes them. Endpoint-side bookkeeping
- * (talker DB, accumulated_latency propagation, listener readiness)
- * runs inside the SM transition callbacks in mrp.c §6a.
- *
- * Note: avb_send_cvu_srp_attr (CVU SRP-over-AECP transport) lives in
- * avb.h's ATDECC section — same MSRP payload, different envelope.
- */
+ * Note: avb_send_cvu_srp_attr (CVU SRP-over-AECP) lives in avb.h's
+ * ATDECC section — same MSRP payload, different envelope. */
 
 uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index);
 

@@ -11,13 +11,7 @@
 
 #include "avbutils.h"
 
-/* Convert an octet buffer to a hex string
- *
- * buffer: the octet buffer to convert
- * size: the size of the buffer
- * hex_string: the resulting hex string (must be at least size * 3 + 1 bytes)
- * delimiter: the delimiter to use between octets (default is space)
- */
+/* hex_string must be at least size * 3 + 1 bytes. */
 void octets_to_hex_string(const uint8_t *buffer, size_t size, char *hex_string,
                           unsigned char delimiter) {
   if (!buffer || size == 0) {

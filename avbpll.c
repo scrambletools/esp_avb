@@ -51,22 +51,13 @@
 
 static const char *TAG = "avb_pll";
 
-/* ---------------------------------------------------------------------------
- * Hardware backend: ESP32-P4 APLL
- *
- * We bypass ESP-IDF's periph_rtc_apll_freq_set() and write the APLL
- * sigma-delta coefficients directly. Reason: the public helper has a
- * refcount gate that silently drops the retune when more than one
- * peripheral owns APLL — which is exactly our situation, since both
- * the I2S TX and RX channels acquire APLL at init (ref_cnt = 2). Using
- * rtc_clk_apll_coeff_calc + rtc_clk_apll_coeff_set skips that gate and
- * reprograms the SDM directly; the modulator absorbs the coefficient
- * step without audio glitches within the audio band.
- *
- * The CS2000 analogy: everything in this section is what the chip would
- * do for us internally, driven by I2C ratio writes. Replace this section
- * with an I2C driver and the rest of avbpll.c compiles unchanged.
- * ------------------------------------------------------------------------- */
+/* ESP32-P4 APLL backend. periph_rtc_apll_freq_set() has a refcount
+ * gate that silently drops retunes when two peripherals own APLL —
+ * which is our situation (I2S TX + RX, ref_cnt = 2). We call
+ * rtc_clk_apll_coeff_calc + rtc_clk_apll_coeff_set to reprogram the
+ * SDM directly; the modulator absorbs the step within the audio
+ * band. (Replacing this section with a CS2000 I2C driver leaves the
+ * rest of avbpll.c unchanged.) */
 
 static struct {
   bool initialised;
@@ -147,9 +138,7 @@ static void mclk_hw_deinit(void) {
   s_hw.initialised = false;
 }
 
-/* ---------------------------------------------------------------------------
- * Measurement + control loop — SoC-independent.
- * ------------------------------------------------------------------------- */
+/* Measurement + control loop, SoC-independent. */
 
 /* Baseline snapshot used to compute cumulative ppm from the start of a
  * measurement window (or from the last applied correction). */

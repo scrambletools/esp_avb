@@ -178,18 +178,10 @@ avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
   }
 }
 
-/* ----------------------------------------------------------------------
- * Bridge-role stubs for endpoint-only ATDECC functions.
- *
- * The bridge has no ATDECC entity (per the plan: transparent L2 bridge
- * per Milan/802.1Q semantics). atdecc.c is excluded from the bridge
- * build, but avb.c contains unconditional calls into ATDECC dispatch
- * paths from the periodic-send and RX-message routines. Rather than
- * thread #ifdefs through avb.c, satisfy the linker with no-op stubs
- * here. Each function's purpose is annotated for future readers; if
- * the bridge ever grows a Controller-class entity, these stubs
- * become the entry points to a slim ATDECC subset.
- * ---------------------------------------------------------------------- */
+/* No-op stubs for ATDECC entry points that avb.c dispatches into
+ * unconditionally. The bridge has no ATDECC entity (transparent L2
+ * bridge per Milan/802.1Q); atdecc.c is excluded from the bridge
+ * build, so these satisfy the linker. */
 
 int avb_send_adp_entity_available(avb_state_s *state) {
   (void)state;

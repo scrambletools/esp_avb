@@ -12,9 +12,6 @@
 #ifndef _ESP_AVB_AVB_H_
 #define _ESP_AVB_AVB_H_
 
-/****************************************************************************
- * Included Files
- ****************************************************************************/
 #include "avbconfig.h"
 #include "avbutils.h"
 #include "esp_avb.h"
@@ -49,10 +46,6 @@
 #include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
-
-/****************************************************************************
- * Pre-processor Definitions
- ****************************************************************************/
 
 /* Number of protocols to use for L2TAP (AVTP, MSRP, MVRP) */
 #define AVB_NUM_PROTOCOLS 4
@@ -201,30 +194,19 @@ typedef enum {
  * listener connection state that survive reboots. Stored as a single
  * blob under NVS namespace "avb" / key "persist".
  *
- * ============================================================
- *   WARNING — THIS STRUCT IS APPEND-ONLY.
- * ============================================================
- *   The on-disk layout is a raw memcpy of this struct. Loader
- *   tolerance (see avb_persist_load) only works if every byte
- *   offset of every existing field stays identical across
- *   firmware versions.
+ * WARNING — THIS STRUCT IS APPEND-ONLY.
  *
- *   YOU MUST:
- *     * Only ADD new fields at the END of the struct.
- *     * Bump AVB_PERSIST_VERSION when you do.
+ * On-disk layout is a raw memcpy of this struct. Loader tolerance
+ * (avb_persist_load) only works if every byte offset of every existing
+ * field stays identical across firmware versions.
  *
- *   YOU MUST NOT:
- *     * Reorder, resize, remove, or change the type of any
- *       existing field.
- *     * Change any AVB_PERSIST_MAX_* constant below — those
- *       freeze array dimensions independent of the build-time
- *       AVB_MAX_* constants, so config changes cannot shift
- *       field offsets.
+ * MUST: only ADD fields at the END; bump AVB_PERSIST_VERSION.
+ * MUST NOT: reorder/resize/remove/retype existing fields; change any
+ * AVB_PERSIST_MAX_* below (those freeze array dimensions independently
+ * of build-time AVB_MAX_* so config changes cannot shift offsets).
  *
- *   Breaking these rules silently corrupts saved data on every
- *   device that upgrades through the broken version. There is
- *   no wire integrity check that will catch it.
- * ============================================================ */
+ * Breaking these silently corrupts saved data on every upgrade — no
+ * wire integrity check will catch it. */
 
 /* Fixed upper bounds for the NVS blob layout. Do NOT change these
  * without also writing a migration path — see the warning above.
@@ -337,10 +319,6 @@ typedef struct {
    .chan_per_frame = ((channels) & 0x03),                                      \
    .samples_per_frame_h = 0,                                                   \
    .samples_per_frame = 6}
-
-/****************************************************************************
- * Public Types
- ****************************************************************************/
 
 /* AVB Enums*/
 
@@ -611,7 +589,6 @@ typedef struct avb_state_s {
   avb_statusreq_s status_req;
   struct ptpd_status_s ptp_status;
 
-  esp_eth_handle_t eth_handle; // legacy slot, currently unused
   QueueHandle_t ctrl_rx_queue; // control frame queue from EMAC dispatcher
   bool stream_in_active;       // stream-in handler is registered
   bool avb_lite;               // operating in AVB Lite mode (standard PTP)

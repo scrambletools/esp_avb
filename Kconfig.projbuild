@@ -45,16 +45,18 @@ menu "AVB Configuration"
 
     config ESP_AVB_STREAM_VLAN_ID_CLASS_B
         int "AVB Class B stream VLAN ID"
-        default 3
+        default 2
         range 1 4094
         depends on ESP_AVB
         help
-            VLAN ID for SR Class B streams. Per IEEE 802.1Q-2018 §35.2.2.8.2.3
-            Table 35-7 the recommended Class B VLAN is 3 (one higher than
-            Class A). Configure separately because strict AVB switches map
-            each SR class to its own VLAN and rewrite priority otherwise.
-            May be set equal to the Class A VLAN if the network supports
-            both classes on the same VID (the IEEE spec allows it).
+            VLAN ID for SR Class B streams. IEEE 802.1Q-2018 §35.2.2.8.2.3
+            Table 35-7 places both SR classes on VLAN 2 by default —
+            class is distinguished by PCP, not VID. Networks driven by
+            the MOTU AVB switch and other strict implementations have
+            been observed to advertise Class B Domain on VLAN 2, so
+            the firmware must match to accept those declarations. May
+            be overridden to a different VID for networks that segment
+            classes by VLAN.
 
     config ESP_AVB_VLAN_PRIO_CLASS_A
         int "AVB Class A VLAN Priority"

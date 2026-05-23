@@ -19,6 +19,7 @@
  */
 
 #include "avb.h"
+#include "esp_ptp.h"
 #include "esp_timer.h"
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
@@ -698,6 +699,13 @@ void avb_create_eth_frame(uint8_t *eth_frame, eth_addr_t *dest_addr,
 int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
                     uint16_t msg_len, struct timespec *ts,
                     eth_addr_t *dest_addr) {
+  /* Match the guard in avb_net_send_on: skip TX silently when port 0
+   * has no carrier so periodic ADP / MAAP / AECP cycles do not spam
+   * the failure log. Single source of truth is esp_ptp. */
+  if (!ptpd_port_link_up(0)) {
+    return 0;
+  }
+
   uint8_t eth_frame[msg_len + ETH_HEADER_LEN];
 
   // Create the Ethernet frame
@@ -740,6 +748,10 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
 int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
                          uint16_t msg_len, struct timespec *ts,
                          eth_addr_t *dest_addr, uint8_t *vlan_id) {
+  if (!ptpd_port_link_up(0)) {
+    return 0;
+  }
+
   uint8_t eth_frame[msg_len + ETH_HEADER_LEN + sizeof(struct eth_vlan_hdr)];
 
   // Create the Ethernet frame
@@ -826,6 +838,18 @@ int avb_net_send_on(avb_state_s *state, int port_index,
   (void)ts;
 
   avb_port_s *p = &state->port[port_index];
+
+  /* Skip TX when the port is not carrying frames. The periodic
+   * cycles (MSRP / MVRP / ADP) tick continuously while STA is
+   * disassociated or the ETH cable is unplugged; without this gate
+   * each one would call into esp_wifi_internal_tx / L2TAP write
+   * with no carrier and spam the failure log at multi-Hz. Single
+   * source of truth lives in esp_ptp — it already owns the per-port
+   * topology and event handlers. Returning 0 (zero bytes sent) lets
+   * the callers' `if (ret < 0)` failure check pass silently. */
+  if (!ptpd_port_link_up(port_index)) {
+    return 0;
+  }
 
   /* Derive dest_addr, mirroring avb_net_send. */
   eth_addr_t dest_addr;

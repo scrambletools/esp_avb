@@ -76,8 +76,6 @@ static stream_tx_ctx_t *s_stream_tx_ctx = NULL;
  * task to miss its 125μs deadlines. The DMA ring appears to handle concurrent
  * access in practice (separate TX descriptors for each caller). */
 
-/* Send MVRP VLAN identifier message */
-
 void stream_id_from_mac(eth_addr_t *mac_addr, uint8_t *stream_id, size_t uid) {
   // copy the mac address octets to the stream id and fill the remaining octects
   // with uid
@@ -1140,16 +1138,11 @@ err:
   vTaskDelete(NULL);
 }
 
-/****************************************************************************
- * Stream Input (Listener) — Jitter-buffered AVTP → I2S
- *
- * Architecture:
+/* Stream Input (Listener) — jitter-buffered AVTP → I2S.
  *   EMAC RX handler → ring_write (non-blocking)
- *   esp_timer 1ms   → ring_read → i2s_channel_write
- *
- * The SPSC lock-free ring buffer decouples bursty EMAC packet arrival
- * from steady I2S DMA consumption. Milan-compliant: buffers ≥2.126ms.
- ****************************************************************************/
+ *   esp_timer 1 ms  → ring_read → i2s_channel_write
+ * SPSC lock-free ring decouples bursty EMAC RX from steady I2S DMA.
+ * Milan-compliant: buffers ≥ 2.126 ms. */
 
 /* Time-scheduled packet queue for presentation-time rendering
  * (IEEE 1722 AVTP audio + Milan v1.3 §7.2): each received packet is stored
@@ -2095,9 +2088,7 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
   // Codec stays open — shared with talker stream-out. Closed at AVB shutdown.
 }
 
-/****************************************************************************
- * Stream Output (Talker)
- ****************************************************************************/
+/* Stream Output (Talker) */
 
 /* CRF media-clock output task (talker). Sends one AudioSample CRF timestamp
  * per PDU using the Milan-compatible 48 kHz profile advertised in AEM. */

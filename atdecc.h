@@ -1219,15 +1219,15 @@ typedef uint8_t aem_sample_rate_t[4];
 typedef struct {
   uint8_t object_name[64];          // 64-octet UTF8 string containing a name.
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
-  uint8_t clock_domain_index[2];    //
-  uint8_t num_stream_input_ports[2];  //
-  uint8_t base_stream_input_port[2];  //
-  uint8_t num_stream_output_ports[2]; //
-  uint8_t base_stream_output_port[2]; //
+  uint8_t clock_domain_index[2];
+  uint8_t num_stream_input_ports[2];
+  uint8_t base_stream_input_port[2];
+  uint8_t num_stream_output_ports[2];
+  uint8_t base_stream_output_port[2];
   uint8_t unused[56];                 // these fields not yet supported
-  uint8_t current_sampling_rate[4];   //
+  uint8_t current_sampling_rate[4];
   uint8_t sampling_rate_offset[2];    // 144 for this version of AEM
-  uint8_t sampling_rates_count[2];    //
+  uint8_t sampling_rates_count[2];
   aem_sample_rate_t sampling_rates[AEM_MAX_NUM_SAMPLE_RATES];
 } aem_audio_unit_desc_s; // 180 bytes
 
@@ -1256,21 +1256,21 @@ typedef struct {
 typedef struct {
   uint8_t object_name[64];          // 64-octet UTF8 string containing a name.
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
-  eth_addr_t mac_address;           //
-  aem_avb_interface_flags_s flags;  //
-  unique_id_t clock_identity;       //
-  uint8_t priority1;                //
-  uint8_t clock_class;              //
-  uint8_t offset_scaled_log_variance[2]; //
-  uint8_t clock_accuracy;                //
-  uint8_t priority2;                     //
-  uint8_t domain_number;                 //
-  uint8_t log_sync_interval;             //
-  uint8_t log_announce_interval;         //
-  uint8_t log_pdelay_interval;           //
-  uint8_t port_number[2];                //
-  uint8_t number_of_controls[2];         //
-  uint8_t base_control[2];               //
+  eth_addr_t mac_address;
+  aem_avb_interface_flags_s flags;
+  unique_id_t clock_identity;
+  uint8_t priority1;
+  uint8_t clock_class;
+  uint8_t offset_scaled_log_variance[2];
+  uint8_t clock_accuracy;
+  uint8_t priority2;
+  uint8_t domain_number;
+  uint8_t log_sync_interval;
+  uint8_t log_announce_interval;
+  uint8_t log_pdelay_interval;
+  uint8_t port_number[2];
+  uint8_t number_of_controls[2];
+  uint8_t base_control[2];
 } aem_avb_interface_desc_s;              // 98 bytes
 
 /* AEM Clock Source flags (used for descriptor) */
@@ -1287,11 +1287,11 @@ typedef struct {
 typedef struct {
   uint8_t object_name[64];          // 64-octet UTF8 string containing a name.
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
-  aem_clock_source_flags_s clock_source_flags; //
+  aem_clock_source_flags_s clock_source_flags;
   uint8_t clock_source_type[2]; // must be one of aem_clock_source_type_t
-  unique_id_t clock_source_id;  //
+  unique_id_t clock_source_id;
   uint8_t clock_source_location_type[2];  // must be one of aem_desc_type_t
-  uint8_t clock_source_location_index[2]; //
+  uint8_t clock_source_location_index[2];
 } aem_clock_source_desc_s;                // 82 bytes
 
 /* AEM Memory Object descriptor */
@@ -1300,11 +1300,11 @@ typedef struct {
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
   uint8_t memory_object_type[2];    // must be one of aem_memory_obj_type_t
   uint8_t target_descriptor_type[2];  // must be one of aem_desc_type_t
-  uint8_t target_descriptor_index[2]; //
-  uint8_t start_address[8];           //
-  uint8_t maximum_length[8];          //
-  uint8_t length[8];                  //
-  uint8_t maximum_segment_length[8];  //
+  uint8_t target_descriptor_index[2];
+  uint8_t start_address[8];
+  uint8_t maximum_length[8];
+  uint8_t length[8];
+  uint8_t maximum_segment_length[8];
 } aem_memory_object_desc_s;           // 104 bytes
 
 /* AEM Locale descriptor */
@@ -1332,22 +1332,22 @@ typedef struct {
 /* AEM Stream Port flags (used for descriptor) */
 typedef struct {
   uint8_t reserved1;                  // Reserved for future use
-  uint8_t clock_sync_source : 1;      //
-  uint8_t async_sample_rate_conv : 1; //
-  uint8_t sync_sample_rate_conv : 1;  //
+  uint8_t clock_sync_source : 1;
+  uint8_t async_sample_rate_conv : 1;
+  uint8_t sync_sample_rate_conv : 1;
   uint8_t reserved2 : 5;              // Reserved for future use
 } aem_stream_port_flags_s;            // 2 bytes
 
 /* AEM Stream Port descriptor (input and output) */
 typedef struct {
-  uint8_t clock_domain_index[2];      //
-  aem_stream_port_flags_s port_flags; //
-  uint8_t number_of_controls[2];      //
-  uint8_t base_control[2];            //
-  uint8_t number_of_clusters[2];      //
-  uint8_t base_cluster[2];            //
-  uint8_t number_of_maps[2];          //
-  uint8_t base_map[2];                //
+  uint8_t clock_domain_index[2];
+  aem_stream_port_flags_s port_flags;
+  uint8_t number_of_controls[2];
+  uint8_t base_control[2];
+  uint8_t number_of_clusters[2];
+  uint8_t base_cluster[2];
+  uint8_t number_of_maps[2];
+  uint8_t base_map[2];
 } aem_stream_port_desc_s;             // 16 bytes
 
 /* AEM Audio Cluster descriptor */
@@ -1355,22 +1355,22 @@ typedef struct {
   uint8_t object_name[64];          // 64-octet UTF8 string containing a name.
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
   uint8_t signal_type[2];           // must be one of aem_desc_type_t
-  uint8_t signal_index[2];          //
-  uint8_t signal_output[2];         //
-  uint8_t path_latency[4];          //
-  uint8_t block_latency[4];         //
-  uint8_t channel_count[2];         //
+  uint8_t signal_index[2];
+  uint8_t signal_output[2];
+  uint8_t path_latency[4];
+  uint8_t block_latency[4];
+  uint8_t channel_count[2];
   uint8_t format[2];                // must be one of aem_audio_cluster_format_t
-  uint8_t aes_data_type_reference[2]; //
-  uint8_t aes_data_type[2];           //
+  uint8_t aes_data_type_reference[2];
+  uint8_t aes_data_type[2];
 } aem_audio_cluster_desc_s;           // 86 bytes
 
 /* AEM Audio Mapping */
 typedef struct {
-  uint8_t mapping_stream_index[2];    //
-  uint8_t mapping_stream_channel[2];  //
-  uint8_t mapping_cluster_offset[2];  //
-  uint8_t mapping_cluster_channel[2]; //
+  uint8_t mapping_stream_index[2];
+  uint8_t mapping_stream_channel[2];
+  uint8_t mapping_cluster_offset[2];
+  uint8_t mapping_cluster_channel[2];
 } aem_audio_mapping_s;                // 8 bytes
 
 /* AEM Audio Map descriptor */
@@ -1392,17 +1392,17 @@ typedef struct {
 typedef struct {
   uint8_t object_name[64];          // 64-octet UTF8 string containing a name.
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
-  uint8_t block_latency[4];         //
-  uint8_t control_latency[4];       //
-  uint8_t control_domain[2];        //
-  uint8_t control_value_type[2];    //
-  uint8_t control_type[8];          //
-  uint8_t reset_time[4];            //
-  uint8_t values_offset[2];         //
-  uint8_t number_of_values[2];      //
-  uint8_t signal_type[2];           //
-  uint8_t signal_index[2];          //
-  uint8_t signal_output[2];         //
+  uint8_t block_latency[4];
+  uint8_t control_latency[4];
+  uint8_t control_domain[2];
+  uint8_t control_value_type[2];
+  uint8_t control_type[8];
+  uint8_t reset_time[4];
+  uint8_t values_offset[2];
+  uint8_t number_of_values[2];
+  uint8_t signal_type[2];
+  uint8_t signal_index[2];
+  uint8_t signal_output[2];
   uint8_t value_details[AEM_MAX_LEN_CONTROL_VAL_DETAILS];
 } aem_control_desc_s; // 68 bytes
 
@@ -1413,8 +1413,8 @@ typedef uint8_t aem_clock_source_t[2];
 typedef struct {
   uint8_t object_name[64];          // 64-octet UTF8 string containing a name.
   uint8_t localized_description[2]; // Pointer to the localized name. See 7.3.7.
-  uint8_t clock_source_index[2];    //
-  uint8_t clock_sources_offset[2];  //
+  uint8_t clock_source_index[2];
+  uint8_t clock_sources_offset[2];
   uint8_t clock_sources_count[2];   // number of clock sources in the descriptor
                                     // (max is 216)
   aem_clock_source_t

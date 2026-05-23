@@ -12,81 +12,52 @@
 #ifndef _ESP_AVB_H_
 #define _ESP_AVB_H_
 
-/****************************************************************************
- * Included Files
- ****************************************************************************/
-
 #include <esp_eth.h>
 #include <stdbool.h>
 #include <time.h>
 
-/****************************************************************************
- * Compiler Definitions
- ****************************************************************************/
-
-/* Default Ethernet interface */
 #define DEF_ETH_IF "ETH_0"
 
-/****************************************************************************
- * Public Types
- ****************************************************************************/
-
-/* High-level role of this AVB instance. Selected at compile time via
- * CONFIG_ESP_AVB_ROLE_*. The default is endpoint_wired, which preserves
- * historical behavior. Other roles gate codec / talker-listener init
- * and (for bridge) enable forwarding + FQTSS. */
+/* Selected at compile time via CONFIG_ESP_AVB_ROLE_*. Bridge role
+ * enables forwarding + FQTSS; endpoint roles gate codec init. */
 typedef enum {
   avb_role_endpoint_wired = 0,
   avb_role_endpoint_wireless = 1,
   avb_role_bridge = 2,
 } avb_role_e;
 
-/* Per-port medium + timing-mechanism. Mirrors ptp_port_medium_e in
- * esp_ptp:
- *   eth_hwts — Ethernet medium with IEEE 1588 HW timestamping and
- *              on-wire 802.1AS Pdelay.
- *   wifi_ftm — Wi-Fi medium with IEEE 802.11mc FTM peer-delay and
- *              Sync transported in the SoftAP's 802.11 Beacon Vendor
- *              IE. */
 typedef enum {
   avb_port_medium_eth_hwts = 0,
   avb_port_medium_wifi_ftm = 1,
 } avb_port_medium_e;
 
-/* Port-host-interface. How the port attaches to the host SoC.
- * Determines timestamp accuracy, latency floor, admission budget.
- * Mirrors ptp_port_host_if_e in esp_ptp. */
 typedef enum {
-  avb_port_host_if_emac  = 0,   /* on-chip MAC, RMII/RGMII; hardware TS */
-  avb_port_host_if_ahb   = 1,   /* on-chip peripheral (native Wi-Fi) */
-  avb_port_host_if_sdio  = 2,   /* external coprocessor over SDIO */
-  avb_port_host_if_spi   = 3,   /* external Eth/Wi-Fi over SPI */
-  avb_port_host_if_usb   = 4,   /* USB-attached */
+  avb_port_host_if_emac  = 0,
+  avb_port_host_if_ahb   = 1,
+  avb_port_host_if_sdio  = 2,
+  avb_port_host_if_spi   = 3,
+  avb_port_host_if_usb   = 4,
   avb_port_host_if_other = 5,
 } avb_port_host_if_e;
 
-/* Port type — role in the AVB topology. Any port with type=bridged
- * implies the entity is in bridge mode (mirror of ESP_AVB_ROLE_BRIDGE). */
+/* type=bridged on any port implies the entity is in bridge mode. */
 typedef enum {
   avb_port_type_primary  = 0,
   avb_port_type_failover = 1,
   avb_port_type_bridged  = 2,
 } avb_port_type_e;
 
-/* Wi-Fi mode for medium=wifi ports. Numeric values match IDF's
- * WIFI_IF_STA=0 / WIFI_IF_AP=1 so the field doubles as the wifi_if
- * argument to esp_wifi_internal_tx. NONE is the sentinel for non-wifi. */
+/* Values match IDF's WIFI_IF_STA=0 / WIFI_IF_AP=1. */
 typedef enum {
   avb_port_wifi_mode_sta  = 0,
   avb_port_wifi_mode_ap   = 1,
   avb_port_wifi_mode_none = 0xFF,
 } avb_port_wifi_mode_e;
 
-/* How the port's slave-side time is synchronized. GPTP_WIRED is the
- * historical 802.1AS path (Sync/Follow_Up + Pdelay on-wire). BEACON_IE_WIFI
- * is the wireless variant where Sync rides the AP's 802.11 beacon Vendor IE
- * and peer-delay rides FTM. FTM_ONLY is a peer-delay-only port (Sync
- * transport handled elsewhere). */
+/* Where the port's timereceiver-side time comes from:
+ *   gptp_wired      — on-wire 802.1AS
+ *   beacon_ie_wifi  — Sync via beacon Vendor IE, peer-delay via FTM
+ *   ftm_only        — peer-delay only; Sync transport elsewhere */
 typedef enum {
   avb_port_time_source_gptp_wired = 0,
   avb_port_time_source_beacon_ie_wifi = 1,
@@ -189,10 +160,6 @@ typedef struct {
     uint8_t id[8]; // Entity ID
   } entity;
 } avb_status_s;
-
-/****************************************************************************
- * Public Function Prototypes
- ****************************************************************************/
 
 #ifdef __cplusplus
 #define EXTERN extern "C"

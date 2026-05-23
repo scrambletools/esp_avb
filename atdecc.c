@@ -15,7 +15,6 @@
 static uint16_t
 count_acmp_connected_talker_listeners(avb_talker_stream_s *stream);
 
-/* Send ADP entity available message */
 int avb_send_adp_entity_available(avb_state_s *state) {
   adp_message_s msg;
   struct timespec ts;
@@ -23,7 +22,6 @@ int avb_send_adp_entity_available(avb_state_s *state) {
   size_t body_size = 56; // ADP Entity Available message body length
   memset(&msg, 0, sizeof(msg));
 
-  // Populate the message
   msg.header.subtype = avtp_subtype_adp;
   msg.header.msg_type = adp_msg_type_entity_available;
   msg.header.version = 0;
@@ -53,14 +51,12 @@ int avb_send_adp_entity_available(avb_state_s *state) {
   return ret;
 }
 
-/* Send AECP command controller available message */
 int avb_send_aecp_cmd_controller_available(avb_state_s *state,
                                            unique_id_t *target_id) {
   // not implemented
   return OK;
 }
 
-/* Send AECP command get stream info message */
 int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
                                       unique_id_t *target_id) {
   aecp_get_stream_info_s msg;
@@ -69,7 +65,6 @@ int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
   size_t body_size = 24; // AEC Get Stream Info message body length
   memset(&msg, 0, sizeof(msg));
 
-  // Populate the message
   msg.common.header.subtype = avtp_subtype_aecp;
   msg.common.header.msg_type = aecp_msg_type_aem_command;
   msg.common.header.status_valtime = 8; // valid time: 16 seconds
@@ -91,7 +86,6 @@ int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get stream info message */
 int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
                                       aecp_get_stream_info_s *msg,
                                       eth_addr_t *dest_addr) {
@@ -110,7 +104,6 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
     ret = ERROR;
   }
 
-  // create a response message
   aecp_get_stream_info_rsp_s response = {0};
   memcpy(&response, msg, sizeof(aecp_get_stream_info_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
@@ -165,15 +158,12 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
     memcpy(&response.vlan_id, &s->vlan_id, 2);
   }
 
-  // calc control data length
   uint16_t control_data_len =
       sizeof(aecp_get_stream_info_rsp_s) - AVTP_CDL_PREAMBLE_LEN;
 
-  // set the control data length
   response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   response.common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len = sizeof(aecp_get_stream_info_rsp_s);
   ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
                         dest_addr);
@@ -183,7 +173,6 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response set stream format message */
 int avb_send_aecp_rsp_set_stream_format(avb_state_s *state,
                                         aecp_stream_format_s *msg,
                                         eth_addr_t *dest_addr) {
@@ -193,7 +182,6 @@ int avb_send_aecp_rsp_set_stream_format(avb_state_s *state,
   // set the message type to response
   msg->common.header.msg_type = aecp_msg_type_aem_response;
 
-  // set the control data length
   uint16_t control_data_len =
       sizeof(aecp_stream_format_s) - AVTP_CDL_PREAMBLE_LEN;
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
@@ -208,7 +196,6 @@ int avb_send_aecp_rsp_set_stream_format(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP unsolicited notification get stream info response */
 // sends to all regitered notification recipients
 int avb_send_aecp_unsol_get_stream_info(avb_state_s *state, uint16_t index,
                                         bool is_output) {
@@ -216,13 +203,11 @@ int avb_send_aecp_unsol_get_stream_info(avb_state_s *state, uint16_t index,
   return OK;
 }
 
-/* Send AECP command get stream info message */
 int avb_send_aecp_cmd_get_counters(avb_state_s *state, unique_id_t *target_id) {
   // not implemented
   return OK;
 }
 
-/* Send AECP response get counters message */
 // may be sent as an unsolicited notification
 int avb_send_aecp_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
                                    eth_addr_t *dest_addr) {
@@ -230,7 +215,6 @@ int avb_send_aecp_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
   return OK;
 }
 
-/* Send AECP unsolicited notification get stream info response */
 // sends to all regitered notification recipients
 int avb_send_aecp_unsol_get_counters(avb_state_s *state,
                                      aem_desc_type_t descriptor_type,
@@ -239,7 +223,6 @@ int avb_send_aecp_unsol_get_counters(avb_state_s *state,
   return OK;
 }
 
-/* Send AECP response get descriptor for entity message */
 int avb_send_aecp_rsp_read_descr_entity(avb_state_s *state,
                                         aecp_read_descriptor_rsp_s *msg,
                                         eth_addr_t *dest_addr) {
@@ -248,24 +231,20 @@ int avb_send_aecp_rsp_read_descr_entity(avb_state_s *state,
   uint16_t control_data_len = sizeof(aecp_read_descriptor_rsp_s) -
                               sizeof(atdecc_header_s) - AEM_MAX_DESC_LEN;
 
-  // create a descriptor
   aem_entity_desc_s descriptor;
   memcpy(&descriptor, &state->own_entity, sizeof(aem_entity_desc_s));
   descriptor.detail.vendor_name_ref[1] = 12; // strings desc 1, string_4
   descriptor.detail.model_name_ref[1] = 13;  // strings desc 1, string_5
 
-  // insert the descriptor data
   memcpy(msg->descriptor_data, &state->own_entity, sizeof(aem_entity_desc_s));
   /* descriptor_type and descriptor_index (4 bytes) are already counted
    * in the initial control_data_len via sizeof(aecp_read_descriptor_rsp_s);
    * only add the descriptor body here. */
   control_data_len += sizeof(aem_entity_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -275,7 +254,6 @@ int avb_send_aecp_rsp_read_descr_entity(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for configuration message */
 int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
                                                aecp_read_descriptor_rsp_s *msg,
                                                eth_addr_t *dest_addr) {
@@ -284,7 +262,6 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
   uint16_t control_data_len = sizeof(aecp_read_descriptor_rsp_s) -
                               sizeof(atdecc_header_s) - AEM_MAX_DESC_LEN;
 
-  // create a configuration descriptor
   aem_config_desc_s config_desc = {0};
 
   // give it a name
@@ -346,7 +323,6 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
            sizeof(aem_config_desc_count_s));
   }
 
-  // insert the descriptor data into the response message
   int_to_octets(&descriptor_counts_count, config_desc.descriptor_counts_count,
                 2);
   uint16_t offset = 74; // As defined in section 7.2.2
@@ -358,11 +334,9 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
   control_data_len += sizeof(aem_config_desc_s) -
                       (4 * (AEM_MAX_NUM_DESC - descriptor_counts_count));
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -372,7 +346,6 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for audio unit message */
 int avb_send_aecp_rsp_read_descr_audio_unit(avb_state_s *state,
                                             aecp_read_descriptor_rsp_s *msg,
                                             eth_addr_t *dest_addr) {
@@ -416,7 +389,6 @@ int avb_send_aecp_rsp_read_descr_audio_unit(avb_state_s *state,
                   4);
   }
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_audio_unit_desc_s));
   /* descriptor_type and descriptor_index (4 bytes) are already counted
    * in the initial control_data_len; only add the descriptor body, minus
@@ -425,11 +397,9 @@ int avb_send_aecp_rsp_read_descr_audio_unit(avb_state_s *state,
                       (sizeof(aem_sample_rate_t) *
                        (AEM_MAX_NUM_SAMPLE_RATES - sampling_rates_count));
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -439,7 +409,6 @@ int avb_send_aecp_rsp_read_descr_audio_unit(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for stream input or output message */
 // TODO: change to use the input_streams and output_streams arrays from the
 // state also move the supported formats to the state
 int avb_send_aecp_rsp_read_descr_stream(avb_state_s *state,
@@ -501,7 +470,6 @@ int avb_send_aecp_rsp_read_descr_stream(avb_state_s *state,
   int buffer_length = 8; // 8ns ingress buffer
   int redundant_offset = formats_offset + 8 * number_of_formats;
 
-  // create a stream input descriptor
   aem_stream_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_stream_desc_s));
 
@@ -523,20 +491,16 @@ int avb_send_aecp_rsp_read_descr_stream(avb_state_s *state,
   memcpy(&descriptor.formats, formats_list,
          sizeof(avtp_stream_format_s) * number_of_formats);
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_stream_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_stream_desc_s) -
       (AEM_MAX_NUM_FORMATS - number_of_formats) *
           sizeof(avtp_stream_format_s); // resize for actual number of formats
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -562,7 +526,6 @@ void avb_update_avb_interface_from_ptp(avb_state_s *state) {
       state->ptp_status.clock_source_info.priority2;
 }
 
-/* Send AECP response get descriptor for avb interface message */
 int avb_send_aecp_rsp_read_descr_avb_interface(avb_state_s *state,
                                                aecp_read_descriptor_rsp_s *msg,
                                                eth_addr_t *dest_addr) {
@@ -576,18 +539,14 @@ int avb_send_aecp_rsp_read_descr_avb_interface(avb_state_s *state,
   uint16_t localized_description = 6;
   int_to_octets(&localized_description, descriptor.localized_description, 2);
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_avb_interface_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_avb_interface_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -597,7 +556,6 @@ int avb_send_aecp_rsp_read_descr_avb_interface(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for clock source message */
 int avb_send_aecp_rsp_read_descr_clock_source(avb_state_s *state,
                                               aecp_read_descriptor_rsp_s *msg,
                                               eth_addr_t *dest_addr) {
@@ -605,7 +563,6 @@ int avb_send_aecp_rsp_read_descr_clock_source(avb_state_s *state,
   struct timespec ts;
   uint16_t index = octets_to_uint(msg->descriptor_index, 2);
 
-  // create a clock source descriptor
   aem_clock_source_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_clock_source_desc_s));
 
@@ -630,18 +587,14 @@ int avb_send_aecp_rsp_read_descr_clock_source(avb_state_s *state,
     int_to_octets(&location_type, &descriptor.clock_source_location_type, 2);
   }
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_clock_source_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_clock_source_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -651,7 +604,6 @@ int avb_send_aecp_rsp_read_descr_clock_source(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for memory object message */
 int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
                                             aecp_read_descriptor_rsp_s *msg,
                                             eth_addr_t *dest_addr) {
@@ -662,11 +614,9 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   int localized_description = 8; // strings desc 1, string_0
   uint16_t object_type = aem_memory_obj_type_png_entity;
 
-  // create a stream input descriptor
   aem_memory_object_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_memory_object_desc_s));
 
-  // populate the descriptor (only non-zero fields)
   int_to_octets(&localized_description, descriptor.localized_description, 2);
   int_to_octets(&object_type, &descriptor.memory_object_type, 2);
   int_to_octets(&state->logo_start, &descriptor.start_address[4], 4);
@@ -675,18 +625,14 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   uint32_t max_segment = 400; /* safe limit for single AECP frame */
   int_to_octets(&max_segment, &descriptor.maximum_segment_length[4], 4);
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_memory_object_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_memory_object_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -696,7 +642,6 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for locale message */
 int avb_send_aecp_rsp_read_descr_locale(avb_state_s *state,
                                         aecp_read_descriptor_rsp_s *msg,
                                         eth_addr_t *dest_addr) {
@@ -713,28 +658,22 @@ int avb_send_aecp_rsp_read_descr_locale(avb_state_s *state,
   uint16_t number_of_strings = AVB_LOCALIZED_STRINGS_DESCRIPTORS;
   uint16_t base_strings = index * AVB_LOCALIZED_STRINGS_DESCRIPTORS;
 
-  // create a locale descriptor
   aem_locale_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_locale_desc_s));
 
-  // populate the descriptor (only non-zero fields)
   memcpy(&descriptor.locale_identifier, locale->locale_identifier,
          strlen(locale->locale_identifier));
   int_to_octets(&number_of_strings, &descriptor.number_of_strings, 2);
   int_to_octets(&base_strings, &descriptor.base_strings, 2);
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_locale_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_locale_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -744,7 +683,6 @@ int avb_send_aecp_rsp_read_descr_locale(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for strings message */
 int avb_send_aecp_rsp_read_descr_strings(avb_state_s *state,
                                          aecp_read_descriptor_rsp_s *msg,
                                          eth_addr_t *dest_addr) {
@@ -761,11 +699,9 @@ int avb_send_aecp_rsp_read_descr_strings(avb_state_s *state,
 
   const avb_locale_strings_s *locale = &AVB_LOCALIZED_STRINGS[locale_index];
 
-  // create a strings descriptor
   aem_strings_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_strings_desc_s));
 
-  // populate the descriptor (only non-zero fields)
   uint8_t *dst[AVB_LOCALIZED_STRINGS_PER_DESCRIPTOR] = {
       descriptor.string_0, descriptor.string_1, descriptor.string_2,
       descriptor.string_3, descriptor.string_4, descriptor.string_5,
@@ -782,18 +718,14 @@ int avb_send_aecp_rsp_read_descr_strings(avb_state_s *state,
       memcpy(dst[i], src, strlen(src));
   }
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_strings_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_strings_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -803,7 +735,6 @@ int avb_send_aecp_rsp_read_descr_strings(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for stream port input message */
 int avb_send_aecp_rsp_read_descr_stream_port(avb_state_s *state,
                                              aecp_read_descriptor_rsp_s *msg,
                                              eth_addr_t *dest_addr,
@@ -815,11 +746,9 @@ int avb_send_aecp_rsp_read_descr_stream_port(avb_state_s *state,
   uint16_t num_clusters = 1;
   uint16_t num_maps = 1;
 
-  // create a stream input descriptor
   aem_stream_port_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_stream_port_desc_s));
 
-  // populate the descriptor (only non-zero fields)
   int_to_octets(&num_clusters, &descriptor.number_of_clusters, 2);
   int_to_octets(&num_maps, &descriptor.number_of_maps, 2);
   if (is_output) { // bases are different for output port
@@ -827,18 +756,14 @@ int avb_send_aecp_rsp_read_descr_stream_port(avb_state_s *state,
     descriptor.base_map[1] = 1;
   }
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_stream_port_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_stream_port_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -848,7 +773,6 @@ int avb_send_aecp_rsp_read_descr_stream_port(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for audio cluster message */
 int avb_send_aecp_rsp_read_descr_audio_cluster(avb_state_s *state,
                                                aecp_read_descriptor_rsp_s *msg,
                                                eth_addr_t *dest_addr) {
@@ -867,28 +791,22 @@ int avb_send_aecp_rsp_read_descr_audio_cluster(avb_state_s *state,
   // TODO: may need to change depending on 61883 vs aaf
   aem_audio_cluster_format_t cluster_format = aem_audio_cluster_format_mbla;
 
-  // create a stream input descriptor
   aem_audio_cluster_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_audio_cluster_desc_s));
 
-  // populate the descriptor (only non-zero fields)
   int_to_octets(&localized_description, descriptor.localized_description, 2);
   int_to_octets(&cluster_format, descriptor.format, 2);
   int_to_octets(&num_channels, descriptor.channel_count, 2);
   int_to_octets(&signal_type, descriptor.signal_type, 2);
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_audio_cluster_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_audio_cluster_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -898,7 +816,6 @@ int avb_send_aecp_rsp_read_descr_audio_cluster(avb_state_s *state,
   return ret;
 }
 
-/* Send AECP response get descriptor for audio map message */
 int avb_send_aecp_rsp_read_descr_audio_map(avb_state_s *state,
                                            aecp_read_descriptor_rsp_s *msg,
                                            eth_addr_t *dest_addr) {
@@ -919,27 +836,21 @@ int avb_send_aecp_rsp_read_descr_audio_map(avb_state_s *state,
     mappings[i] = mapping;
   }
 
-  // create a stream input descriptor
   aem_audio_map_desc_s descriptor = {0};
 
-  // populate the descriptor (only non-zero fields)
   int_to_octets(&mappings_offset, &descriptor.mappings_offset, 2);
   int_to_octets(&num_mappings, &descriptor.number_of_mappings, 2);
   memcpy(descriptor.mappings, mappings,
          num_mappings * sizeof(aem_audio_mapping_s));
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_audio_map_desc_s));
 
-  // calc control data length
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_audio_map_desc_s);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -1223,7 +1134,6 @@ int avb_process_aecp_cmd_get_control(avb_state_s *state, aecp_message_u *msg,
   return ret;
 }
 
-/* Send AECP response get descriptor for clock domain message */
 int avb_send_aecp_rsp_read_descr_clock_domain(avb_state_s *state,
                                               aecp_read_descriptor_rsp_s *msg,
                                               eth_addr_t *dest_addr) {
@@ -1245,11 +1155,9 @@ int avb_send_aecp_rsp_read_descr_clock_domain(avb_state_s *state,
   /* Currently-selected source — reflects any prior SET_CLOCK_SOURCE */
   uint16_t clock_source_index = state->media_clock.active_clock_source_index;
 
-  // create a clock domain descriptor
   aem_clock_domain_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_clock_domain_desc_s));
 
-  // populate the descriptor (only non-zero fields)
   int_to_octets(&localized_description, descriptor.localized_description, 2);
   int_to_octets(&clock_source_index, descriptor.clock_source_index, 2);
   int_to_octets(&clock_sources_offset, &descriptor.clock_sources_offset, 2);
@@ -1257,20 +1165,16 @@ int avb_send_aecp_rsp_read_descr_clock_domain(avb_state_s *state,
   memcpy(descriptor.clock_sources, clock_sources,
          sizeof(aem_clock_source_t) * clock_sources_count);
 
-  // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_clock_domain_desc_s));
 
-  // calc control data length — trim to the actual clock_sources_count
   uint16_t control_data_len =
       AECP_DESC_PREAMBLE_LEN + sizeof(aem_clock_domain_desc_s) -
       (AEM_MAX_NUM_CLOCK_SOURCES - clock_sources_count) *
           sizeof(aem_clock_source_t);
 
-  // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   msg->common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(unique_id_t) + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, dest_addr);
@@ -1280,7 +1184,6 @@ int avb_send_aecp_rsp_read_descr_clock_domain(avb_state_s *state,
   return ret;
 }
 
-/* Process received ATDECC ADP message */
 int avb_process_adp(avb_state_s *state, adp_message_s *msg,
                     eth_addr_t *src_addr) {
 
@@ -1418,7 +1321,6 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
   return OK;
 }
 
-/* Process received ATDECC AECP message */
 /* Resolve a descriptor's object_name pointer from type/index/name_index.
  * Returns NULL if the descriptor type is not supported for naming. */
 static uint8_t *avb_resolve_name_ptr(avb_state_s *state, uint16_t desc_type,
@@ -2035,13 +1937,11 @@ int avb_process_aecp_cmd_deregister_unsol_notif(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP command acquire entity */
 int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
                                         eth_addr_t *src_addr) {
   int ret;
   struct timespec ts;
 
-  // create a response, copy the cmd message data, change the msg type and set
   // owner id
   aecp_acquire_entity_s response = {0};
   memcpy(&response, msg, sizeof(aecp_acquire_entity_s));
@@ -2050,7 +1950,6 @@ int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
     memcpy(response.owner_id, msg->common.controller_entity_id, UNIQUE_ID_LEN);
   }
 
-  // send the response message
   uint16_t msg_len = sizeof(atdecc_header_s) + sizeof(aecp_acquire_entity_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
@@ -2071,13 +1970,11 @@ int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
   return ret;
 }
 
-/* Process AECP command lock entity */
 int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
                                      eth_addr_t *src_addr) {
   int ret;
   struct timespec ts;
 
-  // create a response, copy the cmd message data, change the msg type and set
   // locked id
   aecp_lock_entity_s response = {0};
   memcpy(&response, msg, sizeof(aecp_lock_entity_s));
@@ -2086,7 +1983,6 @@ int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
     memcpy(response.locked_id, msg->common.controller_entity_id, UNIQUE_ID_LEN);
   }
 
-  // send the response message
   uint16_t msg_len = sizeof(atdecc_header_s) + sizeof(aecp_lock_entity_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
@@ -2105,21 +2001,18 @@ int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
   return ret;
 }
 
-/* Process AECP command entity available */
 int avb_process_aecp_cmd_entity_available(avb_state_s *state,
                                           aecp_message_u *msg,
                                           eth_addr_t *src_addr) {
   int ret;
   struct timespec ts;
 
-  // create a response, copy the cmd message data and change the msg type
   aecp_entity_available_rsp_s response;
   memset(&response, 0, sizeof(aecp_entity_available_rsp_s));
   memcpy(&response.common, &msg->common, sizeof(aecp_common_s));
   memcpy(&response.aem, &msg->basic.aem, sizeof(aecp_common_aem_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
 
-  // send the response message
   uint16_t msg_len =
       sizeof(atdecc_header_s) + sizeof(aecp_entity_available_rsp_s);
   ret =
@@ -2130,7 +2023,6 @@ int avb_process_aecp_cmd_entity_available(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP command get configuration */
 int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
                                            aecp_message_u *msg,
                                            eth_addr_t *src_addr) {
@@ -2138,7 +2030,6 @@ int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
 
   struct timespec ts;
 
-  // create a response, copy the cmd message data and change the msg type, add
   // config index
   aecp_get_configuration_rsp_s response;
   memset(&response, 0, sizeof(aecp_get_configuration_rsp_s));
@@ -2148,7 +2039,6 @@ int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
   size_t config_index = DEFAULT_CONFIG_INDEX;
   int_to_octets(&config_index, response.configuration_index, 2);
 
-  // send the response message
   uint16_t msg_len = sizeof(atdecc_header_s) + sizeof(aecp_lock_entity_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
@@ -2158,13 +2048,11 @@ int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP command read descriptor */
 int avb_process_aecp_cmd_read_descriptor(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr) {
   int ret = OK;
 
-  // create a response, copy the cmd message data and change the msg type
   aecp_read_descriptor_rsp_s *response = NULL;
   response = (aecp_read_descriptor_rsp_s *)calloc(
       1, sizeof(aecp_read_descriptor_rsp_s));
@@ -2233,7 +2121,6 @@ int avb_process_aecp_cmd_read_descriptor(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP command set stream format */
 int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
                                            aecp_message_u *msg,
                                            eth_addr_t *src_addr) {
@@ -2309,7 +2196,6 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
   }
 }
 
-/* Process AECP command get stream format */
 int avb_process_aecp_cmd_get_stream_format(avb_state_s *state,
                                            aecp_message_u *msg,
                                            eth_addr_t *src_addr) {
@@ -2502,7 +2388,6 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP command get stream info */
 int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr) {
@@ -2531,13 +2416,11 @@ int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
                                            src_addr);
 }
 
-/* Send AECP response get AVB info */
 int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
                                    eth_addr_t *dest_addr) {
   int ret;
   struct timespec ts;
 
-  // create a response message
   aecp_get_avb_info_rsp_s response = {0};
   memcpy(&response, msg, sizeof(aecp_get_avb_info_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
@@ -2570,15 +2453,12 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   memcpy(response.msrp_mappings, state->msrp_mappings,
          state->msrp_mappings_count * sizeof(aem_msrp_mapping_s));
 
-  // calc control data length
   uint16_t control_data_len =
       sizeof(aecp_get_avb_info_rsp_s) - AVTP_CDL_PREAMBLE_LEN;
 
-  // set the control data length
   response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   response.common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len = sizeof(aecp_get_avb_info_rsp_s);
   ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
                         dest_addr);
@@ -2588,7 +2468,6 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   return ret;
 }
 
-/* Process AECP command get AVB info */
 int avb_process_aecp_cmd_get_avb_info(avb_state_s *state, aecp_message_u *msg,
                                       eth_addr_t *src_addr) {
 
@@ -2612,13 +2491,11 @@ int avb_process_aecp_cmd_get_avb_info(avb_state_s *state, aecp_message_u *msg,
   return avb_send_aecp_rsp_get_avb_info(state, &msg->get_avb_info, src_addr);
 }
 
-/* Send AECP response get AS path */
 int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
                                   eth_addr_t *dest_addr) {
   int ret;
   struct timespec ts;
 
-  // create a response message
   aecp_get_as_path_rsp_s response = {0};
   memcpy(&response, msg, sizeof(aecp_get_as_path_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
@@ -2645,16 +2522,13 @@ int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
   count++;
   int_to_octets(&count, response.count, 2);
 
-  // calc control data length (variable based on path count)
   uint16_t control_data_len = sizeof(aecp_common_s) - AVTP_CDL_PREAMBLE_LEN +
                               sizeof(aecp_common_aem_s) + 4 + 2 +
                               (count * UNIQUE_ID_LEN);
 
-  // set the control data length
   response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   response.common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message (only the populated portion)
   uint16_t msg_len = AVTP_CDL_PREAMBLE_LEN + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
                         dest_addr);
@@ -2664,7 +2538,6 @@ int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
   return ret;
 }
 
-/* Process AECP command get AS path */
 int avb_process_aecp_cmd_get_as_path(avb_state_s *state, aecp_message_u *msg,
                                      eth_addr_t *src_addr) {
 
@@ -2679,7 +2552,6 @@ int avb_process_aecp_cmd_get_as_path(avb_state_s *state, aecp_message_u *msg,
   return avb_send_aecp_rsp_get_as_path(state, &msg->get_as_path, src_addr);
 }
 
-/* Process AECP command get counters */
 // counters can be for entity, stream input, stream output, avb interface or
 // clock domain
 int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
@@ -2689,7 +2561,6 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
   uint16_t control_data_len =
       sizeof(aecp_get_counters_rsp_s) - sizeof(atdecc_header_s);
 
-  // create a response, copy the cmd message data and change the msg type
   aecp_get_counters_rsp_s response;
   memset(&response, 0, sizeof(aecp_get_counters_rsp_s));
   memcpy(&response, msg, sizeof(aecp_get_counters_rsp_s));
@@ -2748,11 +2619,9 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
     return ERROR;
   }
 
-  // set the control data length
   response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   response.common.header.control_data_len = control_data_len & 0xFF;
 
-  // send the response message
   uint16_t msg_len = sizeof(atdecc_header_s) + control_data_len;
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
@@ -2762,25 +2631,21 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
   return ret;
 }
 
-/* Process AECP response register unsol notif */
 int avb_process_aecp_rsp_register_unsol_notif(avb_state_s *state,
                                               aecp_message_u *msg) {
   return OK;
 }
 
-/* Process AECP response deregister unsol notif */
 int avb_process_aecp_rsp_deregister_unsol_notif(avb_state_s *state,
                                                 aecp_message_u *msg) {
   return OK;
 }
 
-/* Process AECP response entity available */
 int avb_process_aecp_rsp_entity_available(avb_state_s *state,
                                           aecp_message_u *msg) {
   return OK;
 }
 
-/* Process AECP response controller available */
 int avb_process_aecp_rsp_controller_available(avb_state_s *state,
                                               aecp_message_u *msg) {
   return OK;
@@ -2814,7 +2679,6 @@ int avb_process_aecp_rsp_get_counters(avb_state_s *state, aecp_message_u *msg) {
   return OK;
 }
 
-/* Process received ATDECC AECP message */
 int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
                      eth_addr_t *src_addr) {
 
@@ -2997,7 +2861,6 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
   }
 }
 
-/* Process received ATDECC ACMP message */
 int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
 
   switch (msg->header.msg_type) {
@@ -3081,7 +2944,6 @@ int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
   return OK;
 }
 
-/* Send an ACMP command message */
 int avb_send_acmp_command(avb_state_s *state, acmp_msg_type_t msg_type,
                           acmp_message_s *command, bool retried,
                           bool track_inflight) {
@@ -3124,7 +2986,6 @@ int avb_send_acmp_command(avb_state_s *state, acmp_msg_type_t msg_type,
   return ret;
 }
 
-/* Send an ACMP response message */
 int avb_send_acmp_response(avb_state_s *state, acmp_msg_type_t msg_type,
                            acmp_message_s *response, acmp_status_t status) {
   int ret = OK;
@@ -3377,7 +3238,6 @@ static void remove_talker_listener_by_index(avb_talker_stream_s *stream,
          sizeof(stream->connected_listeners[0]));
 }
 
-/* Process ACMP connect tx command */
 int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
                                         bool disconnect) {
   int ret = OK;
@@ -3518,7 +3378,6 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
   return ret;
 }
 
-/* Process ACMP connect tx response */
 int avb_process_acmp_connect_tx_response(avb_state_s *state,
                                          acmp_message_s *response,
                                          bool disconnect) {
@@ -3602,7 +3461,6 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
   return ret;
 }
 
-/* Process ACMP get rx state command */
 int avb_process_acmp_get_rx_state_command(avb_state_s *state,
                                           acmp_message_s *msg, bool rx) {
   uint16_t listener_uid = octets_to_uint(msg->listener_uid, 2);

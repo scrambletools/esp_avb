@@ -33,10 +33,6 @@ static void avb_audio_test_run(avb_state_s *state);
 extern const char logo_png_start[] asm("_binary_logo_png_start");
 extern const char logo_png_end[] asm("_binary_logo_png_end");
 
-/****************************************************************************
- * Private Functions
- ****************************************************************************/
-
 /* Return the local STREAM_INPUT index used for the CRF media-clock input.
  * Talker-only endpoints expose only the CRF input at index 0. Endpoints with
  * audio listener support keep audio at index 0 and CRF at index 1. */
@@ -197,11 +193,8 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // Copy config to state
   memcpy(&state->config, config, sizeof(avb_config_s));
 
-  /* Seed port[0] from the legacy single-port config so the per-port
-   * array reflects historical { ethernet, gptp_wired } behavior.
-   * Per-port runtime state (internal_mac_addr, l2if[],
-   * last_transmitted_* timers) lives in state->port[0] and is
-   * populated by avb_net_init and the periodic-send paths. */
+  /* Seed port[0] from the config; per-port runtime state lives in
+   * state->port[0] and is populated by avb_net_init. */
   state->port[0].enabled = true;
 #if defined(CONFIG_ESP_AVB_PORT0_MEDIUM_WIFI_FTM)
   state->port[0].medium = avb_port_medium_wifi_ftm;
@@ -320,11 +313,8 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   state->port[1].neighbor_gptp_capable = false;
 #endif /* CONFIG_ESP_AVB_NUM_PORTS > 1 */
 
-  /* Initialize the per-port MRP timer state (JoinTimer disarmed,
-   * LeaveAllTimer and PeriodicTimer armed). The SM-driven path
-   * coexists with the legacy avb_send_msrp_* / avb_process_msrp_*
-   * direct-call path until the cutover lands. Zero behavior change
-   * until something calls mrp_declare_* or mrp_rx_msrp(). */
+  /* Initialize per-port MRP timer state (JoinTimer disarmed,
+   * LeaveAllTimer and PeriodicTimer armed). */
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
     mrp_port_init(state, p);
   }
@@ -464,13 +454,12 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
 
   // Set default MSRP mappings (class A and class B).
   //
-  // IEEE 802.1Q-2018 §35.2.2.8.2.3 Table 35-7 recommends one VLAN per
-  // SR class (Class A = VLAN 2, Class B = VLAN 3). MOTU's AVB switch
-  // enforces this strictly: declaring Class B on the Class A VLAN
-  // causes MOTU to rewrite priority back to Class A on forwarding,
-  // even when the talker also declares a Class B Domain attribute on
-  // that VLAN. The VIDs are configurable so projects on networks that
-  // allow class-mixing can collapse them to a single VID.
+  // IEEE 802.1Q-2018 §35.2.2.8.2.3 Table 35-7 places both SR Class A
+  // and Class B on VLAN 2 by default — class is distinguished by PCP
+  // (3 for A, 2 for B), not by VID. Observed AVB networks (MOTU AVB
+  // switch and the Mac mini controller) advertise both classes on
+  // VLAN 2 accordingly. VIDs remain configurable so projects that
+  // segment classes by VLAN can override either independently.
   state->msrp_mappings_count = 2;
   state->msrp_mappings[0].traffic_class = 1;
   state->msrp_mappings[0].priority = CONFIG_ESP_AVB_VLAN_PRIO_CLASS_A;
@@ -814,11 +803,8 @@ static int avb_periodic_send(avb_state_s *state) {
                  ETH_ADDR_LEN) == 0)
         continue;
       uint16_t mfs = avb_compute_tspec_max_frame_size(state, i);
-      /* MSRP talker — SM-driven. The SM resolves JoinIn vs JoinMt
-       * from its own Registrar state at TX time; we just keep the
-       * declaration alive at a steady cadence. CONN vs IDLE interval
-       * comes from the legacy code; functionally only IDLE matters
-       * now (the SM's Registrar tracks listener presence). */
+      /* MSRP talker — SM-driven; the SM resolves JoinIn vs JoinMt
+       * at TX time. Keep the declaration alive at a steady cadence. */
       int interval = (octets_to_uint(state->output_streams[i].connection_count,
                                      2) > 0)
                          ? MSRP_TALKER_CONN_INTERVAL_MSEC
@@ -854,11 +840,8 @@ static int avb_periodic_send(avb_state_s *state) {
     }
   }
 
-  /* MSRP / MVRP LeaveAll are both driven by the SM's per-port
-   * LeaveAllTimer (10–15 s on wired, 30–60 s on Wi-Fi per §10.7.11
-   * + the Phase 2 Wi-Fi cut). The Applicants automatically re-declare
-   * on rLA, so the legacy "send LeaveAll then explicitly re-decl
-   * everything" block is gone. */
+  /* MSRP / MVRP LeaveAll driven by per-port LeaveAllTimer (10–15 s
+   * wired, 30–60 s Wi-Fi per §10.7.11); Applicants re-declare on rLA. */
 
   // Send Unsolicited notifications
   if (state->unsol_notif_enabled) {
@@ -902,12 +885,10 @@ static int avb_periodic_send(avb_state_s *state) {
   avb_process_inflight_timeouts(state);
 
   /* Attempt fast-connect for any listener stream with a saved binding
-   * that hasn't reconnected yet. Self-throttled per-stream.
-   *
-   * Disabled in CONFIG_ESP_AVB_DISABLE_FAST_CONNECT builds for Phase 3
-   * class-selection testing — fast-connect re-binds with default (Class A)
-   * flags within milliseconds of any disconnect, which prevents observing
-   * a clean controller-driven Class B connection. */
+   * that hasn't reconnected yet (self-throttled per-stream). Disabled
+   * under CONFIG_ESP_AVB_DISABLE_FAST_CONNECT for class-selection
+   * testing — the auto-rebind otherwise masks controller-driven
+   * Class B connections within milliseconds. */
 #ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
   if (state->config.listener) {
     avb_periodic_fast_connect(state);
@@ -973,9 +954,7 @@ static int avb_process_rx_message(avb_state_s *state, int protocol_idx,
     break;
   }
   case MVRP: {
-    /* Single MVRP RX entry point. Drives the per-VLAN MRP SMs
-     * directly — no legacy reaction layer (MVRP was cut straight
-     * onto the MRP core in Phase 4). */
+    /* Single MVRP RX entry point — drives per-VLAN MRP SMs directly. */
     mvrp_vlan_id_message_s *msg =
         (mvrp_vlan_id_message_s *)&state->rxbuf[protocol_idx].mvrp;
     mrp_rx_mvrp(state, state->rxport[protocol_idx], msg, (size_t)length,
@@ -1183,10 +1162,6 @@ err:
   }
   vTaskDelete(NULL);
 }
-
-/****************************************************************************
- * Public Functions
- ****************************************************************************/
 
 /* Start the AVB task */
 int avb_start(avb_config_s *config) {
@@ -1500,9 +1475,7 @@ static void avb_audio_test_run(avb_state_s *state) {
 }
 #endif /* AVB_AUDIO_TEST_BOOT_RATE_HZ > 0 */
 
-/****************************************************************************
- * NVS Persistent Storage
- ****************************************************************************/
+/* NVS persistent storage */
 
 #define AVB_NVS_NAMESPACE "avb"
 #define AVB_NVS_KEY "persist"
