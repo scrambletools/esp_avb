@@ -14,6 +14,7 @@
  */
 
 #include "avb.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "soc/soc_caps.h"
 #if SOC_EMAC_SUPPORTED
@@ -181,6 +182,14 @@ static void avb_cpu_stats_tick(void) {
                        &rx_other);
   avbinfo("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
           rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other);
+  /* Heap watcher — surfaces exhaustion vs. fragmentation. The wifi
+   * RX path mallocs per-frame at ~1500 B; when the largest contiguous
+   * block falls below that, RX stops cold. */
+  size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+  size_t heap_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+  size_t heap_min_ever = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+  avbinfo("  ====> HEAP free=%u largest=%u min_ever=%u",
+          (unsigned)heap_free, (unsigned)heap_largest, (unsigned)heap_min_ever);
 
   /* EMAC DMA hardware missed-frame counter. missed_fc counts frames the
    * DMA discarded because the Host Receive Buffer was unavailable (the

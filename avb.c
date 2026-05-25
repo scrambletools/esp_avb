@@ -452,6 +452,28 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   uint16_t port_number = state->config.port_id;
   int_to_octets(&port_number, state->avb_interface.port_number, 2);
 
+  /* Seed AVB_INTERFACE with spec-valid clock fields before the first
+   * ptpd_status() snapshot lands (up to PTP_STATUS_UPDATE_INTERVAL_MSEC
+   * after init). EUI-64 from port MAC per IEEE 802.1AS §8.5.2.2;
+   * priority1/priority2/clockClass/accuracy/variance per IEEE 1588-2008
+   * Table 5 for an unsynchronized non-BTC slave clock. */
+  const uint8_t *mac = state->port[0].internal_mac_addr;
+  state->avb_interface.clock_identity[0] = mac[0];
+  state->avb_interface.clock_identity[1] = mac[1];
+  state->avb_interface.clock_identity[2] = mac[2];
+  state->avb_interface.clock_identity[3] = 0xff;
+  state->avb_interface.clock_identity[4] = 0xfe;
+  state->avb_interface.clock_identity[5] = mac[3];
+  state->avb_interface.clock_identity[6] = mac[4];
+  state->avb_interface.clock_identity[7] = mac[5];
+  state->avb_interface.priority1 = 255;
+  state->avb_interface.clock_class = 248;
+  state->avb_interface.clock_accuracy = 0xFE;
+  uint16_t default_variance = 0xFFFF;
+  int_to_octets(&default_variance,
+                state->avb_interface.offset_scaled_log_variance, 2);
+  state->avb_interface.priority2 = 255;
+
   // Set default MSRP mappings (class A and class B).
   //
   // IEEE 802.1Q-2018 §35.2.2.8.2.3 Table 35-7 places both SR Class A
@@ -674,13 +696,10 @@ static int avb_destroy_state(avb_state_s *state) {
   return OK;
 }
 
-/* Get latest PTP status. Same gating as the avb_initialize_state
- * call site: skip on wifi-medium ports — ptpd isn't started there;
- * the wifi endpoint syncs via beacon-IE FollowUpInformation. */
+/* Refresh the AVB_INTERFACE / clock_source descriptor sources from
+ * the daemon's latest BMCA / selected_source view. Runs on every port
+ * medium — esp_ptp populates valid clock state regardless. */
 static void avb_update_ptp_status(avb_state_s *state) {
-  if (state->port[0].medium != avb_port_medium_eth_hwts) {
-    return;
-  }
   struct ptpd_status_s ptp_status;
   if (ptpd_status(0, &ptp_status) == 0) {
     memcpy(&state->ptp_status, &ptp_status, sizeof(struct ptpd_status_s));

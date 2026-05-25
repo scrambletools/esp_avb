@@ -29,13 +29,20 @@
 
 #define TAG "AVB-NET"
 
-/* Control frame queue depth — ample for MSRP/MVRP/ATDECC rates */
+/* Control frame queue depth — ample for MSRP/MVRP/ATDECC rates.
+ * Deliberately small: under a controller's enumeration burst, the
+ * Wi-Fi medium can't drain responses faster than ~50 fps, so a deeper
+ * queue just delays the tail. With xQueueSend(..., 0) the surplus
+ * gets dropped here; the controller's retry is faster than waiting
+ * for a backlog to drain. */
 #define CTRL_RX_QUEUE_DEPTH 16
 
 /* File-static state for unified EMAC RX dispatcher */
 static QueueHandle_t s_ctrl_rx_queue = NULL;
 static avb_stream_rx_handler_t s_stream_handler = NULL;
 static void *s_stream_ctx = NULL;
+static avb_ptp_rx_handler_t s_ptp_handler = NULL;
+static void *s_ptp_ctx = NULL;
 static esp_netif_t *s_eth_netif = NULL;
 #if CONFIG_ESP_AVB_NUM_PORTS > 1
 static esp_netif_t *s_wifi_netif = NULL;
@@ -229,7 +236,8 @@ void avb_net_rx_breakdown(uint32_t *total, uint32_t *avtp, uint32_t *msrp,
  *   0x22f0 (AVTP) → ctrl_rx_queue (protocol_idx = AVTP)
  *   0x22ea (MSRP) → ctrl_rx_queue (protocol_idx = MSRP)
  *   0x88f5 (MVRP) → ctrl_rx_queue (protocol_idx = MVRP)
- *   default        → esp_netif_receive (IP stack for PTP, ARP, etc.)
+ *   0x88f7 (PTP)  → L2TAP filter on EMAC ingress; ptp_handler on Wi-Fi
+ *   default        → L2TAP filter then esp_netif_receive (ARP, IP, etc.)
  */
 static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
                                    uint32_t len, void *priv, void *info) {
@@ -398,29 +406,51 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
     free(buf);
     return ESP_OK;
   }
-  default: {
-    /* PTP, ARP, IP, etc. — pass through L2TAP filter then to IP stack.
-     * esp_vfs_l2tap_eth_filter_frame frees buf when it matches a filter
-     * (eb_handle=NULL path calls free(buf) internally), so we must NOT
-     * free buf ourselves when frame_len==0.
-     *
-     * L2TAP only applies on Ethernet ingress — wifi-port-0 RX (Phase
-     * 6b.2) passes eth_handle=NULL and we skip straight to
-     * esp_netif_receive.
-     *
-     * The Wi-Fi RX path (eth_handle=NULL) is hooked at link time via
-     * the esp_wifi_remote_channel_rx strong override, so frames can
-     * arrive *before* avb_start() runs and populates s_eth_netif /
-     * s_bridge_state. Drop those — there's nothing to dispatch them
-     * to yet. */
-    if (s_eth_netif == NULL) {
+  case 0x88f7: { /* IEEE 1588 / IEEE 802.1AS.
+                    Wi-Fi ingress: deliver to registered handler (Wi-Fi
+                    STA endpoint has no L2TAP socket). EMAC ingress:
+                    fan out through L2TAP so the gPTP daemon's
+                    L2TAP socket wakes up on poll(). */
+    if (eth_handle == NULL) {
+      if (s_ptp_handler && len >= ETH_HEADER_LEN) {
+        uint8_t src_mac[6];
+        memcpy(src_mac, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
+        s_ptp_handler(buf + ETH_HEADER_LEN,
+                      (uint16_t)(len - ETH_HEADER_LEN), src_mac, s_ptp_ctx);
+      }
       free(buf);
       return ESP_OK;
     }
     size_t frame_len = len;
-    if (eth_handle != NULL) {
-      esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, info);
+    esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, info);
+    if (frame_len > 0) {
+      /* No L2TAP fd matched (gPTP daemon not yet up, or socket closed) —
+       * free the unconsumed buffer ourselves. */
+      free(buf);
     }
+    return ESP_OK;
+  }
+  default: {
+    /* ARP, IP, etc.
+     *
+     * On EMAC ingress (eth_handle != NULL) we pass through the L2TAP
+     * filter and then to esp_netif_receive — the host needs the IP
+     * stack for management traffic. esp_vfs_l2tap_eth_filter_frame
+     * frees buf when it matches a filter (eb_handle=NULL path frees
+     * internally), so we must NOT free buf ourselves when
+     * frame_len==0.
+     *
+     * On Wi-Fi ingress (eth_handle == NULL) the AVB-only endpoint
+     * has no IP sockets — every broadcast the AP forwards (UDP
+     * discovery, ARP, STP, mDNS, etc.) would otherwise queue in
+     * lwIP's pbuf chain indefinitely and slowly drain the default
+     * heap. Drop them. */
+    if (eth_handle == NULL || s_eth_netif == NULL) {
+      free(buf);
+      return ESP_OK;
+    }
+    size_t frame_len = len;
+    esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, info);
     if (frame_len > 0) {
       return esp_netif_receive(s_eth_netif, buf, frame_len, NULL);
     }
@@ -989,6 +1019,11 @@ void avb_net_set_stream_rx_handler(avb_stream_rx_handler_t handler, void *ctx) {
   /* Write handler last with memory barrier semantics —
    * the callback checks s_stream_handler != NULL as gate */
   s_stream_handler = handler;
+}
+
+void avb_net_set_ptp_rx_handler(avb_ptp_rx_handler_t handler, void *ctx) {
+  s_ptp_ctx = ctx;
+  s_ptp_handler = handler;
 }
 
 uint32_t avb_net_stream_rx_drops(void) { return s_stream_rx_drops; }
