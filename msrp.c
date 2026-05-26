@@ -213,11 +213,11 @@ int avb_send_msrp_talker(avb_state_s *state, mrp_attr_event_t attr_event,
   if (!is_failed) {
     msg.header.attr_type = msrp_attr_type_talker_advertise;
     msg.header.attr_len = 25;
-    attr_list_len = 29; // includes vechead, attr_event and vec end mark
+    attr_list_len = 30; // includes vechead, first value, attr_event and vec end mark
   } else {
     msg.header.attr_type = msrp_attr_type_talker_failed;
     msg.header.attr_len = 34;
-    attr_list_len = 38; // includes vechead, attr_event and vec end mark
+    attr_list_len = 39; // includes vechead, first value, attr_event and vec end mark
   }
   int_to_octets(&attr_list_len, msg.header.attr_list_len, 2);
   msg.header.vechead_leaveall = leave_all;
@@ -495,7 +495,7 @@ int avb_process_msrp_talker(avb_state_s *state, msrp_msgbuf_s *msg_data,
       memset(&failed, 0, sizeof(failed));
       failed.header.attr_type = msrp_attr_type_talker_failed;
       failed.header.attr_len = 34;
-      int attr_list_len = 38;
+      int attr_list_len = 39;
       int_to_octets(&attr_list_len, failed.header.attr_list_len, 2);
       failed.header.vechead_num_vals = 1;
       memcpy(&failed.talker_failed.info, &msg.talker.info,
