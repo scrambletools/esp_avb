@@ -53,6 +53,13 @@ static esp_netif_t *s_wifi_netif = NULL;
  * still links. Diagnoses wired<->Wi-Fi multicast forwarding asymmetry. */
 static volatile uint32_t s_fwd_eth_ok, s_fwd_eth_fail;
 static volatile uint32_t s_fwd_wifi_ok, s_fwd_wifi_fail, s_fwd_wifi_oom;
+/* Sub-counts of s_fwd_wifi_ok split by destination address type. Used by the
+ * bridge heartbeat to surface the very specific question "is the AP actually
+ * able to send unicast frames to associated STAs?" — multicast/broadcast and
+ * unicast take different paths inside the IDF wifi driver, and the two paths
+ * can be in very different states for the first minute or so after a cold
+ * boot. Hot path adds 1 branch + 1 store. */
+static volatile uint32_t s_fwd_wifi_ok_ucast, s_fwd_wifi_ok_mcast;
 
 void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
                               uint32_t *wifi_ok, uint32_t *wifi_fail,
@@ -62,6 +69,12 @@ void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
   if (wifi_ok)   *wifi_ok   = s_fwd_wifi_ok;
   if (wifi_fail) *wifi_fail = s_fwd_wifi_fail;
   if (wifi_oom)  *wifi_oom  = s_fwd_wifi_oom;
+}
+
+void avb_bridge_forward_stats_wifi_split(uint32_t *wifi_ok_ucast,
+                                         uint32_t *wifi_ok_mcast) {
+  if (wifi_ok_ucast) *wifi_ok_ucast = s_fwd_wifi_ok_ucast;
+  if (wifi_ok_mcast) *wifi_ok_mcast = s_fwd_wifi_ok_mcast;
 }
 
 /* Ingress-port lookup by medium. Populated once at avb_net_init from
@@ -194,7 +207,13 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
      * redundant local malloc+memcpy+free that used to sit here — a
      * measurable CPU win on the EMAC RX task at 8000 fps. */
     esp_err_t r = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, (void *)frame, len);
-    if (r == ESP_OK) s_fwd_wifi_ok++; else s_fwd_wifi_fail++;
+    if (r == ESP_OK) {
+      s_fwd_wifi_ok++;
+      if (frame[0] & 0x01) s_fwd_wifi_ok_mcast++;
+      else                 s_fwd_wifi_ok_ucast++;
+    } else {
+      s_fwd_wifi_fail++;
+    }
     return;
   }
 }

@@ -863,6 +863,13 @@ void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
                               uint32_t *wifi_ok, uint32_t *wifi_fail,
                               uint32_t *wifi_oom);
 
+/* Wi-Fi-side OK forwards split by destination MAC type (multicast bit).
+ * Used by the bridge heartbeat to surface whether the AP path can deliver
+ * unicast frames to associated STAs vs only multicast — IDF's wifi driver
+ * uses different TX paths for the two cases. */
+void avb_bridge_forward_stats_wifi_split(uint32_t *wifi_ok_ucast,
+                                         uint32_t *wifi_ok_mcast);
+
 /* AVB send functions */
 
 /* MVRP and MSRP send functions live in mrp.h. */

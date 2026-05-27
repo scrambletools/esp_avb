@@ -1,0 +1,8 @@
+build/
+build.clang/
+*.lock
+sdkconfig
+.DS_Store
+*.old
+sdkconfig.old
+compile_commands.json

@@ -277,9 +277,10 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
    * IEEE 1722.1 §7.2.2. Nested descriptors are reached through the
    * parent's base+count fields and are NOT listed here:
    *   STRINGS                     via LOCALE.base_strings / number_of_strings
-   *   STREAM_PORT_INPUT/OUTPUT    via AUDIO_UNIT.base_*_port / number_of_*_ports
-   *   AUDIO_CLUSTER / AUDIO_MAP   via STREAM_PORT.base_cluster / base_map
-   *   per-port CONTROLs           via STREAM_PORT.base_control / number_of_controls
+   *   STREAM_PORT_INPUT/OUTPUT    via AUDIO_UNIT.base_*_port /
+   * number_of_*_ports AUDIO_CLUSTER / AUDIO_MAP   via STREAM_PORT.base_cluster
+   * / base_map per-port CONTROLs           via STREAM_PORT.base_control /
+   * number_of_controls
    */
   uint16_t descriptors[AEM_MAX_NUM_DESC];
   int i = 0;
@@ -1540,8 +1541,12 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
 
 /* ---- AVB Community Vendor Unique (CVU) command handlers ---- */
 
+/* Send a CVU SRP attribute. CVU SRP attributes are transported as AECP vendor
+ * unique commands but semantically originate from the talker/listener endpoint
+ * itself, just like native MSRP. The response reflects the command payload with
+ * AECP status set. */
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
-                           const char *label) {
+                          const char *label) {
   msrp_attr_header_s *header = (msrp_attr_header_s *)attr;
   size_t attr_size = 4 + attr_list_len; /* attr hdr w/o vechead + attr list */
   aecp_message_u msg;
@@ -1577,10 +1582,6 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
   return ret;
 }
 
-/* Send a CVU response. CVU SRP commands are transported as AECP vendor unique
- * commands but semantically originate from the talker/listener endpoint itself,
- * just like native MSRP. The response reflects the command payload with AECP
- * status set. */
 static int avb_send_cvu_response(avb_state_s *state, void *msg,
                                  eth_addr_t *src_addr, uint16_t msg_len,
                                  uint8_t status) {
@@ -1607,7 +1608,7 @@ static uint16_t avb_aecp_msg_len(aecp_message_u *msg) {
  * synthesize a one-attribute MSRP buffer and route through the existing MSRP
  * handlers so talker/listener state logic stays in exactly one place. */
 int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
-                                  eth_addr_t *src_addr) {
+                                 eth_addr_t *src_addr) {
   size_t msg_len = avb_aecp_msg_len(msg);
   if (msg_len < sizeof(aecp_cvu_common_s) + sizeof(msrp_attr_header_s)) {
     return avb_send_cvu_response(state, msg, src_addr, msg_len,
@@ -2179,8 +2180,8 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
       size_t num_supported = is_output ? state->num_supported_formats_out
                                        : state->num_supported_formats_in;
       for (size_t i = 0; i < num_supported; i++) {
-        if (memcmp(requested, &supported[i],
-                   sizeof(avtp_stream_format_s)) == 0) {
+        if (memcmp(requested, &supported[i], sizeof(avtp_stream_format_s)) ==
+            0) {
           format_supported = true;
           break;
         }
@@ -2452,11 +2453,11 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   //      zero and looks like "no BTC" to controllers like Hive.
   //      Applies in both gPTP and standard PTP profiles.
   if (state->ptp_status.clock_source_valid) {
-    memcpy(&response.gptp_btc_id,
-           state->ptp_status.clock_source_info.btc_id, UNIQUE_ID_LEN);
+    memcpy(&response.gptp_btc_id, state->ptp_status.clock_source_info.btc_id,
+           UNIQUE_ID_LEN);
   } else {
-    memcpy(&response.gptp_btc_id,
-           state->ptp_status.own_identity_info.id, UNIQUE_ID_LEN);
+    memcpy(&response.gptp_btc_id, state->ptp_status.own_identity_info.id,
+           UNIQUE_ID_LEN);
   }
 
   // populate propagation delay from PTP peer delay measurement
@@ -2530,7 +2531,8 @@ int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
     // If the selected source is not the BTC (i.e. an intermediate
     // boundary clock like the AVB switch), add it to the path
     if (memcmp(state->ptp_status.clock_source_info.id,
-               state->ptp_status.clock_source_info.btc_id, UNIQUE_ID_LEN) != 0) {
+               state->ptp_status.clock_source_info.btc_id,
+               UNIQUE_ID_LEN) != 0) {
       memcpy(&response.path_sequence[count],
              state->ptp_status.clock_source_info.id, UNIQUE_ID_LEN);
       count++;
@@ -3323,16 +3325,16 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     bool req_class_b = (cmd_flags & 0x8000) != 0;
     uint16_t conn_count = octets_to_uint(stream->connection_count, 2);
     int acmp_locked = 0;
-    for (int i = 0;
-         i < conn_count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
-      if (stream->connected_listeners[i].acmp_connected) acmp_locked++;
+    for (int i = 0; i < conn_count && i < AVB_MAX_NUM_CONNECTED_LISTENERS;
+         i++) {
+      if (stream->connected_listeners[i].acmp_connected)
+        acmp_locked++;
     }
     if (acmp_locked > 0 &&
         (bool)stream->stream_info_flags.class_b != req_class_b) {
       avbwarn("ACMP: stream %d class-mismatch CONNECT_TX rejected "
               "(active class %s, requested %s, acmp_listeners=%d/%u)",
-              talker_uid,
-              stream->stream_info_flags.class_b ? "B" : "A",
+              talker_uid, stream->stream_info_flags.class_b ? "B" : "A",
               req_class_b ? "B" : "A", acmp_locked, (unsigned)conn_count);
       avb_send_acmp_response(state, tx_response_type, msg,
                              acmp_status_talker_exclusive);
@@ -3358,20 +3360,20 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
      * switches enforce one-class-per-VLAN), so the per-stream vlan_id
      * has to follow the class flip. */
     if (stream->stream_info_flags.class_b != req_class_b) {
-      avbinfo("ACMP: stream %d class set to %s by first connection",
-              talker_uid, req_class_b ? "B" : "A");
+      avbinfo("ACMP: stream %d class set to %s by first connection", talker_uid,
+              req_class_b ? "B" : "A");
       stream->stream_info_flags.class_b = req_class_b ? 1 : 0;
       uint16_t mapping_index = req_class_b ? 1 : 0;
       if (mapping_index < state->msrp_mappings_count) {
-        memcpy(stream->vlan_id,
-               state->msrp_mappings[mapping_index].vlan_id, 2);
+        memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
       }
     }
 
-    avbinfo("ACMP: listener connected to stream %d (count=%d, msrp=%d, class=%c)",
-            talker_uid, octets_to_uint(stream->connection_count, 2),
-            stream->connected_listeners[listener_idx].msrp_ready,
-            stream->stream_info_flags.class_b ? 'B' : 'A');
+    avbinfo(
+        "ACMP: listener connected to stream %d (count=%d, msrp=%d, class=%c)",
+        talker_uid, octets_to_uint(stream->connection_count, 2),
+        stream->connected_listeners[listener_idx].msrp_ready,
+        stream->stream_info_flags.class_b ? 'B' : 'A');
 
     /* If MSRP Ready arrived before ACMP CONNECT_TX, start now that both halves
      * of the connection state are present. */
@@ -3391,8 +3393,10 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
   memcpy(msg->connection_count,
          state->output_streams[talker_uid].connection_count, 2);
   uint16_t rsp_flags = octets_to_uint(msg->flags, 2);
-  if (stream->stream_info_flags.class_b) rsp_flags |= 0x8000u;
-  else                                   rsp_flags &= ~0x8000u;
+  if (stream->stream_info_flags.class_b)
+    rsp_flags |= 0x8000u;
+  else
+    rsp_flags &= ~0x8000u;
   int_to_octets(&rsp_flags, msg->flags, 2);
   avb_send_acmp_response(state, tx_response_type, msg, acmp_status_success);
   return ret;

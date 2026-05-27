@@ -67,7 +67,7 @@ void mrp_applicant_step(mrp_sm_state_t *sm, mrp_event_e ev) {
   mrp_tx_action_e tx = sm->pending_tx;
 
   switch (ev) {
-  /* ----- Local-origin events (from application via mrp_declare_*) ----- */
+    /* ----- Local-origin events (from application via mrp_declare_*) ----- */
 
   case mrp_event_new: /* New! — local declares fresh registration */
     /* From any state → VN (very anxious to send New). */
@@ -76,30 +76,58 @@ void mrp_applicant_step(mrp_sm_state_t *sm, mrp_event_e ev) {
 
   case mrp_event_join: /* Join! — local declares (already-known) attr */
     switch (s) {
-    case mrp_applicant_vo: next = mrp_applicant_vp; break;
-    case mrp_applicant_la: next = mrp_applicant_vp; break; /* cancel leave */
-    case mrp_applicant_lo: next = mrp_applicant_vp; break;
-    case mrp_applicant_ao: next = mrp_applicant_ap; break;
-    case mrp_applicant_qo: next = mrp_applicant_qp; break;
-    default: break; /* VP, VN, AN, AA, QA, AP, QP unchanged */
+    case mrp_applicant_vo:
+      next = mrp_applicant_vp;
+      break;
+    case mrp_applicant_la:
+      next = mrp_applicant_vp;
+      break; /* cancel leave */
+    case mrp_applicant_lo:
+      next = mrp_applicant_vp;
+      break;
+    case mrp_applicant_ao:
+      next = mrp_applicant_ap;
+      break;
+    case mrp_applicant_qo:
+      next = mrp_applicant_qp;
+      break;
+    default:
+      break; /* VP, VN, AN, AA, QA, AP, QP unchanged */
     }
     break;
 
   case mrp_event_lv: /* Lv! — local withdraws registration */
     switch (s) {
-    case mrp_applicant_vo: next = mrp_applicant_lo; break;
-    case mrp_applicant_vp: next = mrp_applicant_vo; break;
-    case mrp_applicant_vn: next = mrp_applicant_lo; break;
-    case mrp_applicant_an: next = mrp_applicant_lo; break;
-    case mrp_applicant_aa: next = mrp_applicant_la; break;
-    case mrp_applicant_qa: next = mrp_applicant_la; break;
-    case mrp_applicant_ap: next = mrp_applicant_ao; break;
-    case mrp_applicant_qp: next = mrp_applicant_qo; break;
-    default: break; /* LA, LO, AO, QO unchanged */
+    case mrp_applicant_vo:
+      next = mrp_applicant_lo;
+      break;
+    case mrp_applicant_vp:
+      next = mrp_applicant_vo;
+      break;
+    case mrp_applicant_vn:
+      next = mrp_applicant_lo;
+      break;
+    case mrp_applicant_an:
+      next = mrp_applicant_lo;
+      break;
+    case mrp_applicant_aa:
+      next = mrp_applicant_la;
+      break;
+    case mrp_applicant_qa:
+      next = mrp_applicant_la;
+      break;
+    case mrp_applicant_ap:
+      next = mrp_applicant_ao;
+      break;
+    case mrp_applicant_qp:
+      next = mrp_applicant_qo;
+      break;
+    default:
+      break; /* LA, LO, AO, QO unchanged */
     }
     break;
 
-  /* ----- Peer-receive events (decoded from inbound 3pe vectors) ----- */
+    /* ----- Peer-receive events (decoded from inbound 3pe vectors) ----- */
 
   case mrp_event_r_new:
     /* rNew is consumed by the Registrar; Applicant is unaffected
@@ -109,12 +137,23 @@ void mrp_applicant_step(mrp_sm_state_t *sm, mrp_event_e ev) {
 
   case mrp_event_r_join_in: /* peer is registered with us */
     switch (s) {
-    case mrp_applicant_vo: next = mrp_applicant_ao; break;
-    case mrp_applicant_vp: next = mrp_applicant_ap; break;
-    case mrp_applicant_aa: next = mrp_applicant_qa; break;
-    case mrp_applicant_ao: next = mrp_applicant_qo; break;
-    case mrp_applicant_ap: next = mrp_applicant_qp; break;
-    default: break; /* VN/AN/QA/LA/QO/QP/LO unchanged */
+    case mrp_applicant_vo:
+      next = mrp_applicant_ao;
+      break;
+    case mrp_applicant_vp:
+      next = mrp_applicant_ap;
+      break;
+    case mrp_applicant_aa:
+      next = mrp_applicant_qa;
+      break;
+    case mrp_applicant_ao:
+      next = mrp_applicant_qo;
+      break;
+    case mrp_applicant_ap:
+      next = mrp_applicant_qp;
+      break;
+    default:
+      break; /* VN/AN/QA/LA/QO/QP/LO unchanged */
     }
     break;
 
@@ -141,22 +180,41 @@ void mrp_applicant_step(mrp_sm_state_t *sm, mrp_event_e ev) {
   case mrp_event_r_lv:
   case mrp_event_r_la: /* peer is leaving / asked everyone to re-declare */
     switch (s) {
-    case mrp_applicant_vo: next = mrp_applicant_lo; break;
-    case mrp_applicant_an: next = mrp_applicant_vn; break;
-    case mrp_applicant_aa: next = mrp_applicant_vp; break;
-    case mrp_applicant_qa: next = mrp_applicant_vp; break;
-    case mrp_applicant_ao: next = mrp_applicant_lo; break;
-    case mrp_applicant_qo: next = mrp_applicant_lo; break;
-    case mrp_applicant_ap: next = mrp_applicant_vp; break;
-    case mrp_applicant_qp: next = mrp_applicant_vp; break;
-    case mrp_applicant_lo: next = mrp_applicant_vo; break;
-    default: break; /* VP, VN, LA unchanged */
+    case mrp_applicant_vo:
+      next = mrp_applicant_lo;
+      break;
+    case mrp_applicant_an:
+      next = mrp_applicant_vn;
+      break;
+    case mrp_applicant_aa:
+      next = mrp_applicant_vp;
+      break;
+    case mrp_applicant_qa:
+      next = mrp_applicant_vp;
+      break;
+    case mrp_applicant_ao:
+      next = mrp_applicant_lo;
+      break;
+    case mrp_applicant_qo:
+      next = mrp_applicant_lo;
+      break;
+    case mrp_applicant_ap:
+      next = mrp_applicant_vp;
+      break;
+    case mrp_applicant_qp:
+      next = mrp_applicant_vp;
+      break;
+    case mrp_applicant_lo:
+      next = mrp_applicant_vo;
+      break;
+    default:
+      break; /* VP, VN, LA unchanged */
     }
     break;
 
-  /* ----- Timer-driven events ----- */
+    /* ----- Timer-driven events ----- */
 
-  case mrp_event_tx: /* JoinTimer fired — encode + transmit pending event */
+  case mrp_event_tx:    /* JoinTimer fired — encode + transmit pending event */
   case mrp_event_tx_la: /* tx! coincident with LeaveAll TX (same effect for
                          * the Applicant; LeaveAll is handled at envelope
                          * level) */
@@ -196,15 +254,19 @@ void mrp_applicant_step(mrp_sm_state_t *sm, mrp_event_e ev) {
       }
       break;
     /* Observer states: [sJ] is optional, treat as no-op on shared media. */
-    default: break;
+    default:
+      break;
     }
     break;
 
   case mrp_event_periodic: /* PeriodicTransmission timer fired */
     /* Per §10.7.9 — Quiet states re-arm to Anxious to drive re-TX. */
-    if (s == mrp_applicant_qa) next = mrp_applicant_aa;
-    else if (s == mrp_applicant_qo) next = mrp_applicant_ao;
-    else if (s == mrp_applicant_qp) next = mrp_applicant_ap;
+    if (s == mrp_applicant_qa)
+      next = mrp_applicant_aa;
+    else if (s == mrp_applicant_qo)
+      next = mrp_applicant_ao;
+    else if (s == mrp_applicant_qp)
+      next = mrp_applicant_ap;
     break;
 
   case mrp_event_leave_timer:
@@ -285,13 +347,20 @@ void mrp_registrar_step(mrp_sm_state_t *sm, mrp_event_e ev) {
  * octet: V = e1*36 + e2*6 + e3, where each e is 0..5. */
 static mrp_event_e mrp_3pe_to_event(int pe_val) {
   switch (pe_val) {
-  case 0: return mrp_event_r_new;
-  case 1: return mrp_event_r_join_in;
-  case 2: return mrp_event_r_in;
-  case 3: return mrp_event_r_join_mt;
-  case 4: return mrp_event_r_mt;
-  case 5: return mrp_event_r_lv;
-  default: return mrp_event_r_mt; /* malformed; treat as no-op-ish */
+  case 0:
+    return mrp_event_r_new;
+  case 1:
+    return mrp_event_r_join_in;
+  case 2:
+    return mrp_event_r_in;
+  case 3:
+    return mrp_event_r_join_mt;
+  case 4:
+    return mrp_event_r_mt;
+  case 5:
+    return mrp_event_r_lv;
+  default:
+    return mrp_event_r_mt; /* malformed; treat as no-op-ish */
   }
 }
 
@@ -305,9 +374,9 @@ static void mrp_sm_step(mrp_sm_state_t *sm, mrp_event_e ev) {
  * mrp_port_tick() advances them and sets tx-pending / LeaveAll-pending
  * flags; §6 iterates the attribute tables on dispatch. */
 
-#define MRP_JOIN_TIMER_US      (200 * 1000)         /* §10.7.11 JoinTime */
-#define MRP_LEAVEALL_TIMER_US  (10 * 1000 * 1000)   /* §10.7.11 LeaveAllTime */
-#define MRP_PERIODIC_TIMER_US  (1 * 1000 * 1000)    /* §10.7.9  PeriodicTime */
+#define MRP_JOIN_TIMER_US (200 * 1000)           /* §10.7.11 JoinTime */
+#define MRP_LEAVEALL_TIMER_US (10 * 1000 * 1000) /* §10.7.11 LeaveAllTime */
+#define MRP_PERIODIC_TIMER_US (1 * 1000 * 1000)  /* §10.7.9  PeriodicTime */
 /* Wi-Fi efficiency cut #2: a LeaveAll burst transmits one MRPDU per
  * attribute on the port and triggers re-declarations on every peer.
  * On Wi-Fi this is expensive (airtime ∝ table size, no concurrency
@@ -315,8 +384,8 @@ static void mrp_sm_step(mrp_sm_state_t *sm, mrp_event_e ev) {
  * to 30 s, so the burst lands at 30–60 s instead of 10–15 s. Still
  * well within the spec's permissive upper bound (§10.7.11 allows
  * implementer-chosen LeaveAllTime ≥ 600 ms). */
-#define MRP_LEAVEALL_TIMER_WIFI_US     (30 * 1000 * 1000)
-#define MRP_LEAVEALL_JITTER_WIFI_US    (30 * 1000 * 1000)
+#define MRP_LEAVEALL_TIMER_WIFI_US (30 * 1000 * 1000)
+#define MRP_LEAVEALL_JITTER_WIFI_US (30 * 1000 * 1000)
 
 /* Forward decl — definition in §6c (after the attribute tables). */
 void mrp_tx_flush_port(avb_state_s *state, int port);
@@ -344,7 +413,8 @@ static int64_t mrp_join_next_expiry_us(void) {
 
 /* Initialize per-port MRP timer state. Called at port bring-up. */
 void mrp_port_init(avb_state_s *state, int port) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
   avb_port_s *p = &state->port[port];
   p->mrp_join_timer_us = 0; /* disarmed; armed when first sm->pending_tx set */
   p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
@@ -361,7 +431,8 @@ static void mrp_port_dispatch_periodic(int port);
 /* Called from avb_periodic / avb main loop on every tick. Fires
  * expired port-scoped timers. Returns true if anything fired. */
 bool mrp_port_tick(avb_state_s *state, int port) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return false;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return false;
   avb_port_s *p = &state->port[port];
   int64_t now = esp_timer_get_time();
   bool fired = false;
@@ -435,7 +506,8 @@ bool mrp_port_tick(avb_state_s *state, int port) {
 /* Arm the JoinTimer on `port` if not already armed. Called whenever
  * a per-attribute SM transitions to a state with pending TX. */
 void mrp_port_arm_join_timer(avb_state_s *state, int port) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
   avb_port_s *p = &state->port[port];
   if (p->mrp_join_timer_us == 0) {
     p->mrp_join_timer_us = mrp_join_next_expiry_us();
@@ -498,12 +570,12 @@ typedef struct {
   mrp_sm_state_t sm;
 } msrp_domain_entry_t;
 
-static msrp_talker_entry_t
-    s_msrp_talkers[CONFIG_ESP_AVB_NUM_PORTS][MSRP_TALKER_TABLE_SIZE];
-static msrp_listener_entry_t
-    s_msrp_listeners[CONFIG_ESP_AVB_NUM_PORTS][MSRP_LISTENER_TABLE_SIZE];
-static msrp_domain_entry_t
-    s_msrp_domains[CONFIG_ESP_AVB_NUM_PORTS][MSRP_DOMAIN_TABLE_SIZE];
+static msrp_talker_entry_t s_msrp_talkers[CONFIG_ESP_AVB_NUM_PORTS]
+                                         [MSRP_TALKER_TABLE_SIZE];
+static msrp_listener_entry_t s_msrp_listeners[CONFIG_ESP_AVB_NUM_PORTS]
+                                             [MSRP_LISTENER_TABLE_SIZE];
+static msrp_domain_entry_t s_msrp_domains[CONFIG_ESP_AVB_NUM_PORTS]
+                                         [MSRP_DOMAIN_TABLE_SIZE];
 
 static bool stream_id_eq(const unique_id_t *a, const unique_id_t *b) {
   return memcmp(a, b, sizeof(unique_id_t)) == 0;
@@ -515,7 +587,8 @@ static bool stream_id_eq(const unique_id_t *a, const unique_id_t *b) {
 static msrp_talker_entry_t *msrp_talker_find(int port,
                                              const unique_id_t *stream_id,
                                              msrp_attr_type_t attr_type) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
     if (e->valid && e->attr_type == attr_type &&
@@ -531,16 +604,17 @@ static msrp_talker_entry_t *
 msrp_talker_find_or_insert(int port, const unique_id_t *stream_id,
                            msrp_attr_type_t attr_type) {
   msrp_talker_entry_t *e = msrp_talker_find(port, stream_id, attr_type);
-  if (e != NULL) return e;
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (e != NULL)
+    return e;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
     msrp_talker_entry_t *slot = &s_msrp_talkers[port][i];
     if (!slot->valid) {
       memset(slot, 0, sizeof(*slot));
       slot->valid = true;
       slot->attr_type = attr_type;
-      memcpy(&slot->wire.talker.info.stream_id, stream_id,
-             sizeof(unique_id_t));
+      memcpy(&slot->wire.talker.info.stream_id, stream_id, sizeof(unique_id_t));
       slot->sm.applicant = mrp_applicant_vo;
       slot->sm.registrar = mrp_registrar_mt;
       slot->sm.pending_tx = mrp_tx_none;
@@ -575,7 +649,8 @@ bool mrp_talker_failed_active(int port, const unique_id_t *stream_id,
 
 static msrp_listener_entry_t *msrp_listener_find(int port,
                                                  const unique_id_t *stream_id) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
     if (e->valid &&
@@ -589,8 +664,10 @@ static msrp_listener_entry_t *msrp_listener_find(int port,
 static msrp_listener_entry_t *
 msrp_listener_find_or_insert(int port, const unique_id_t *stream_id) {
   msrp_listener_entry_t *e = msrp_listener_find(port, stream_id);
-  if (e != NULL) return e;
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (e != NULL)
+    return e;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
     msrp_listener_entry_t *slot = &s_msrp_listeners[port][i];
     if (!slot->valid) {
@@ -608,10 +685,12 @@ msrp_listener_find_or_insert(int port, const unique_id_t *stream_id) {
 
 static msrp_domain_entry_t *msrp_domain_find_or_insert(int port,
                                                        uint8_t sr_class_id) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
     msrp_domain_entry_t *e = &s_msrp_domains[port][i];
-    if (e->valid && e->wire.sr_class_id == sr_class_id) return e;
+    if (e->valid && e->wire.sr_class_id == sr_class_id)
+      return e;
   }
   for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
     msrp_domain_entry_t *slot = &s_msrp_domains[port][i];
@@ -646,17 +725,18 @@ static msrp_domain_entry_t *msrp_domain_find_or_insert(int port,
  * would stall downstream tear-down by up to 1 s. */
 typedef enum {
   mrp_reg_transition_none = 0,
-  mrp_reg_transition_register,    /* not-IN → IN */
-  mrp_reg_transition_deregister,  /* IN → not-IN */
+  mrp_reg_transition_register,   /* not-IN → IN */
+  mrp_reg_transition_deregister, /* IN → not-IN */
 } mrp_reg_transition_e;
 
 static inline mrp_reg_transition_e
-mrp_reg_transition(mrp_registrar_state_e before,
-                   mrp_registrar_state_e after) {
+mrp_reg_transition(mrp_registrar_state_e before, mrp_registrar_state_e after) {
   bool was_in = (before == mrp_registrar_in);
-  bool is_in  = (after  == mrp_registrar_in);
-  if (!was_in && is_in) return mrp_reg_transition_register;
-  if (was_in && !is_in) return mrp_reg_transition_deregister;
+  bool is_in = (after == mrp_registrar_in);
+  if (!was_in && is_in)
+    return mrp_reg_transition_register;
+  if (was_in && !is_in)
+    return mrp_reg_transition_deregister;
   return mrp_reg_transition_none;
 }
 
@@ -731,14 +811,13 @@ static int find_or_add_msrp_listener(avb_state_s *state,
   if (idx >= 0)
     return idx;
 
-  int listener_idx = avb_find_entity_by_addr(state, mac_addr,
-                                             avb_entity_type_listener);
+  int listener_idx =
+      avb_find_entity_by_addr(state, mac_addr, avb_entity_type_listener);
   if (listener_idx != NOT_FOUND) {
     idx = find_connected_listener_by_entity(
         stream, state->listeners[listener_idx].entity_id);
     if (idx >= 0) {
-      memcpy(stream->connected_listeners[idx].mac_addr, mac_addr,
-             ETH_ADDR_LEN);
+      memcpy(stream->connected_listeners[idx].mac_addr, mac_addr, ETH_ADDR_LEN);
       return idx;
     }
   }
@@ -778,11 +857,13 @@ static uint32_t avb_port_forwarding_latency_ns(const avb_port_s *p) {
  * always rebuilds the field from a port-local default; the bridge
  * propagation needs to override with the cumulative path latency
  * per §35.2.2.8.6. */
-static void mrp_patch_egress_accumulated_latency(
-    int port, const unique_id_t *stream_id, msrp_attr_type_t attr_type,
-    uint32_t total_ns) {
+static void mrp_patch_egress_accumulated_latency(int port,
+                                                 const unique_id_t *stream_id,
+                                                 msrp_attr_type_t attr_type,
+                                                 uint32_t total_ns) {
   msrp_talker_entry_t *eg = msrp_talker_find(port, stream_id, attr_type);
-  if (eg == NULL) return;
+  if (eg == NULL)
+    return;
   uint8_t *field = (attr_type == msrp_attr_type_talker_failed)
                        ? eg->wire.talker_failed.info.accumulated_latency
                        : eg->wire.talker.info.accumulated_latency;
@@ -809,10 +890,11 @@ static bool any_listener_acmp_connected(avb_talker_stream_s *stream) {
   return false;
 }
 
-static void mrp_on_talker_registrar_change(
-    avb_state_s *state, int port, msrp_attr_type_t attr_type,
-    const msrp_talker_message_u *wire, mrp_reg_transition_e tr,
-    eth_addr_t *src_addr) {
+static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
+                                           msrp_attr_type_t attr_type,
+                                           const msrp_talker_message_u *wire,
+                                           mrp_reg_transition_e tr,
+                                           eth_addr_t *src_addr) {
   (void)src_addr;
 
   const talker_adv_info_s *info = &wire->talker.info;
@@ -881,7 +963,8 @@ static void mrp_on_talker_registrar_change(
    * SM doesn't transition on a content change, so without the
    * class-update path the egress Applicant would stay stuck on the
    * old class indefinitely. */
-  if (state->port[port].type != avb_port_type_bridged) return;
+  if (state->port[port].type != avb_port_type_bridged)
+    return;
 
   /* §35.2.2.8.6 accumulated_latency must aggregate the bridge's own
    * forwarding contribution onto the inbound value as we propagate
@@ -908,8 +991,7 @@ static void mrp_on_talker_registrar_change(
    * last-propagated priority + TSpec snapshot. The entry was either
    * just inserted or already existed when msrp_rx_talker_attr
    * stepped its SM. */
-  msrp_talker_entry_t *ingress =
-      msrp_talker_find(port, stream_id, attr_type);
+  msrp_talker_entry_t *ingress = msrp_talker_find(port, stream_id, attr_type);
   uint8_t old_priority = ingress ? ingress->last_propagated_priority : 0;
   uint16_t old_mfs = ingress ? ingress->last_propagated_mfs : 0;
   uint16_t old_mfi = ingress ? ingress->last_propagated_mfi : 0;
@@ -919,12 +1001,11 @@ static void mrp_on_talker_registrar_change(
   /* Use the snapshotted TSpec for old_bps so a §35-mid-life
    * SET_STREAM_FORMAT (mfs / mfi change) is detected even when the
    * Registrar stays IN and class doesn't change. */
-  uint32_t old_bps =
-      (uint32_t)old_mfs * (uint32_t)old_mfi * old_intervals * 8u;
+  uint32_t old_bps = (uint32_t)old_mfs * (uint32_t)old_mfi * old_intervals * 8u;
 
   /* Decide the kind of MAP work needed. */
-  bool do_release = false;     /* release admission for old_cls/old_bps */
-  bool do_withdraw = false;    /* mrp_withdraw_talker on egress */
+  bool do_release = false;       /* release admission for old_cls/old_bps */
+  bool do_withdraw = false;      /* mrp_withdraw_talker on egress */
   bool do_admit_declare = false; /* admit + declare with new class */
 
   if (tr == mrp_reg_transition_register) {
@@ -933,10 +1014,9 @@ static void mrp_on_talker_registrar_change(
     do_withdraw = true;
     do_release = (old_priority != 0 && !is_failed);
   } else /* tr == none */ {
-    bool priority_changed =
-        (old_priority != 0 && old_priority != new_priority);
-    bool tspec_changed = (old_priority != 0 && !is_failed &&
-                          (old_mfs != mfs || old_mfi != mfi));
+    bool priority_changed = (old_priority != 0 && old_priority != new_priority);
+    bool tspec_changed =
+        (old_priority != 0 && !is_failed && (old_mfs != mfs || old_mfi != mfi));
     if (priority_changed || tspec_changed) {
       /* Mid-life change — full cycle to release old admission, withdraw
        * stale advertise/failed, and re-admit at the new bps. */
@@ -951,8 +1031,10 @@ static void mrp_on_talker_registrar_change(
   bool propagate_class_b = (new_cls == AVB_SR_CLASS_B);
 
   for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
-    if (y == port) continue;
-    if (state->port[y].type != avb_port_type_bridged) continue;
+    if (y == port)
+      continue;
+    if (state->port[y].type != avb_port_type_bridged)
+      continue;
 
     if (do_release) {
       avb_srp_admission_release(y, old_cls, old_bps);
@@ -998,8 +1080,7 @@ static void mrp_on_talker_registrar_change(
      * machine completes, which is enough to validate the rest of
      * the data plane end-to-end. */
     if (state->port[y].medium == avb_port_medium_wifi_ftm &&
-        new_cls == AVB_SR_CLASS_A &&
-        !state->config.allow_class_a_over_wifi) {
+        new_cls == AVB_SR_CLASS_A && !state->config.allow_class_a_over_wifi) {
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
@@ -1037,7 +1118,9 @@ static void mrp_on_talker_registrar_change(
     }
   }
 #else
-  (void)port; (void)attr_type; (void)tr;
+  (void)port;
+  (void)attr_type;
+  (void)tr;
 #endif
 }
 
@@ -1062,18 +1145,29 @@ static bool msrp_merge_listener_decls(int exclude_port,
   bool any_asking = false;
   bool any_ready_failed = false;
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
-    if (p == exclude_port) continue;
+    if (p == exclude_port)
+      continue;
     msrp_listener_entry_t *e = msrp_listener_find(p, stream_id);
-    if (e == NULL) continue;
-    if (e->sm.registrar != mrp_registrar_in) continue;
+    if (e == NULL)
+      continue;
+    if (e->sm.registrar != mrp_registrar_in)
+      continue;
     switch (e->peer_decl) {
-    case msrp_listener_event_ready:        any_ready = true; break;
-    case msrp_listener_event_asking_failed: any_asking = true; break;
-    case msrp_listener_event_ready_failed:  any_ready_failed = true; break;
-    default: break;
+    case msrp_listener_event_ready:
+      any_ready = true;
+      break;
+    case msrp_listener_event_asking_failed:
+      any_asking = true;
+      break;
+    case msrp_listener_event_ready_failed:
+      any_ready_failed = true;
+      break;
+    default:
+      break;
     }
   }
-  if (!any_ready && !any_asking && !any_ready_failed) return false;
+  if (!any_ready && !any_asking && !any_ready_failed)
+    return false;
   if (any_ready_failed || (any_ready && any_asking)) {
     *out = msrp_listener_event_ready_failed;
   } else if (any_ready) {
@@ -1087,8 +1181,7 @@ static bool msrp_merge_listener_decls(int exclude_port,
 
 static void mrp_on_listener_registrar_change(
     avb_state_s *state, int port, const msrp_listener_message_s *wire,
-    mrp_reg_transition_e tr, bool peer_decl_changed,
-    eth_addr_t *src_addr) {
+    mrp_reg_transition_e tr, bool peer_decl_changed, eth_addr_t *src_addr) {
   /* §35.2.2.4.4 listener declaration nibble lives in event_decl_data[1]
    * event1 (2 bits). Values match msrp_listener_event_t (1=AskingFailed,
    * 2=Ready, 3=ReadyFailed). */
@@ -1171,7 +1264,7 @@ static void mrp_on_listener_registrar_change(
       stream->connected_listeners[lidx].asking_failed = true;
       avbinfo("MSRP: listener %s for stream %d",
               decl == msrp_listener_event_asking_failed ? "asking_failed"
-                                                         : "ready_failed",
+                                                        : "ready_failed",
               i);
       break;
     }
@@ -1185,13 +1278,17 @@ static void mrp_on_listener_registrar_change(
    * (e.g. Ready -> AskingFailed). For each other bridged port,
    * recompute the merged value across all remaining peers and
    * re-declare only when the merged decl actually changes. */
-  if (tr == mrp_reg_transition_none && !peer_decl_changed) return;
-  if (state->port[port].type != avb_port_type_bridged) return;
+  if (tr == mrp_reg_transition_none && !peer_decl_changed)
+    return;
+  if (state->port[port].type != avb_port_type_bridged)
+    return;
 
   const unique_id_t *stream_id = (const unique_id_t *)&wire->stream_id;
   for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
-    if (y == port) continue;
-    if (state->port[y].type != avb_port_type_bridged) continue;
+    if (y == port)
+      continue;
+    if (state->port[y].type != avb_port_type_bridged)
+      continue;
 
     msrp_listener_event_t merged;
     bool has_merged = msrp_merge_listener_decls(y, stream_id, &merged);
@@ -1210,13 +1307,15 @@ static void mrp_on_listener_registrar_change(
     }
   }
 #else
-  (void)port; (void)tr; (void)peer_decl_changed;
+  (void)port;
+  (void)tr;
+  (void)peer_decl_changed;
 #endif
 }
 
-static void mrp_on_domain_registrar_change(
-    avb_state_s *state, int port, const msrp_domain_message_s *wire,
-    mrp_reg_transition_e tr) {
+static void mrp_on_domain_registrar_change(avb_state_s *state, int port,
+                                           const msrp_domain_message_s *wire,
+                                           mrp_reg_transition_e tr) {
   /* ----- Endpoint-side validation — runs every RX -----
    * The network's SR-class VLAN must match our own. Mismatches mean
    * a configuration drift that will break MSRP path establishment;
@@ -1233,12 +1332,16 @@ static void mrp_on_domain_registrar_change(
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
   /* ----- Bridge MAP propagation — transition-edge only ----- */
-  if (tr == mrp_reg_transition_none) return;
-  if (state->port[port].type != avb_port_type_bridged) return;
+  if (tr == mrp_reg_transition_none)
+    return;
+  if (state->port[port].type != avb_port_type_bridged)
+    return;
 
   for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
-    if (y == port) continue;
-    if (state->port[y].type != avb_port_type_bridged) continue;
+    if (y == port)
+      continue;
+    if (state->port[y].type != avb_port_type_bridged)
+      continue;
 
     if (tr == mrp_reg_transition_deregister) {
       /* No mrp_withdraw_domain API — MSRP domain entries are
@@ -1251,7 +1354,8 @@ static void mrp_on_domain_registrar_change(
                        wire->sr_class_vid);
   }
 #else
-  (void)port; (void)tr;
+  (void)port;
+  (void)tr;
 #endif
 }
 
@@ -1279,12 +1383,13 @@ static void msrp_dispatch_leaveall(int port) {
  * its 3pe event vector. Returns the Registrar transition (register
  * /deregister edge) so the caller can fire the MAP / application
  * callback only on transition edges, not on every RX. */
-static mrp_reg_transition_e msrp_rx_talker_attr(
-    int port, msrp_attr_type_t attr_type,
-    const msrp_talker_message_u *wire) {
+static mrp_reg_transition_e
+msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
+                    const msrp_talker_message_u *wire) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, (const unique_id_t *)&wire->talker.info.stream_id, attr_type);
-  if (e == NULL) return mrp_reg_transition_none; /* table full */
+  if (e == NULL)
+    return mrp_reg_transition_none; /* table full */
   memcpy(&e->wire, wire, sizeof(*wire));
   /* Decode the 3pe vector. event_data[] is at the same offset in
    * both talker_adv and talker_failed (after the per-type info
@@ -1301,13 +1406,14 @@ static mrp_reg_transition_e msrp_rx_talker_attr(
 }
 
 /* Process one LISTENER attribute. */
-static mrp_reg_transition_e msrp_rx_listener_attr(
-    int port, const msrp_listener_message_s *wire,
-    bool *peer_decl_changed_out) {
-  msrp_listener_entry_t *e = msrp_listener_find_or_insert(
-      port, (const unique_id_t *)&wire->stream_id);
+static mrp_reg_transition_e
+msrp_rx_listener_attr(int port, const msrp_listener_message_s *wire,
+                      bool *peer_decl_changed_out) {
+  msrp_listener_entry_t *e =
+      msrp_listener_find_or_insert(port, (const unique_id_t *)&wire->stream_id);
   if (e == NULL) {
-    if (peer_decl_changed_out) *peer_decl_changed_out = false;
+    if (peer_decl_changed_out)
+      *peer_decl_changed_out = false;
     return mrp_reg_transition_none;
   }
   memcpy(&e->wire, wire, sizeof(*wire));
@@ -1331,10 +1437,11 @@ static mrp_reg_transition_e msrp_rx_listener_attr(
 }
 
 /* Process one DOMAIN attribute. */
-static mrp_reg_transition_e msrp_rx_domain_attr(
-    int port, const msrp_domain_message_s *wire) {
+static mrp_reg_transition_e
+msrp_rx_domain_attr(int port, const msrp_domain_message_s *wire) {
   msrp_domain_entry_t *e = msrp_domain_find_or_insert(port, wire->sr_class_id);
-  if (e == NULL) return mrp_reg_transition_none;
+  if (e == NULL)
+    return mrp_reg_transition_none;
   memcpy(&e->wire, wire, sizeof(*wire));
   int e1, e2, e3;
   three_pe_to_int(wire->attr_event[0], &e1, &e2, &e3);
@@ -1350,7 +1457,8 @@ static mrp_reg_transition_e msrp_rx_domain_attr(
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
                  size_t length, eth_addr_t *src_addr) {
   (void)length;
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
 
   int offset = 0;
   msrp_attr_header_s header;
@@ -1359,7 +1467,8 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
   while ((size_t)offset + sizeof(msrp_attr_header_s) <=
          sizeof(msg->messages_raw)) {
     memcpy(&header, &msg->messages_raw[offset], sizeof(msrp_attr_header_s));
-    if (header.attr_type == msrp_attr_type_none) break;
+    if (header.attr_type == msrp_attr_type_none)
+      break;
 
     size_t attr_size = octets_to_uint(header.attr_list_len, 2) + 4;
 
@@ -1385,8 +1494,8 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
       memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
       mrp_reg_transition_e tr =
           msrp_rx_talker_attr(port, header.attr_type, &wire);
-      mrp_on_talker_registrar_change(state, port, header.attr_type,
-                                     &wire, tr, src_addr);
+      mrp_on_talker_registrar_change(state, port, header.attr_type, &wire, tr,
+                                     src_addr);
       break;
     }
     case msrp_attr_type_listener: {
@@ -1419,8 +1528,7 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size,
-                                  bool class_b) {
+                                  uint16_t max_frame_size, bool class_b) {
   memcpy(info->stream_id, stream_id, UNIQUE_ID_LEN);
   memcpy(info->stream_dest_addr, stream_dest_addr, ETH_ADDR_LEN);
   memcpy(info->vlan_id, vlan_id, 2);
@@ -1433,7 +1541,8 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
    * class_b explicitly because matching by VLAN doesn't work when
    * both classes share one. */
   uint16_t mapping_index = class_b ? 1 : 0;
-  if (mapping_index >= state->msrp_mappings_count) mapping_index = 0;
+  if (mapping_index >= state->msrp_mappings_count)
+    mapping_index = 0;
   info->priority = state->msrp_mappings[mapping_index].priority;
   info->rank = 1;
   int accumulated_latency = 15000;
@@ -1460,11 +1569,11 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size,
-                                  bool class_b) {
+                                  uint16_t max_frame_size, bool class_b) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, stream_id, msrp_attr_type_talker_advertise);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
@@ -1475,14 +1584,13 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
 void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const unique_id_t *stream_id,
                                const eth_addr_t *stream_dest_addr,
-                               const uint8_t *vlan_id,
-                               uint16_t max_frame_size,
-                               uint8_t failure_code,
-                               bool class_b,
+                               const uint8_t *vlan_id, uint16_t max_frame_size,
+                               uint8_t failure_code, bool class_b,
                                const uint8_t *src_bridge_id) {
-  msrp_talker_entry_t *e = msrp_talker_find_or_insert(
-      port, stream_id, msrp_attr_type_talker_failed);
-  if (e == NULL) return;
+  msrp_talker_entry_t *e =
+      msrp_talker_find_or_insert(port, stream_id, msrp_attr_type_talker_failed);
+  if (e == NULL)
+    return;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker_failed.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
@@ -1517,16 +1625,19 @@ void mrp_declare_listener(avb_state_s *state, int port,
                           const unique_id_t *stream_id,
                           msrp_listener_event_t decl) {
   msrp_listener_entry_t *e = msrp_listener_find_or_insert(port, stream_id);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
   e->decl_event = decl;
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_port_arm_join_timer(state, port);
 }
 
 void mrp_declare_domain(avb_state_s *state, int port, uint8_t sr_class_id,
-                        uint8_t sr_class_priority, const uint8_t *sr_class_vid) {
+                        uint8_t sr_class_priority,
+                        const uint8_t *sr_class_vid) {
   msrp_domain_entry_t *e = msrp_domain_find_or_insert(port, sr_class_id);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
   e->wire.sr_class_id = sr_class_id;
   e->wire.sr_class_priority = sr_class_priority;
   memcpy(e->wire.sr_class_vid, sr_class_vid, 2);
@@ -1551,13 +1662,15 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
     mrp_applicant_step(&e->sm, mrp_event_lv);
     armed = true;
   }
-  if (armed) mrp_port_arm_join_timer(state, port);
+  if (armed)
+    mrp_port_arm_join_timer(state, port);
 }
 
 void mrp_withdraw_listener(avb_state_s *state, int port,
                            const unique_id_t *stream_id) {
   msrp_listener_entry_t *e = msrp_listener_find(port, stream_id);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
   mrp_applicant_step(&e->sm, mrp_event_lv);
   mrp_port_arm_join_timer(state, port);
 }
@@ -1571,18 +1684,21 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
 /* Forward decl — definition is below in §6, after the periodic
  * declare helpers. */
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
-                              int attr_list_len, const char *label);
+                         int attr_list_len, const char *label);
 
 /* Resolve an Applicant TX action to a concrete 3pe event value (0..5)
  * given the current Registrar state. sJ → JoinIn (1) if Registrar IN,
  * JoinMt (3) otherwise; sN → New (0); sL → Lv (5). */
-static int mrp_resolve_3pe(mrp_tx_action_e action,
-                           mrp_registrar_state_e reg) {
+static int mrp_resolve_3pe(mrp_tx_action_e action, mrp_registrar_state_e reg) {
   switch (action) {
-  case mrp_tx_new: return 0; /* New */
-  case mrp_tx_join: return (reg == mrp_registrar_in) ? 1 : 3; /* JoinIn/JoinMt */
-  case mrp_tx_leave: return 5; /* Lv */
-  default: return -1;
+  case mrp_tx_new:
+    return 0; /* New */
+  case mrp_tx_join:
+    return (reg == mrp_registrar_in) ? 1 : 3; /* JoinIn/JoinMt */
+  case mrp_tx_leave:
+    return 5; /* Lv */
+  default:
+    return -1;
   }
 }
 
@@ -1594,26 +1710,27 @@ static void mrp_tx_flush_talker(avb_state_s *state, int port,
   if (e->attr_type == msrp_attr_type_talker_advertise) {
     msg.header.attr_type = msrp_attr_type_talker_advertise;
     msg.header.attr_len = 25;
-    attr_list_len = 29;
+    attr_list_len = 30;
   } else {
     msg.header.attr_type = msrp_attr_type_talker_failed;
     msg.header.attr_len = 34;
-    attr_list_len = 38;
+    attr_list_len = 39;
   }
   int_to_octets(&attr_list_len, msg.header.attr_list_len, 2);
   msg.header.vechead_leaveall = leaveall ? 1 : 0;
   msg.header.vechead_num_vals = 1;
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
-  if (pe < 0) return;
+  if (pe < 0)
+    return;
   if (e->attr_type == msrp_attr_type_talker_advertise) {
     msg.talker.event_data[0] = int_to_3pe(pe, 0, 0);
   } else {
     msg.talker_failed.event_data[0] = int_to_3pe(pe, 0, 0);
   }
   mrp_send_attr(state, port, &msg, attr_list_len,
-                     (e->attr_type == msrp_attr_type_talker_advertise)
-                         ? "talker advertise"
-                         : "talker failed");
+                (e->attr_type == msrp_attr_type_talker_advertise)
+                    ? "talker advertise"
+                    : "talker failed");
 }
 
 static void mrp_tx_flush_listener(avb_state_s *state, int port,
@@ -1627,7 +1744,8 @@ static void mrp_tx_flush_listener(avb_state_s *state, int port,
   msg.header.vechead_leaveall = leaveall ? 1 : 0;
   msg.header.vechead_num_vals = 1;
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
-  if (pe < 0) return;
+  if (pe < 0)
+    return;
   /* event_decl_data[0]: 3pe event in the .event byte; the 4pe
    * listener declaration is packed into .declaration of slot 1. */
   msg.event_decl_data[0].event = int_to_3pe(pe, 0, 0);
@@ -1649,7 +1767,8 @@ static void mrp_tx_flush_domain(avb_state_s *state, int port,
   msg.header.vechead_leaveall = leaveall ? 1 : 0;
   msg.header.vechead_num_vals = 1;
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
-  if (pe < 0) return;
+  if (pe < 0)
+    return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
   mrp_send_attr(state, port, &msg, attr_list_len, "domain");
 }
@@ -1663,15 +1782,17 @@ static void mrp_tx_flush_mvrp(avb_state_s *state, int port, bool leaveall,
  * through Applicant transitions, and emits PDUs for those that
  * resolve to a non-none TX action. */
 void mrp_tx_flush_port(avb_state_s *state, int port) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
   avb_port_s *p = &state->port[port];
-  mrp_event_e tx_ev = p->mrp_leaveall_tx_pending ? mrp_event_tx_la
-                                                 : mrp_event_tx;
+  mrp_event_e tx_ev =
+      p->mrp_leaveall_tx_pending ? mrp_event_tx_la : mrp_event_tx;
   bool leaveall = p->mrp_leaveall_tx_pending;
 
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
       mrp_tx_flush_talker(state, port, e, leaveall);
@@ -1680,7 +1801,8 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
   }
   for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
       mrp_tx_flush_listener(state, port, e, leaveall);
@@ -1689,7 +1811,8 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
   }
   for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
     msrp_domain_entry_t *e = &s_msrp_domains[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
       mrp_tx_flush_domain(state, port, e, leaveall);
@@ -1767,8 +1890,8 @@ typedef struct {
   mrp_sm_state_t sm;
 } mvrp_vlan_entry_t;
 
-static mvrp_vlan_entry_t
-    s_mvrp_vlans[CONFIG_ESP_AVB_NUM_PORTS][MVRP_VLAN_TABLE_SIZE];
+static mvrp_vlan_entry_t s_mvrp_vlans[CONFIG_ESP_AVB_NUM_PORTS]
+                                     [MVRP_VLAN_TABLE_SIZE];
 
 /* LeaveTimer dispatch — declared in §1b above mrp_port_tick. The
  * Registrar SM (§1) handles mrp_event_leave_timer (LV → MT)
@@ -1779,7 +1902,8 @@ static mvrp_vlan_entry_t
  * each entry is small. */
 static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
                                            int64_t now) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return false;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return false;
   bool fired = false;
   /* Each Registrar that expires LV→MT crosses a deregister transition
    * that the application layer must see — endpoint bookkeeping clears
@@ -1790,21 +1914,23 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
    * matching release never happens). */
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
       mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
       mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
       if (tr != mrp_reg_transition_none) {
-        mrp_on_talker_registrar_change(state, port, e->attr_type, &e->wire,
-                                       tr, NULL);
+        mrp_on_talker_registrar_change(state, port, e->attr_type, &e->wire, tr,
+                                       NULL);
       }
       fired = true;
     }
   }
   for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; ++i) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
       mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
@@ -1818,7 +1944,8 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
   }
   for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; ++i) {
     msrp_domain_entry_t *e = &s_msrp_domains[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
       mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
@@ -1831,7 +1958,8 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
   }
   for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; ++i) {
     mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     if (e->sm.leave_timer_us != 0 && now >= e->sm.leave_timer_us) {
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
       fired = true;
@@ -1848,22 +1976,27 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
  * (~10 s), which is longer than the Registrar LeaveTimer (~1 s) on
  * the receiving side — causing peer Registrars to flap. */
 static void mrp_port_dispatch_periodic(int port) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
-    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+    if (e->valid)
+      mrp_applicant_step(&e->sm, mrp_event_periodic);
   }
   for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; ++i) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
-    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+    if (e->valid)
+      mrp_applicant_step(&e->sm, mrp_event_periodic);
   }
   for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; ++i) {
     msrp_domain_entry_t *e = &s_msrp_domains[port][i];
-    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+    if (e->valid)
+      mrp_applicant_step(&e->sm, mrp_event_periodic);
   }
   for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; ++i) {
     mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
-    if (e->valid) mrp_applicant_step(&e->sm, mrp_event_periodic);
+    if (e->valid)
+      mrp_applicant_step(&e->sm, mrp_event_periodic);
   }
 }
 
@@ -1872,10 +2005,12 @@ static bool vlan_id_eq(const uint8_t *a, const uint8_t *b) {
 }
 
 static mvrp_vlan_entry_t *mvrp_vlan_find(int port, const uint8_t *vlan_id) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
     mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
-    if (e->valid && vlan_id_eq(e->vlan_id, vlan_id)) return e;
+    if (e->valid && vlan_id_eq(e->vlan_id, vlan_id))
+      return e;
   }
   return NULL;
 }
@@ -1883,8 +2018,10 @@ static mvrp_vlan_entry_t *mvrp_vlan_find(int port, const uint8_t *vlan_id) {
 static mvrp_vlan_entry_t *mvrp_vlan_find_or_insert(int port,
                                                    const uint8_t *vlan_id) {
   mvrp_vlan_entry_t *e = mvrp_vlan_find(port, vlan_id);
-  if (e != NULL) return e;
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return NULL;
+  if (e != NULL)
+    return e;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return NULL;
   for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
     mvrp_vlan_entry_t *slot = &s_mvrp_vlans[port][i];
     if (!slot->valid) {
@@ -1911,7 +2048,7 @@ static void mvrp_dispatch_leaveall(int port) {
 }
 
 /* MAP transition callback for MVRP — parallel to mrp_on_talker_/
- * listener_/domain_registrar_change in §6a. Fires only on Registrar
+ * listener/domain_registrar_change in §6a. Fires only on Registrar
  * register/deregister edges. Bridge mode re-declares VLAN membership
  * on every other bridged port so a peer's VLAN registration on one
  * port flows out the other ports as well. No admission gate — MVRP
@@ -1920,10 +2057,13 @@ static void mrp_on_vlan_registrar_change(avb_state_s *state, int port,
                                          const uint8_t *vlan_id,
                                          mrp_reg_transition_e tr) {
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
-  if (state->port[port].type != avb_port_type_bridged) return;
+  if (state->port[port].type != avb_port_type_bridged)
+    return;
   for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
-    if (y == port) continue;
-    if (state->port[y].type != avb_port_type_bridged) continue;
+    if (y == port)
+      continue;
+    if (state->port[y].type != avb_port_type_bridged)
+      continue;
     if (tr == mrp_reg_transition_register) {
       mrp_declare_vlan(state, y, vlan_id);
     } else {
@@ -1931,7 +2071,10 @@ static void mrp_on_vlan_registrar_change(avb_state_s *state, int port,
     }
   }
 #else
-  (void)state; (void)port; (void)vlan_id; (void)tr;
+  (void)state;
+  (void)port;
+  (void)vlan_id;
+  (void)tr;
 #endif
 }
 
@@ -1941,16 +2084,20 @@ static void mrp_on_vlan_registrar_change(avb_state_s *state, int port,
  * fires only on register/deregister edges. */
 void mrp_rx_mvrp(avb_state_s *state, int port, mvrp_vlan_id_message_s *msg,
                  size_t length, eth_addr_t *src_addr) {
-  (void)length; (void)src_addr;
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
-  if (msg->header.attr_type != mvrp_attr_type_vlan_identifier) return;
+  (void)length;
+  (void)src_addr;
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
+  if (msg->header.attr_type != mvrp_attr_type_vlan_identifier)
+    return;
 
   if (msg->header.vechead_leaveall) {
     mvrp_dispatch_leaveall(port);
   }
 
   mvrp_vlan_entry_t *e = mvrp_vlan_find_or_insert(port, msg->vlan_id);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
 
   int e1, e2, e3;
   three_pe_to_int(msg->attr_event[0], &e1, &e2, &e3);
@@ -1964,19 +2111,20 @@ void mrp_rx_mvrp(avb_state_s *state, int port, mvrp_vlan_id_message_s *msg,
 
 /* SM-driven origination. Idempotent — repeat calls keep the
  * Applicant alive (Join!), first call seeds it (New!). */
-void mrp_declare_vlan(avb_state_s *state, int port,
-                      const uint8_t *vlan_id) {
-  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+void mrp_declare_vlan(avb_state_s *state, int port, const uint8_t *vlan_id) {
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
   mvrp_vlan_entry_t *e = mvrp_vlan_find_or_insert(port, vlan_id);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_port_arm_join_timer(state, port);
 }
 
-void mrp_withdraw_vlan(avb_state_s *state, int port,
-                       const uint8_t *vlan_id) {
+void mrp_withdraw_vlan(avb_state_s *state, int port, const uint8_t *vlan_id) {
   mvrp_vlan_entry_t *e = mvrp_vlan_find(port, vlan_id);
-  if (e == NULL) return;
+  if (e == NULL)
+    return;
   mrp_applicant_step(&e->sm, mrp_event_lv);
   mrp_port_arm_join_timer(state, port);
 }
@@ -1995,7 +2143,8 @@ static void mvrp_tx_emit(avb_state_s *state, int port, mvrp_vlan_entry_t *e,
   msg.header.vechead_num_vals = 1;
   memcpy(msg.vlan_id, e->vlan_id, 2);
   int pe = mrp_resolve_3pe(e->sm.pending_tx, e->sm.registrar);
-  if (pe < 0) return;
+  if (pe < 0)
+    return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
   /* MVRP MRPDU size: protocol_ver(1) + header(4) + vlan_id(2) +
    * attr_event(1) + end-mark-list(2) + end-mark-msg(2) = 12. */
@@ -2008,7 +2157,8 @@ static void mrp_tx_flush_mvrp(avb_state_s *state, int port, bool leaveall,
                               mrp_event_e tx_ev) {
   for (int i = 0; i < MVRP_VLAN_TABLE_SIZE; i++) {
     mvrp_vlan_entry_t *e = &s_mvrp_vlans[port][i];
-    if (!e->valid) continue;
+    if (!e->valid)
+      continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
       mvrp_tx_emit(state, port, e, leaveall);
@@ -2016,8 +2166,6 @@ static void mrp_tx_flush_mvrp(avb_state_s *state, int port, bool leaveall,
     }
   }
 }
-
-
 
 /* Compute the MSRP TSpec MaxFrameSize for an output stream based on its
  * current stream_format. Per IEEE 802.1Qat, MaxFrameSize is the L2 frame
@@ -2053,7 +2201,7 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
 }
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
-                              int attr_list_len, const char *label) {
+                         int attr_list_len, const char *label) {
   size_t attr_size = 4 + attr_list_len; /* attr hdr w/o vechead + attr list */
   struct timespec ts;
   int ret;
@@ -2078,8 +2226,6 @@ static int mrp_send_attr(avb_state_s *state, int port, void *attr,
   return ret;
 }
 
-
-
 /* MAAP timing constants (IEEE 1722-2016 Annex B) */
 #define MAAP_PROBE_RETRANSMITS 3
 #define MAAP_PROBE_INTERVAL_BASE_MS 500
@@ -2097,7 +2243,8 @@ static int mrp_send_attr(avb_state_s *state, int port, void *attr,
  * devices happen to hash to the same slot. */
 static void maap_generate_addr(avb_state_s *state, eth_addr_t *addr,
                                int stream_index) {
-  uint32_t seed = state->port[0].internal_mac_addr[2] ^ state->port[0].internal_mac_addr[3];
+  uint32_t seed =
+      state->port[0].internal_mac_addr[2] ^ state->port[0].internal_mac_addr[3];
   seed = (seed << 8) | state->port[0].internal_mac_addr[4];
   seed = (seed << 8) | state->port[0].internal_mac_addr[5];
   seed += stream_index;
@@ -2147,7 +2294,7 @@ int avb_send_maap_msg(avb_state_s *state, maap_msg_type_t msg_type,
   int ret = avb_net_send(state, ethertype_avtp, &msg, sizeof(msg), &ts);
   if (ret < 0) {
     avberr("send MAAP %s failed: %d",
-           msg_type == maap_msg_type_probe     ? "probe"
+           msg_type == maap_msg_type_probe      ? "probe"
            : msg_type == maap_msg_type_defend   ? "defend"
            : msg_type == maap_msg_type_announce ? "announce"
                                                 : "unknown",
@@ -2165,8 +2312,8 @@ void avb_maap_init(avb_state_s *state) {
     maap_generate_addr(state, &m->acquired_addr, i);
     m->probe_count = MAAP_PROBE_RETRANSMITS;
     m->timer_expiry_us =
-        esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
-                                              MAAP_PROBE_INTERVAL_VAR_MS);
+        esp_timer_get_time() +
+        maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS, MAAP_PROBE_INTERVAL_VAR_MS);
     m->state = maap_state_probe;
     avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1, NULL,
                       0);
@@ -2207,17 +2354,15 @@ void avb_maap_tick(avb_state_s *state) {
         /* Send another probe */
         avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
                           NULL, 0);
-        m->timer_expiry_us =
-            now + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
-                                 MAAP_PROBE_INTERVAL_VAR_MS);
+        m->timer_expiry_us = now + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
+                                                  MAAP_PROBE_INTERVAL_VAR_MS);
       }
     } else if (m->state == maap_state_defend) {
       /* Periodic announce refresh */
       avb_send_maap_msg(state, maap_msg_type_announce, &m->acquired_addr, 1,
                         NULL, 0);
-      m->timer_expiry_us =
-          now + maap_jitter_us(MAAP_ANNOUNCE_INTERVAL_BASE_MS,
-                               MAAP_ANNOUNCE_INTERVAL_VAR_MS);
+      m->timer_expiry_us = now + maap_jitter_us(MAAP_ANNOUNCE_INTERVAL_BASE_MS,
+                                                MAAP_ANNOUNCE_INTERVAL_VAR_MS);
     }
   }
 }
@@ -2228,9 +2373,7 @@ int avb_process_iec_61883(avb_state_s *state, iec_61883_6_message_s *msg) {
 }
 
 /* Process received AVTP AAF PCM message */
-int avb_process_aaf(avb_state_s *state, aaf_pcm_message_s *msg) {
-  return OK;
-}
+int avb_process_aaf(avb_state_s *state, aaf_pcm_message_s *msg) { return OK; }
 
 /* Process received AVTP MAAP message */
 int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
@@ -2238,7 +2381,8 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
     maap_stream_state_s *m = &state->maap[i];
 
     /* Only handle messages that conflict with our address */
-    if (!maap_addr_conflicts(&m->acquired_addr, (eth_addr_t *)msg->req_start_addr))
+    if (!maap_addr_conflicts(&m->acquired_addr,
+                             (eth_addr_t *)msg->req_start_addr))
       continue;
 
     switch (msg->msg_type) {
@@ -2256,9 +2400,8 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
         maap_generate_addr(state, &m->acquired_addr, i);
         m->probe_count = MAAP_PROBE_RETRANSMITS;
         m->timer_expiry_us =
-            esp_timer_get_time() +
-            maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
-                           MAAP_PROBE_INTERVAL_VAR_MS);
+            esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
+                                                  MAAP_PROBE_INTERVAL_VAR_MS);
         avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
                           NULL, 0);
       }
@@ -2271,9 +2414,8 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
         maap_generate_addr(state, &m->acquired_addr, i);
         m->probe_count = MAAP_PROBE_RETRANSMITS;
         m->timer_expiry_us =
-            esp_timer_get_time() +
-            maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
-                           MAAP_PROBE_INTERVAL_VAR_MS);
+            esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
+                                                  MAAP_PROBE_INTERVAL_VAR_MS);
         avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
                           NULL, 0);
       }
@@ -2288,9 +2430,8 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
         m->state = maap_state_probe;
         m->probe_count = MAAP_PROBE_RETRANSMITS;
         m->timer_expiry_us =
-            esp_timer_get_time() +
-            maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
-                           MAAP_PROBE_INTERVAL_VAR_MS);
+            esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
+                                                  MAAP_PROBE_INTERVAL_VAR_MS);
         avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
                           NULL, 0);
       }
@@ -2311,8 +2452,8 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 
-static avb_admission_class_s
-    s_admission[CONFIG_ESP_AVB_NUM_PORTS][AVB_SR_CLASS_COUNT];
+static avb_admission_class_s s_admission[CONFIG_ESP_AVB_NUM_PORTS]
+                                        [AVB_SR_CLASS_COUNT];
 
 int avb_srp_admission_init(avb_state_s *state) {
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
@@ -2334,8 +2475,10 @@ void avb_srp_admission_stop(avb_state_s *state) { (void)state; }
 
 int avb_srp_admission_try_admit(int port_index, avb_sr_class_e cls,
                                 uint32_t request_bps) {
-  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS) return -1;
-  if (cls < 0 || cls >= AVB_SR_CLASS_COUNT) return -1;
+  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS)
+    return -1;
+  if (cls < 0 || cls >= AVB_SR_CLASS_COUNT)
+    return -1;
   avb_admission_class_s *e = &s_admission[port_index][cls];
   if (e->cap_bps == 0) {
     return -2; /* -ENOSPC: link rate not yet known (Wi-Fi port not up) */
@@ -2352,8 +2495,10 @@ int avb_srp_admission_try_admit(int port_index, avb_sr_class_e cls,
 
 void avb_srp_admission_release(int port_index, avb_sr_class_e cls,
                                uint32_t request_bps) {
-  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS) return;
-  if (cls < 0 || cls >= AVB_SR_CLASS_COUNT) return;
+  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
+  if (cls < 0 || cls >= AVB_SR_CLASS_COUNT)
+    return;
   avb_admission_class_s *e = &s_admission[port_index][cls];
   if (e->admitted_bps > request_bps) {
     e->admitted_bps -= request_bps;

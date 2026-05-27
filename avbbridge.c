@@ -35,9 +35,7 @@ static volatile bool s_bridge_stop = false;
  * stay in the application layer. */
 static volatile unsigned int s_wifi_ap_sta_count = 0;
 
-unsigned int avb_bridge_wifi_ap_sta_count(void) {
-  return s_wifi_ap_sta_count;
-}
+unsigned int avb_bridge_wifi_ap_sta_count(void) { return s_wifi_ap_sta_count; }
 
 void avb_bridge_set_wifi_ap_sta_count(unsigned int count) {
   s_wifi_ap_sta_count = count;
@@ -66,8 +64,8 @@ int avb_bridge_init(avb_state_s *state) {
   }
   s_bridge_stop = false;
   /* Pin to core 1 alongside AVB-OUT so the EMAC RX cores stay free. */
-  BaseType_t r = xTaskCreatePinnedToCore(bridge_task, "AVB-BR", 8192,
-                                         state, 22, &s_bridge_task, 1);
+  BaseType_t r = xTaskCreatePinnedToCore(bridge_task, "AVB-BR", 8192, state, 22,
+                                         &s_bridge_task, 1);
   return (r == pdPASS) ? 0 : -1;
 }
 
@@ -98,7 +96,7 @@ void avb_bridge_stop(avb_state_s *state) {
  *                      the v1 plan (Wi-Fi admits Class B only).
  *   Other           — IP, ARP, etc. — forwarded best-effort. */
 
-#define ETHERTYPE_PTP  0x88f7
+#define ETHERTYPE_PTP 0x88f7
 #define ETHERTYPE_AVTP 0x22f0
 #define ETHERTYPE_MSRP 0x22ea
 #define ETHERTYPE_MVRP 0x88f5
@@ -110,9 +108,8 @@ void avb_bridge_set_allow_class_a_over_wifi(bool allow) {
   s_allow_class_a_over_wifi = allow;
 }
 
-avb_bridge_disposition_t avb_bridge_classify(int ingress_port,
-                                             uint16_t ethertype,
-                                             uint8_t vlan_pcp) {
+avb_bridge_disposition_t
+avb_bridge_classify(int ingress_port, uint16_t ethertype, uint8_t vlan_pcp) {
   avb_bridge_disposition_t d = {0};
   /* Egress is always the OTHER port. Asserts NUM_PORTS == 2 in the
    * bridge build; with NUM_PORTS=1 nothing can actually be forwarded. */
