@@ -1869,4 +1869,11 @@ acmp_status_t avb_disconnect_listener(avb_state_s *state,
 int avb_get_acmp_timeout_ms(acmp_msg_type_t msg_type);
 void avb_process_inflight_timeouts(avb_state_s *state);
 
+/* AVTP RX dispatcher for ATDECC subtypes (ADP / AECP / ACMP). Called
+ * from avb_process_rx_message in avb.c when one of those subtypes
+ * arrives, gated by CONFIG_ESP_AVB_ATDECC. Centralizes the subtype
+ * switch so avb.c stays agnostic of the ATDECC message types. */
+int atdecc_dispatch_avtp_rx(avb_state_s *state, avtp_msgbuf_u *msg,
+                            eth_addr_t *src_addr);
+
 #endif /* ESP_AVB_ATDECC_H_ */

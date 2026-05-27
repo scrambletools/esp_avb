@@ -3,7 +3,7 @@ menu "AVB Configuration"
     config ESP_AVB
         bool "Enable AVB"
         default y
-        depends on NETUTILS_PTPD
+        depends on ESP_PTP
         help
             Enable Audio Video Bridging (AVB) support.
             AVB provides time-synchronized, low-latency streaming services 
@@ -102,6 +102,19 @@ menu "AVB Configuration"
             pure IEEE 1722.1-2021 AVB/AVDECC endpoint rather than a
             Milan endpoint.
 
+    config ESP_AVB_ATDECC
+        bool "Build ATDECC (IEEE 1722.1) discovery + control"
+        depends on ESP_AVB
+        default n if ESP_AVB_ROLE_BRIDGE
+        default y
+        help
+            Compile and link the ATDECC layer (atdecc.c) — ADP discovery,
+            AECP entity model + control, ACMP stream connection management.
+            When disabled, the AVTP RX dispatcher in avb.c silently drops
+            ADP/AECP/ACMP subtypes and atdecc.c is excluded from the build.
+
+            Default off for bridge builds (transparent L2 forwarder has no
+            ATDECC entity); default on for endpoints.
 
     config ESP_AVB_AVB_LITE_COMPLIANT
         bool "Advertise AVB Lite compliance"

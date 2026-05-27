@@ -498,16 +498,6 @@ typedef struct {
 typedef void (*avb_stream_rx_handler_t)(uint8_t *avtp_data, uint16_t len,
                                         void *ctx);
 
-/* PTP frame rx handler — called by avb_unified_rx_cb for every
- * received frame with ethertype 0x88f7 (IEEE 1588 / IEEE 802.1AS).
- * The handler receives the Ethernet-header-stripped PTP message bytes
- * so it can dispatch into a PTP daemon's state machine directly. The
- * caller frees the underlying buffer after the handler returns. Used
- * by esp_ptp on Wi-Fi-medium endpoints, where there is no L2TAP
- * socket for the daemon to read from. */
-typedef void (*avb_ptp_rx_handler_t)(const uint8_t *ptp_msg, uint16_t len,
-                                     const uint8_t src_mac[6], void *ctx);
-
 /* Stream Output params */
 struct stream_out_params_s {
   void *state;                          // pointer to AVB state (avb_state_s *)
@@ -835,11 +825,6 @@ esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
 
 void avb_net_set_stream_rx_handler(avb_stream_rx_handler_t handler, void *ctx);
 
-/* Register a handler for PTP (0x88f7) frames. Replaces the default
- * dispatch (which falls into esp_netif_receive on Ethernet endpoints
- * and silently drops on Wi-Fi-only endpoints). Single handler,
- * non-recursive; NULL clears. */
-void avb_net_set_ptp_rx_handler(avb_ptp_rx_handler_t handler, void *ctx);
 /* Number of incoming stream frames dropped because the AVB-IN queue
  * was full. Diagnostic counter; persistent across the session. */
 uint32_t avb_net_stream_rx_drops(void);

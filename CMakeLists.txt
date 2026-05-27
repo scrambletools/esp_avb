@@ -11,19 +11,26 @@
 #   - avtp.c (now AVTPDU stream construction + talker/listener tasks
 #     after the SRP move). Excluded from the bridge build because the
 #     bridge has no talker/listener.
-#   - atdecc.c, avbcodec.c, avbpll.c — bridge has no ATDECC entity,
-#     no codec, no media-clock PLL.
+#   - avbcodec.c, avbpll.c — bridge has no codec or media-clock PLL.
 #
 # Bridge-only:
-#   - avbbridge.c (L2 forwarding + ATDECC/codec/PLL no-op stubs)
+#   - avbbridge.c (L2 forwarding + codec/PLL no-op stubs)
 #   - avbfqtss.c (802.1Qav credit-based shaper)
+#
+# Gated by CONFIG_ESP_AVB_ATDECC (defaults n on bridge, y on endpoint):
+#   - atdecc.c (IEEE 1722.1 ADP/AECP/ACMP). avb.c's AVTP RX
+#     dispatcher #ifdef-routes the ATDECC subtypes through it.
 
 set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avtp.c avbstats.c)
 
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)
     list(APPEND avb_srcs avbbridge.c avbfqtss.c)
 else()
-    list(APPEND avb_srcs avbcodec.c atdecc.c avbpll.c)
+    list(APPEND avb_srcs avbcodec.c avbpll.c)
+endif()
+
+if(CONFIG_ESP_AVB_ATDECC)
+    list(APPEND avb_srcs atdecc.c)
 endif()
 
 idf_component_register(SRCS ${avb_srcs}

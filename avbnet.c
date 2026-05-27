@@ -41,8 +41,6 @@
 static QueueHandle_t s_ctrl_rx_queue = NULL;
 static avb_stream_rx_handler_t s_stream_handler = NULL;
 static void *s_stream_ctx = NULL;
-static avb_ptp_rx_handler_t s_ptp_handler = NULL;
-static void *s_ptp_ctx = NULL;
 static esp_netif_t *s_eth_netif = NULL;
 #if CONFIG_ESP_AVB_NUM_PORTS > 1
 static esp_netif_t *s_wifi_netif = NULL;
@@ -426,16 +424,16 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
     return ESP_OK;
   }
   case 0x88f7: { /* IEEE 1588 / IEEE 802.1AS.
-                    Wi-Fi ingress: deliver to registered handler (Wi-Fi
-                    STA endpoint has no L2TAP socket). EMAC ingress:
-                    fan out through L2TAP so the gPTP daemon's
-                    L2TAP socket wakes up on poll(). */
+                    Wi-Fi ingress: inject straight into esp_ptp (Wi-Fi
+                    netif has no L2TAP backend). EMAC ingress: fan out
+                    through L2TAP so the gPTP daemon's L2TAP socket
+                    wakes up on poll() — symmetric handoff, just a
+                    different downstream API. */
     if (eth_handle == NULL) {
-      if (s_ptp_handler && len >= ETH_HEADER_LEN) {
-        uint8_t src_mac[6];
-        memcpy(src_mac, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
-        s_ptp_handler(buf + ETH_HEADER_LEN,
-                      (uint16_t)(len - ETH_HEADER_LEN), src_mac, s_ptp_ctx);
+      if (s_wifi_port_idx >= 0 && len >= ETH_HEADER_LEN) {
+        (void)ptp_inject_received_frame(s_wifi_port_idx,
+                                        buf + ETH_HEADER_LEN,
+                                        (uint16_t)(len - ETH_HEADER_LEN));
       }
       free(buf);
       return ESP_OK;
@@ -1038,11 +1036,6 @@ void avb_net_set_stream_rx_handler(avb_stream_rx_handler_t handler, void *ctx) {
   /* Write handler last with memory barrier semantics —
    * the callback checks s_stream_handler != NULL as gate */
   s_stream_handler = handler;
-}
-
-void avb_net_set_ptp_rx_handler(avb_ptp_rx_handler_t handler, void *ctx) {
-  s_ptp_ctx = ctx;
-  s_ptp_handler = handler;
 }
 
 uint32_t avb_net_stream_rx_drops(void) { return s_stream_rx_drops; }

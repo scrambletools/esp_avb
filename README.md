@@ -35,7 +35,7 @@ needed.
   `esp_wifi_internal_reg_rxcb`. Codec is optional; disable it via
   `avb_config_s::codec_disabled = true` for boards without audio
   hardware.
-- **bridge** — transparent L2 AVB bridge between an Ethernet port and a
+- **bridge (experimental)** — transparent L2 AVB bridge between an Ethernet port and a
   Wi-Fi SoftAP. Forwards AVTP control (ADP/AECP/ACMP/MAAP), MSRP, MVRP,
   and VLAN-tagged stream frames in both directions. No codec, no own
   ATDECC entity. Includes FQTSS Credit-Based Shaper and MSRP admission

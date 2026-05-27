@@ -811,8 +811,12 @@ static int find_or_add_msrp_listener(avb_state_s *state,
   if (idx >= 0)
     return idx;
 
+#ifdef CONFIG_ESP_AVB_ATDECC
   int listener_idx =
       avb_find_entity_by_addr(state, mac_addr, avb_entity_type_listener);
+#else
+  int listener_idx = NOT_FOUND; /* bridge has no local ATDECC entity table */
+#endif
   if (listener_idx != NOT_FOUND) {
     idx = find_connected_listener_by_entity(
         stream, state->listeners[listener_idx].entity_id);
@@ -906,11 +910,15 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
    * listener declarations per Milan §5.5. */
   eth_addr_t talker_addr;
   memcpy(&talker_addr, info->stream_id, ETH_ADDR_LEN);
+#ifdef CONFIG_ESP_AVB_ATDECC
   int idx =
       avb_find_entity_by_addr(state, &talker_addr, avb_entity_type_talker);
   if (idx >= 0) {
     memcpy(&state->talkers[idx].info, info, sizeof(talker_adv_info_s));
   }
+#else
+  (void)talker_addr; /* bridge has no local ATDECC talker table */
+#endif
   /* Mirror the §35.2.2.8.4 failure_code into our input_stream slot
    * for ATDECC stream_info responses. decl_event derivation in
    * avb_input_stream_decl_event queries the MRP SM directly, so it
@@ -2206,9 +2214,11 @@ static int mrp_send_attr(avb_state_s *state, int port, void *attr,
   struct timespec ts;
   int ret;
 
+#ifdef CONFIG_ESP_AVB_ATDECC
   if (state->avb_lite) {
     return avb_send_cvu_srp_attr(state, attr, attr_list_len, label);
   }
+#endif
 
   msrp_msgbuf_s msrp_msg;
   memset(&msrp_msg, 0, sizeof(msrp_msg));

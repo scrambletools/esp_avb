@@ -15,6 +15,20 @@
 static uint16_t
 count_acmp_connected_talker_listeners(avb_talker_stream_s *stream);
 
+int atdecc_dispatch_avtp_rx(avb_state_s *state, avtp_msgbuf_u *msg,
+                            eth_addr_t *src_addr) {
+  switch (msg->subtype) {
+  case avtp_subtype_adp:
+    return avb_process_adp(state, &msg->adp, src_addr);
+  case avtp_subtype_aecp:
+    return avb_process_aecp(state, &msg->aecp, src_addr);
+  case avtp_subtype_acmp:
+    return avb_process_acmp(state, &msg->acmp);
+  default:
+    return OK; /* not an ATDECC subtype — caller's default-case handles log */
+  }
+}
+
 int avb_send_adp_entity_available(avb_state_s *state) {
   adp_message_s msg;
   struct timespec ts;

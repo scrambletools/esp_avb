@@ -704,7 +704,9 @@ static void avb_update_ptp_status(avb_state_s *state) {
   if (ptpd_status(0, &ptp_status) == 0) {
     memcpy(&state->ptp_status, &ptp_status, sizeof(struct ptpd_status_s));
     avb_update_avb_lite_from_ptp(state);
+#ifdef CONFIG_ESP_AVB_ATDECC
     avb_update_avb_interface_from_ptp(state);
+#endif
   }
 }
 
@@ -751,6 +753,7 @@ static int avb_periodic_send(avb_state_s *state) {
   // stream out task now reads the PTP clock directly on Core 1 with a
   // double-read consistency check instead of projecting a stale snapshot.
 
+#ifdef CONFIG_ESP_AVB_ATDECC
   // Send ADP entity available message when ATDECC control or Milan mode is enabled.
   if (state->config.atdecc_control || state->config.milan_compliant) {
     timespecsub(&time_now, &state->port[0].last_transmitted_adp_entity_avail,
@@ -760,6 +763,7 @@ static int avb_periodic_send(avb_state_s *state) {
       avb_send_adp_entity_available(state);
     }
   }
+#endif
 
   /* MVRP VLAN — SM-driven. mrp_declare_vlan seeds the Applicant on
    * first call and keeps it alive on subsequent calls; the SM's
@@ -862,6 +866,7 @@ static int avb_periodic_send(avb_state_s *state) {
   /* MSRP / MVRP LeaveAll driven by per-port LeaveAllTimer (10–15 s
    * wired, 30–60 s Wi-Fi per §10.7.11); Applicants re-declare on rLA. */
 
+#ifdef CONFIG_ESP_AVB_ATDECC
   // Send Unsolicited notifications
   if (state->unsol_notif_enabled) {
 
@@ -913,6 +918,7 @@ static int avb_periodic_send(avb_state_s *state) {
     avb_periodic_fast_connect(state);
   }
 #endif
+#endif /* CONFIG_ESP_AVB_ATDECC */
 
   return OK;
 } // avb_periodic_send
@@ -948,15 +954,12 @@ static int avb_process_rx_message(avb_state_s *state, int protocol_idx,
     case avtp_subtype_maap:
       return avb_process_maap(state, &msg->maap);
       break;
+#ifdef CONFIG_ESP_AVB_ATDECC
     case avtp_subtype_adp:
-      return avb_process_adp(state, &msg->adp, &src_addr);
-      break;
     case avtp_subtype_aecp:
-      return avb_process_aecp(state, &msg->aecp, &src_addr);
-      break;
     case avtp_subtype_acmp:
-      return avb_process_acmp(state, &msg->acmp);
-      break;
+      return atdecc_dispatch_avtp_rx(state, msg, &src_addr);
+#endif
     default:
       avbinfo("Ignoring unsupported AVTP message subtype: 0x%02x",
               msg->subtype);

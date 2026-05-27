@@ -175,69 +175,10 @@ avb_bridge_classify(int ingress_port, uint16_t ethertype, uint8_t vlan_pcp) {
   }
 }
 
-/* No-op stubs for ATDECC entry points that avb.c dispatches into
- * unconditionally. The bridge has no ATDECC entity (transparent L2
- * bridge per Milan/802.1Q); atdecc.c is excluded from the bridge
- * build, so these satisfy the linker. */
-
-int avb_send_adp_entity_available(avb_state_s *state) {
-  (void)state;
-  return 0;
-}
-
-int avb_send_aecp_unsol_get_counters(avb_state_s *state,
-                                     aem_desc_type_t descriptor_type,
-                                     uint16_t index) {
-  (void)state;
-  (void)descriptor_type;
-  (void)index;
-  return 0;
-}
-
-void avb_update_avb_interface_from_ptp(avb_state_s *state) { (void)state; }
-
-int avb_process_adp(avb_state_s *state, adp_message_s *msg,
-                    eth_addr_t *src_addr) {
-  (void)state;
-  (void)msg;
-  (void)src_addr;
-  return 0;
-}
-
-int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
-                     eth_addr_t *src_addr) {
-  (void)state;
-  (void)msg;
-  (void)src_addr;
-  return 0;
-}
-
-int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
-  (void)state;
-  (void)msg;
-  return 0;
-}
-
-void avb_periodic_fast_connect(avb_state_s *state) { (void)state; }
-
-void avb_process_inflight_timeouts(avb_state_s *state) { (void)state; }
-
-int avb_find_entity_by_addr(avb_state_s *state, eth_addr_t *entity_addr,
-                            avb_entity_type_t entity_type) {
-  (void)state;
-  (void)entity_addr;
-  (void)entity_type;
-  return -1;
-}
-
-int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
-                          const char *label) {
-  (void)state;
-  (void)attr;
-  (void)attr_list_len;
-  (void)label;
-  return 0;
-}
+/* ATDECC entry-point stubs have been removed — every call site in
+ * avb.c / mrp.c is now gated by CONFIG_ESP_AVB_ATDECC, which is off
+ * on the bridge build. Add a stub here ONLY if a new caller is
+ * introduced that can't reasonably be wrapped in an #ifdef. */
 
 /* avbcodec.c stubs — bridge has no codec / I2S. */
 esp_err_t avb_config_i2s(avb_state_s *state) {
