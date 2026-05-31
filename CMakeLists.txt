@@ -35,7 +35,7 @@ endif()
 
 idf_component_register(SRCS ${avb_srcs}
                        REQUIRES esp_eth
-                       PRIV_REQUIRES esp_codec_dev esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_timer nvs_flash
+                       PRIV_REQUIRES esp_codec_dev esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
                        INCLUDE_DIRS "." "./include"
                        EMBED_FILES logo.png)
 

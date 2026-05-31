@@ -23,6 +23,7 @@
 #include "esp_timer.h"
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
+#include <esp_wifi.h>
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 #include "avbbridge.h"
 #endif
@@ -235,6 +236,14 @@ static volatile uint32_t s_rx_msrp = 0;
 static volatile uint32_t s_rx_mvrp = 0;
 static volatile uint32_t s_rx_vlan = 0;
 static volatile uint32_t s_rx_other = 0;
+/* L2 instrument: every entry into the Wi-Fi RX callback, counted before
+ * the malloc that could drop the frame. Compared against s_rx_total
+ * (which the dispatcher bumps after a successful malloc): a gap = OOM
+ * drops; both frozen while the driver's own RX stats climb = the wifi
+ * driver stopped delivering to our callback. Diagnostic for the C6
+ * RX-stall. */
+static volatile uint32_t s_rx_wifi_cb_entry = 0;
+uint32_t avb_net_wifi_rx_cb_count(void) { return s_rx_wifi_cb_entry; }
 void avb_net_rx_breakdown(uint32_t *total, uint32_t *avtp, uint32_t *msrp,
                           uint32_t *mvrp, uint32_t *vlan, uint32_t *other) {
   if (total) *total = s_rx_total;
@@ -489,6 +498,7 @@ extern esp_err_t esp_wifi_internal_reg_rxcb(
     int wifi_if, esp_err_t (*fn)(void *buffer, uint16_t len, void *eb));
 
 static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
+  s_rx_wifi_cb_entry++; /* L2 counter — bare increment, no logging in hot path */
   uint8_t *buf = malloc(len);
   if (!buf) {
     esp_wifi_internal_free_rx_buffer(eb);
@@ -498,6 +508,18 @@ static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
   esp_wifi_internal_free_rx_buffer(eb);
   return avb_unified_rx_cb(NULL /* no eth_handle */, buf, (uint32_t)len,
                            NULL /* priv */, NULL /* info */);
+}
+
+/* Re-register the Wi-Fi RX callback on WIFI_IF_STA. The single rxcb slot
+ * can be displaced at runtime — e.g. the default STA netif's reconnect
+ * machinery (esp_netif_attach_wifi_station) re-points it at the lwIP
+ * path, after which the MAC keeps receiving (L1 climbs) but our
+ * dispatcher never runs (L2 frozen). The endpoint's RX-stall watchdog
+ * calls this as a light first-line recovery; it restores delivery
+ * without the full esp_wifi_stop/start cycle when displacement is the
+ * cause. Returns whatever esp_wifi_internal_reg_rxcb reports. */
+esp_err_t avb_net_wifi_reregister_rxcb(void) {
+  return esp_wifi_internal_reg_rxcb(0 /* WIFI_IF_STA */, avb_wifi_rx_cb);
 }
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
@@ -603,19 +625,24 @@ int avb_net_init(avb_state_s *state) {
                   &state->port[0].internal_mac_addr);
   } else if (state->port[0].medium == avb_port_medium_wifi_ftm) {
     /* Wi-Fi endpoint or AP. No L2TAP — esp_vfs_l2tap is Ethernet-only
-     * in IDF. MAC + netif handle come from esp_netif (medium-agnostic);
-     * data-plane RX/TX is wired further down via esp_wifi_internal_*. */
+     * in IDF. The data-plane RX/TX is wired further down via
+     * esp_wifi_internal_*; here we only need the MAC and (if present)
+     * the netif handle. The netif is optional on a STA endpoint: when
+     * the app skips esp_netif_create_default_wifi_sta() — to stop the
+     * default STA netif from re-registering its own RX callback on
+     * reassociation and displacing ours — the if_key lookup returns
+     * NULL and we read the MAC straight from the Wi-Fi driver. */
     s_eth_netif =
         esp_netif_get_handle_from_ifkey(state->port[0].eth_interface);
-    if (!s_eth_netif) {
-      avbwarn("port[0]: no netif for if_key '%s'",
-              state->port[0].eth_interface);
-    }
-    if (s_eth_netif && esp_netif_get_mac(s_eth_netif,
-                                         state->port[0].internal_mac_addr) !=
-                           ESP_OK) {
-      avbwarn("port[0]: esp_netif_get_mac on '%s' failed",
-              state->port[0].eth_interface);
+    if (s_eth_netif) {
+      if (esp_netif_get_mac(s_eth_netif, state->port[0].internal_mac_addr) !=
+          ESP_OK) {
+        avbwarn("port[0]: esp_netif_get_mac on '%s' failed",
+                state->port[0].eth_interface);
+      }
+    } else if (esp_wifi_get_mac(WIFI_IF_STA,
+                                state->port[0].internal_mac_addr) != ESP_OK) {
+      avbwarn("port[0]: esp_wifi_get_mac(STA) failed");
     }
     avbinfo("port[0]: WIFI MAC %02x:%02x:%02x:%02x:%02x:%02x",
             state->port[0].internal_mac_addr[0],

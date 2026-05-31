@@ -20,6 +20,18 @@
 #if SOC_EMAC_SUPPORTED
 #include "soc/emac_dma_struct.h"
 #endif
+/* L1 instrument: esp_wifi driver/MAC RX counters, available only on a
+ * native HE Wi-Fi target (the C6 endpoint). The P4 bridge reaches Wi-Fi
+ * via esp_wifi_remote and exposes no local HE stats, so gate it out.
+ *
+ * Both headers live in esp_wifi's public "include" dir (the private one
+ * at include/esp_private/), reachable now that esp_wifi is in the
+ * component's PRIV_REQUIRES. */
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
+#define AVB_WIFI_RX_STATS 1
+#include "esp_wifi_he.h"
+#include "esp_private/esp_wifi_he_private.h"
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -182,6 +194,40 @@ static void avb_cpu_stats_tick(void) {
                        &rx_other);
   avbinfo("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
           rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other);
+
+#ifdef AVB_WIFI_RX_STATS
+  /* L1/L2 RX localization for the C6 Wi-Fi RX-stall. Three layers, all
+   * printed here in the slow stats task — NO logging in the RX hot path:
+   *   L1 = esp_wifi driver/MAC counters (esp_wifi_get_rx_statistics):
+   *        frames the radio+driver actually received, below our callback.
+   *   L2 = avb_net_wifi_rx_cb_count(): entries into avb_wifi_rx_cb,
+   *        counted before the per-frame malloc.
+   *   L3 = RX breakdown total (above): frames that reached the dispatcher.
+   * In the frozen state, L1-climbs-while-L2/L3-frozen => the driver
+   * stopped delivering to our callback (host-side wedge); L1-also-frozen
+   * => the stall is at/below the MAC/driver RX path. esp_wifi_get_rx_
+   * statistics counts ALL PHY RX (beacons etc.), so discriminate AECP
+   * delivery with a dense burst vs the beacon-only baseline, not absolute
+   * values. Enable the driver's stat collection once (HT/legacy SU only;
+   * skip the heavy MU-MIMO/OFDMA buffers). */
+  static bool s_rx_stats_enabled = false;
+  if (!s_rx_stats_enabled &&
+      esp_wifi_enable_rx_statistics(true, false) == ESP_OK) {
+    s_rx_stats_enabled = true;
+  }
+  esp_test_rx_statistics_t rxs;
+  memset(&rxs, 0, sizeof(rxs));
+  if (s_rx_stats_enabled && esp_wifi_get_rx_statistics(0, &rxs) == ESP_OK) {
+    avbinfo("  ====> WIFI L1 rx legacy=%u ht=%u ht_retry=%u rx_isr=%u "
+            "rx_nblks=%u | L2 wifi_cb=%u",
+            rxs.legacy, rxs.ht, rxs.ht_retry, rxs.rx_isr, rxs.rx_nblks,
+            avb_net_wifi_rx_cb_count());
+  } else {
+    avbinfo("  ====> WIFI L1 rx stats pending/unavailable | L2 wifi_cb=%u",
+            avb_net_wifi_rx_cb_count());
+  }
+#endif
+
   /* Heap watcher — surfaces exhaustion vs. fragmentation. The wifi
    * RX path mallocs per-frame at ~1500 B; when the largest contiguous
    * block falls below that, RX stops cold. */

@@ -840,6 +840,12 @@ uint32_t avb_net_ptp_rx_seen(void);
 void avb_net_rx_breakdown(uint32_t *total, uint32_t *avtp, uint32_t *msrp,
                           uint32_t *mvrp, uint32_t *vlan, uint32_t *other);
 
+/* L2 RX instrument: count of entries into the Wi-Fi RX callback, taken
+ * before the per-frame malloc. Compare against avb_net_rx_breakdown's
+ * total to localize a Wi-Fi RX stall (driver-not-delivering vs OOM-drop
+ * vs dispatch). Monotonic; zero on builds with no Wi-Fi RX path. */
+uint32_t avb_net_wifi_rx_cb_count(void);
+
 /* Bridge forwarding stats — per-direction OK / fail / OOM counters
  * bumped inside avb_bridge_forward. Used to diagnose missing
  * wired->Wi-Fi or Wi-Fi->wired multicast traffic. Zero on non-bridge
