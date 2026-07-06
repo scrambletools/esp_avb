@@ -715,17 +715,33 @@ static void avb_stream_out_task(void *task_param) {
   int32_t sched_ns_carry = 0;
   /* Periodic gPTP-vs-esp_timer resync measurement to produce a filtered
    * per-packet correction. Reading gPTP every packet injected ptpd's
-   * 125 ms servo ripple directly into TX cadence; instead we sample
-   * gPTP every ~128 ms (SCHED_RESYNC_PKTS packets) and smoothly adjust
-   * a correction-per-packet in nanoseconds. Between samples the cadence
-   * is pure esp_timer-paced with a filtered ppm offset applied. */
-  #define SCHED_RESYNC_PKTS 8192    /* ~1 s between gPTP baselines —
-                                       each sample covers a full ptpd
-                                       servo cycle, reducing per-sample
-                                       noise before it enters the EMA. */
-  #define SCHED_FILTER_SHIFT 3      /* EMA tau ≈ 8 samples × 1 s = ~8 s
-                                       effective smoothing on a low-noise
-                                       per-sample measurement. */
+   * 125 ms servo ripple directly into TX cadence. Sampling every ~1 s
+   * still passed servo phase noise (measured ±12 ppm rate wander with
+   * ~70 s period at the wire). The slip measurement carries a roughly
+   * fixed few-µs noise regardless of baseline length, so a long
+   * baseline attenuates injected wander proportionally: at 60 s the
+   * same noise is ±0.05 ppm. Between samples the cadence is pure
+   * esp_timer-paced with the filtered ppm offset applied.
+   *
+   * Acquire/track split: the first sample uses a short warmup baseline
+   * and is applied directly, so the ~tens-of-ppm crystal offset is
+   * trimmed within seconds; afterwards samples arrive every
+   * CONFIG_ESP_AVB_TALKER_CADENCE_LOCK_INTERVAL_S and enter the EMA
+   * with the per-update step clamped to ±1 ppm. Interval 0 disables
+   * the lock entirely (free-run with gPTP-seeded timestamps). */
+  #define SCHED_FILTER_SHIFT 3       /* EMA tau ≈ 8 lock intervals */
+  #define SCHED_WARMUP_US 4000000LL  /* acquire baseline: ±1 ppm noise */
+  /* ±1 ppm per update, in q16 ns-per-packet: interval_us µs × 1e3 ns/µs
+   * × 1 ppm = interval_us × 0.001 ns. */
+  const int64_t sched_step_max_q16 =
+      ((int64_t)params->interval << 16) / 1000;
+  /* Packets per lock interval; 0 disables the rate lock. */
+  const int64_t sched_resync_pkts =
+      (int64_t)CONFIG_ESP_AVB_TALKER_CADENCE_LOCK_INTERVAL_S * 1000000LL /
+      params->interval;
+  const int64_t sched_warmup_pkts = SCHED_WARMUP_US / params->interval;
+  int64_t sched_pkts_since_sample = 0;
+  bool sched_locked = false; /* false = next sample is an acquire */
   int64_t sched_gptp_ref_ns = 0;
   int64_t sched_esp_ref_us = 0;
   bool sched_ref_valid = false;
@@ -827,7 +843,11 @@ static void avb_stream_out_task(void *task_param) {
       int64_t diff = (int64_t)(ts_b - ts_a);
       if (diff >= 0 && diff < 500000) {
         avtp_media_ts = (uint32_t)ts_a;
-        gptp_cadence_ready = true;
+        /* Arm the filtered gPTP rate lock below only when a lock
+         * interval is configured. At interval 0 the timestamp is still
+         * gPTP-seeded but cadence free-runs on esp_timer (no gPTP
+         * feedback into packet spacing). */
+        gptp_cadence_ready = sched_resync_pkts > 0;
         break;
       }
     }
@@ -863,7 +883,10 @@ static void avb_stream_out_task(void *task_param) {
      * how far off our free-running esp_timer schedule has slipped, and
      * update sched_ns_adj via an EMA. Result: esp_timer-precision
      * cadence with a heavily-filtered rate lock to gPTP. */
-    if (gptp_cadence_ready && (loop_count & (SCHED_RESYNC_PKTS - 1)) == 0) {
+    sched_pkts_since_sample++;
+    if (gptp_cadence_ready &&
+        sched_pkts_since_sample >=
+            (sched_locked ? sched_resync_pkts : sched_warmup_pkts)) {
       struct timespec ts_now;
       if (ptpd_now(&ts_now) == 0) {
         int64_t now_gptp_ns = (int64_t)ts_now.tv_sec * 1000000000LL +
@@ -879,25 +902,57 @@ static void avb_stream_out_task(void *task_param) {
           int64_t gptp_delta = now_gptp_ns - sched_gptp_ref_ns;
           int64_t esp_delta_us = now - sched_esp_ref_us;
           int64_t esp_delta_ns = esp_delta_us * 1000LL;
-          /* Guard against bogus intervals (first tick / gPTP jump). */
-          if (esp_delta_us > 10000 && esp_delta_us < 10000000) {
+          /* Guard against bogus baselines: accept only a window between
+           * half and double the expected span (first tick / stalls). */
+          int64_t expect_us = sched_pkts_since_sample * params->interval;
+          if (esp_delta_us > expect_us / 2 && esp_delta_us < expect_us * 2) {
             int64_t diff_ns = gptp_delta - esp_delta_ns;
-            /* Per-packet correction = accumulated diff over SCHED_RESYNC_PKTS.
-             * Q16 so sub-ns survives. */
-            int64_t sample_q16 = (diff_ns << 16) / SCHED_RESYNC_PKTS;
-            /* Large jump: re-baseline without polluting the filter. */
+            /* Per-packet correction = accumulated diff over the actual
+             * packet count in this window. Q16 so sub-ns survives. */
+            int64_t sample_q16 = (diff_ns << 16) / sched_pkts_since_sample;
+            /* Large jump (gPTP step): re-baseline and drop back to
+             * acquire so the trim recovers in one warmup window instead
+             * of creeping at the tracking clamp rate. */
             int64_t thresh_ns_per_pkt_q16 = (int64_t)1000 << 16; /* 1 µs */
             if (sample_q16 > thresh_ns_per_pkt_q16 ||
                 sample_q16 < -thresh_ns_per_pkt_q16) {
               gptp_resync_count++;
               sched_ns_adj_q16 = 0;
+              sched_locked = false;
+            } else if (!sched_locked) {
+              /* Acquire: apply the warmup measurement directly — it is
+               * dominated by the static crystal offset. The sample is
+               * an absolute rate measurement (raw gPTP vs raw
+               * esp_timer), independent of the currently applied trim.
+               * Bound it to ±100 ppm: any real crystal sits well
+               * inside; beyond that it is a gPTP disturbance mid-warmup,
+               * so re-baseline and retry the acquire next window. */
+              int64_t acquire_max_q16 =
+                  ((int64_t)params->interval << 16) / 10; /* 100 ppm */
+              if (sample_q16 > acquire_max_q16 ||
+                  sample_q16 < -acquire_max_q16) {
+                gptp_resync_count++;
+              } else {
+                sched_ns_adj_q16 = sample_q16;
+                sched_locked = true;
+              }
             } else {
-              /* EMA: new = (old*(2^K-1) + sample) >> K */
-              sched_ns_adj_q16 =
+              /* Track: EMA new = (old*(2^K-1) + sample) >> K, with the
+               * per-update step clamped to ±1 ppm so servo noise cannot
+               * modulate the wire rate faster than that. The sample is
+               * absolute (see acquire above), so it is the EMA target
+               * itself, not a residual on top of the current trim. */
+              int64_t next_q16 =
                   ((sched_ns_adj_q16 *
                     ((1 << SCHED_FILTER_SHIFT) - 1)) +
                    sample_q16) >>
                   SCHED_FILTER_SHIFT;
+              int64_t step_q16 = next_q16 - sched_ns_adj_q16;
+              if (step_q16 > sched_step_max_q16)
+                step_q16 = sched_step_max_q16;
+              else if (step_q16 < -sched_step_max_q16)
+                step_q16 = -sched_step_max_q16;
+              sched_ns_adj_q16 += step_q16;
             }
             /* Track remaining_ns-like stat for diagnostics: the
              * accumulated diff is the slip over the sample window. */
@@ -910,6 +965,7 @@ static void avb_stream_out_task(void *task_param) {
           sched_gptp_ref_ns = now_gptp_ns;
           sched_esp_ref_us = now;
         }
+        sched_pkts_since_sample = 0;
       }
     }
     /* Per-packet advance: nominal interval plus filtered adjustment,

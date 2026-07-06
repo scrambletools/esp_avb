@@ -126,6 +126,32 @@ menu "AVB Configuration"
             disabled, ESP-AVB will not switch its public AVB Lite status on even
             if PTP is running in standard profile.
 
+    config ESP_AVB_TALKER_CADENCE_LOCK_INTERVAL_S
+        int "Talker cadence rate-lock interval (s, 0 = free-run)"
+        default 60
+        range 0 3600
+        depends on ESP_AVB
+        help
+            Rate-lock the audio talker's packet cadence to gPTP by
+            measuring the gPTP-vs-local-timer offset over windows of
+            this many seconds, so long-run sample count tracks the
+            gPTP domain (no cumulative listener drop/dup). The slip
+            measurement carries a roughly fixed few-µs noise per
+            sample, so longer windows inject proportionally less rate
+            wander into packet spacing (1 s windows measured ±12 ppm
+            wander at the wire; 60 s reduces the same noise to
+            ±0.05 ppm). Corrections are additionally clamped to
+            ±1 ppm per update. A short warmup window trims the static
+            crystal offset within seconds of stream start.
+
+            Set to 0 to free-run: cadence is paced purely by the local
+            timer with only the initial media timestamp seeded from
+            gPTP — no gPTP feedback into packet spacing, at the cost
+            of unbounded slow timestamp drift at crystal-offset rate.
+            Use 0 to diagnose listener-side artifacts attributed to
+            cadence modulation, or when an external media-clock chain
+            cannot tolerate any talker-side rate steering.
+
     # ----------------------------------------------------------------
     # Per-port topology — derived from esp_ptp's taxonomy.
     #
