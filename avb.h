@@ -100,13 +100,21 @@
  * flash. Naturally coalesces bursts of marks in one flash write. */
 #define AVB_PERSIST_POLL_MSEC 1000
 /* Maximum age a dirty persist snapshot is allowed to wait while audio
- * streams are active before we force-flush it anyway, accepting a one-
- * shot Class A glitch in exchange for meeting the Milan §5.5.3.6.17
- * "save within 1 second" durability guarantee. Coalescing during the
- * window already happens for free — avb_persist_request_save gathers
- * synchronously on every call, so only one flash write fires per
- * dirty epoch regardless of how many marks land. */
-#define AVB_PERSIST_FORCED_FLUSH_MSEC 1000
+ * streams are active before we force-flush it anyway.
+ *
+ * The snapshot carries only non-critical config (volume, mic gain,
+ * descriptor names, clock source) — stream bindings meet the Milan
+ * §5.5.3.6.17 durability guarantee through the 32-byte journal
+ * appends, which fire immediately at connect/disconnect. So there is
+ * no protocol reason to force a ~1.2 KB blob write mid-stream: the
+ * flash commit disables cache system-wide for tens of ms, starving
+ * the listener drain and the EMAC RX path (a SET_CONTROL volume
+ * change used to go silent 1-2 s later exactly this way, and on
+ * pre-un-wedge-guard firmware the resulting RX overflow could latch
+ * ingress permanently). Defer during streaming; the save lands when
+ * streams stop, or after this ceiling for devices that stream
+ * indefinitely — one bounded glitch per config change at worst. */
+#define AVB_PERSIST_FORCED_FLUSH_MSEC (10 * 60 * 1000)
 
 // Commonly used mac addresses
 #define BCAST_MAC_ADDR                                                         \

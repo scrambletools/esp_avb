@@ -2036,10 +2036,13 @@ void avb_persist_task(void *arg) {
      * also gated for safety since they still drive the PLL.
      *
      * Override: if the snapshot has already waited longer than
-     * AVB_PERSIST_FORCED_FLUSH_MSEC, flush anyway. A binding that
-     * never lands in flash is a worse failure than a one-shot audio
-     * glitch — Milan §5.5.3.6.17 expects the binding to survive a
-     * power cycle "shortly" after the controller acks it. */
+     * AVB_PERSIST_FORCED_FLUSH_MSEC, flush anyway so a device that
+     * streams indefinitely still persists config eventually. Stream
+     * bindings do NOT rely on this path — they meet the Milan
+     * §5.5.3.6.17 durability guarantee via the 32-byte journal
+     * appends at connect/disconnect; the snapshot holds only
+     * non-critical config (volume, names, clock source), so a long
+     * deferral is safe. See AVB_PERSIST_FORCED_FLUSH_MSEC. */
     bool out_streaming = false;
     for (size_t i = 0; i < state->num_output_streams; i++) {
       if (state->output_streams[i].streaming) {
