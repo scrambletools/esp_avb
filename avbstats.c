@@ -18,7 +18,9 @@
 #include "esp_timer.h"
 #include "soc/soc_caps.h"
 #if SOC_EMAC_SUPPORTED
+#include "esp_rom_sys.h" /* esp_rom_delay_us for the RX FIFO recovery */
 #include "soc/emac_dma_struct.h"
+#include "soc/emac_mac_struct.h"
 #endif
 /* L1 instrument: esp_wifi driver/MAC RX counters, available only on a
  * native HE Wi-Fi target (the C6 endpoint). The P4 bridge reaches Wi-Fi
@@ -42,6 +44,93 @@
  * previously embedded in the main loop. Stream-in/out diag state is
  * owned by their respective contexts in avtp.c. */
 static avb_state_s *s_state = NULL;
+
+#if SOC_EMAC_SUPPORTED
+static uint32_t s_emac_kick_count = 0;
+static uint32_t s_emac_toggle_count = 0;
+static uint32_t s_emac_recover_count = 0;
+#endif
+
+/* EMAC RX un-wedge guard — call frequently (main AVB loop).
+ *
+ * Two distinct ingress-death modes recovered here, both triggered by
+ * RX descriptor-exhaustion bursts and both otherwise permanent:
+ *
+ * Case 1 — RX DMA Suspended with free descriptors: the driver's
+ * recovery (free descriptors, then write the receive poll demand) can
+ * lose a race against the DMA's transition into Suspended; the demand
+ * is ignored and a suspended DMA raises no further interrupts.
+ * Re-issuing the poll demand is always safe: with free descriptors the
+ * DMA resumes; with none it re-raises RBU, which wakes the RX task.
+ *
+ * Case 2 — MTL RX FIFO lockup: after a FIFO overflow during the burst
+ * the MTL stops forwarding to the DMA entirely. Observed live state:
+ * receive process "Running: waiting for packet" (RS=3), all
+ * descriptors free, overflow flag latched, interrupt counters frozen
+ * while the wire carries full-rate traffic. The overflow interrupt
+ * summary only edge-triggers, so nothing ever fires again. Recovery
+ * per DWC practice: stop the RX DMA, toggle the MAC receiver enable
+ * (resets the MTL RX FIFO state), restart, poll demand. Detection is
+ * debounced on a stagnant RX buffer pointer so transient overflow
+ * during normal operation never triggers it; a false trigger would
+ * cost ~100 µs of reception, vs. permanent deafness untreated. */
+void avb_emac_rx_unwedge_tick(void) {
+#if SOC_EMAC_SUPPORTED
+  uint32_t status = EMAC_DMA.dmastatus.val;
+  uint32_t recv_state = (status >> 17) & 0x7; /* RS, bits 19:17 */
+
+  /* Case 1: Suspended (descriptor unavailable) = 100b */
+  if (recv_state == 4) {
+    EMAC_DMA.dmarxpolldemand = 1;
+    s_emac_kick_count++;
+    return;
+  }
+
+  /* Case 2: Running-waiting (011b) + latched overflow + stagnant RX
+   * buffer pointer across consecutive passes. The P4 MTL RX FIFO is
+   * only 256 B, forcing threshold mode (store-and-forward cannot fit a
+   * frame), and threshold-mode FIFOs can latch dead after an overflow.
+   * Escalate: first the cheap MAC-receiver toggle; if the pointer is
+   * still stagnant afterwards, a full EMAC core software reset +
+   * reconfigure (emac_esp_rx_full_recover — the only recovery that
+   * rebuilds the FIFO state), rate-limited so a persistent hardware
+   * fault cannot become a reset storm. */
+  static uint32_t last_rx_buf = 0;
+  static uint32_t stagnant_passes = 0;
+  static int64_t last_restart_us = 0;
+  uint32_t cur_rx_buf = EMAC_DMA.dmarxcurraddr_buf;
+  bool overflow_latched = (status & 0x10) != 0;
+  if (recv_state == 3 && overflow_latched && cur_rx_buf == last_rx_buf) {
+    stagnant_passes++;
+    if (stagnant_passes == 3) {
+      /* Cheap attempt: receiver toggle + poll demand. */
+      EMAC_DMA.dmaoperation_mode.start_stop_rx = 0;
+      EMAC_MAC.gmacconfig.rx = 0;
+      esp_rom_delay_us(100);
+      EMAC_MAC.gmacconfig.rx = 1;
+      EMAC_DMA.dmaoperation_mode.start_stop_rx = 1;
+      EMAC_DMA.dmarxpolldemand = 1;
+      s_emac_toggle_count++;
+    } else if (stagnant_passes >= 6) {
+      int64_t now_us = esp_timer_get_time();
+      if (now_us - last_restart_us > 10 * 1000 * 1000) {
+        last_restart_us = now_us;
+        s_emac_recover_count++;
+        /* Full EMAC core reset + reconfigure (local IDF patch). A plain
+         * esp_eth stop/start cannot clear the latched MTL FIFO; only
+         * the DWC software reset does, and it needs the link-up PHY
+         * clocks that are guaranteed present in this state. */
+        extern esp_err_t emac_esp_rx_full_recover(void);
+        emac_esp_rx_full_recover();
+      }
+      stagnant_passes = 0;
+    }
+  } else {
+    stagnant_passes = 0;
+  }
+  last_rx_buf = cur_rx_buf;
+#endif
+}
 
 typedef struct {
   UBaseType_t tn; /* xTaskNumber — stable per task, used to match snapshots */
@@ -255,6 +344,15 @@ static void avb_cpu_stats_tick(void) {
           (unsigned)((dma_miss >> 17) & 0x7FF),
           (unsigned)((dma_miss >> 16) & 1),
           (unsigned)((dma_miss >> 28) & 1));
+  /* RX un-wedge guard activity (see avb_emac_rx_unwedge_tick): all
+   * three counters are 0 in normal operation. Nonzero kicks/toggles
+   * mean the guard caught a suspended DMA; nonzero recovers mean a
+   * full MTL FIFO reset was needed. */
+  avbinfo("  ====> EMAC unwedge kicks=%u toggles=%u recovers=%u rs=%u",
+          (unsigned)s_emac_kick_count,
+          (unsigned)s_emac_toggle_count,
+          (unsigned)s_emac_recover_count,
+          (unsigned)((EMAC_DMA.dmastatus.val >> 17) & 0x7));
 #endif
 
   /* Stream-in (listener) + stream-out (talker) + MCLK / PLL state —

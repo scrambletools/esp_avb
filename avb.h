@@ -913,6 +913,11 @@ void avb_pll_deinit(void);
  * logs stats (including the drift sums maintained by the RX handlers),
  * and applies any due MCLK correction. */
 void avb_pll_tick(avb_state_s *state);
+/* EMAC RX un-wedge guard — re-issues the receive poll demand when the
+ * RX DMA is stuck in Suspended state (lost poll-demand race after a
+ * descriptor-exhaustion burst). Call every main-loop pass; no-op on
+ * targets without an on-chip EMAC. */
+void avb_emac_rx_unwedge_tick(void);
 void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
                                 aem_stream_in_counters_s *counters);
 uint32_t aaf_code_to_sample_rate(uint8_t code);
