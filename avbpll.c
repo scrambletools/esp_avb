@@ -43,6 +43,7 @@
  */
 #include "avb.h"
 #include "esp_timer.h"
+#include "hal/clk_tree_hal.h" /* clk_hal_apll_get_freq_hz readback */
 #include "hal/clk_tree_ll.h" /* CLK_LL_APLL_MIN_HZ */
 #include "soc/rtc.h"      /* rtc_clk_apll_coeff_calc / _set */
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
@@ -66,6 +67,8 @@ static struct {
   uint32_t nominal_apll_hz;  /* = nominal_mclk_hz * mclk_div */
   uint32_t actual_apll_hz;   /* last frequency programmed */
 } s_hw;
+
+static int mclk_hw_tune_ppm_q16(int32_t ppm_q16);
 
 static int mclk_hw_init(uint32_t nominal_mclk_hz) {
 #if SOC_CLK_APLL_SUPPORTED
@@ -126,6 +129,12 @@ static int mclk_hw_tune_ppm_q16(int32_t ppm_q16) {
   }
   rtc_clk_apll_coeff_set(o_div, sdm0, sdm1, sdm2);
   s_hw.actual_apll_hz = real_hz;
+  /* Hardware readback truth-check: the `hw=` figure in the stats line
+   * is derived from actual_apll_hz (bookkeeping); this log line proves
+   * whether the running PLL really moved. One line per correction
+   * cycle (>=30 s apart), so it is not hot-path noise. */
+  ESP_LOGI(TAG, "tune: target=%" PRIu32 " calc=%" PRIu32 " readback=%" PRIu32,
+           target_hz, real_hz, clk_hal_apll_get_freq_hz());
   return 0;
 #else
   (void)ppm_q16;
@@ -165,12 +174,15 @@ static struct {
  * coefficient for sub-ppm noise. */
 #define AVB_PLL_CORRECTION_DEADBAND_Q16 (1 * 65536 / 2) /* 0.5 ppm */
 
-/* How long to let the cumulative window build up before applying a
- * correction. 30 s + gain 0.5 gives an effective PLL time constant of
- * ~60 s — fast enough that a typical ±50 ppm crystal offset converges
- * in a couple of minutes, slow enough that per-window measurement
- * noise averages down to well under a ppm. */
-#define AVB_PLL_CORRECTION_INTERVAL_US (30 * 1000 * 1000)
+/* How long to let the cumulative window build up before folding the
+ * measured error into a new correction target. Config default 30 s +
+ * gain 0.5 gives an effective PLL time constant of ~60 s — fast enough
+ * that a typical ±50 ppm crystal offset converges in a couple of
+ * minutes, slow enough that per-window measurement noise averages down
+ * to well under a ppm. 0 disables corrections entirely (fixed media
+ * clock; measurement continues for diagnostics). */
+#define AVB_PLL_CORRECTION_INTERVAL_US                                         \
+  ((int64_t)CONFIG_ESP_AVB_PLL_CORRECTION_INTERVAL_S * 1000000LL)
 
 /* Proportional gain, Q16. At 1.0 (65536) a single correction would
  * theoretically zero out the observed error — but that also pumps the
@@ -205,19 +217,27 @@ static struct {
  * near nominal than drag it far off on bad data. */
 #define AVB_PLL_MAX_APPLIED_PPM_Q16 ((int32_t)(100 * 65536))
 
-/* Maximum rate-of-change of the applied MCLK correction, in ppm per
- * second, averaged over the correction interval. Milan §7.2 caps this
- * so upstream rate estimators don't mis-track; the spec ceiling is
- * several ppm/s and audibly the ear detects continuous drift well below
- * 5 ppm/s, so 1 ppm/s is a conservative target that also keeps the
- * startup convergence time bounded (a ±75 ppm crystal offset takes at
- * most 75 seconds of active correction to absorb). The per-step clamp
- * below is derived from this so any future retune of the correction
- * interval automatically preserves the rate limit. */
+/* Maximum change of the correction TARGET per correction cycle, in ppm
+ * per second averaged over the correction interval. Milan §7.2 caps
+ * this so upstream rate estimators don't mis-track; the spec ceiling
+ * is several ppm/s so 1 ppm/s is a conservative target that also keeps
+ * startup convergence bounded (a ±75 ppm crystal offset takes at most
+ * 75 seconds of active correction to absorb). The target is never
+ * applied as a step — see the slew clamp below. */
 #define AVB_PLL_MAX_RATE_PPM_PER_SEC 1
 #define AVB_PLL_MAX_STEP_PPM_Q16                                              \
   ((int32_t)(AVB_PLL_MAX_RATE_PPM_PER_SEC *                                   \
              (AVB_PLL_CORRECTION_INTERVAL_US / 1000000) * 65536))
+
+/* Maximum change of the APPLIED value per 5 s tick. Instantaneous MCLK
+ * coefficient steps — even ~1 ppm — can be audible through some
+ * codecs' clocking, while slow continuous drift far below the pitch
+ * JND is not, so the applied value walks toward the target at
+ * ≤0.5 ppm per tick (~0.1 ppm/s). New correction targets are deferred
+ * while a slew is in flight: measurement windows spanning a moving
+ * coefficient are contaminated, so the loop settles, re-baselines,
+ * then measures clean. */
+#define AVB_PLL_SLEW_MAX_PPM_Q16 (65536 / 2) /* 0.5 ppm per tick */
 
 /* Reject clearly-anomalous cumulative measurements — e.g. the cumul
  * briefly explodes to tens of thousands of ppm when gPTP resyncs after
@@ -348,9 +368,12 @@ void avb_pll_print_stats(avb_state_s *state) {
                                ? (int32_t)((int64_t)hw_delta_hz * 1000000LL /
                                            s_hw.nominal_apll_hz)
                                : 0;
+  int32_t target_centippm =
+      (int32_t)(((int64_t)state->media_clock.pll_target_ppm_q16 * 100) >> 16);
   avbinfo("MCLK: crf n=%lu drift=%lldns mean=%ldns min=%ldns max=%ldns | "
           "stream n=%lu drift=%ldns mean=%ldns min=%ldns max=%ldns | "
-          "pll inst=%ld.%02ld cumul=%ld.%02ld applied=%ld.%02ld hw=%ld ppm",
+          "pll inst=%ld.%02ld cumul=%ld.%02ld applied=%ld.%02ld "
+          "tgt=%ld.%02ld hw=%ld ppm",
           crf_n, state->media_clock.crf_last_drift_ns, crf_mean,
           state->media_clock.crf_drift_min_ns,
           state->media_clock.crf_drift_max_ns, stream_n,
@@ -362,6 +385,8 @@ void avb_pll_print_stats(avb_state_s *state) {
           (cumul_centippm < 0 ? -cumul_centippm : cumul_centippm) % 100,
           applied_centippm / 100,
           (applied_centippm < 0 ? -applied_centippm : applied_centippm) % 100,
+          target_centippm / 100,
+          (target_centippm < 0 ? -target_centippm : target_centippm) % 100,
           hw_applied_ppm);
 
   /* Drift-stat windows reset per log; last_* preserved as latest sample */
@@ -429,6 +454,11 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.prev_i2s_bytes = bytes_now;
     s_pll.prev_gptp_ns = gptp_now_ns;
     s_pll.integrator_ppm_q16 = 0; /* I-term: gPTP reset invalidates history */
+    /* Cancel any in-flight slew: its target came from a measurement the
+     * discontinuity just invalidated. The applied value stays (it is
+     * the hardware state); a fresh window decides the next target. */
+    state->media_clock.pll_target_ppm_q16 =
+        state->media_clock.pll_applied_ppm_q16;
     s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
     return;
   }
@@ -479,11 +509,38 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.base_i2s_bytes = bytes_now;
     s_pll.base_gptp_ns = gptp_now_ns;
     s_pll.integrator_ppm_q16 = 0; /* I-term: anomalous input invalidates it */
+    state->media_clock.pll_target_ppm_q16 =
+        state->media_clock.pll_applied_ppm_q16; /* cancel in-flight slew */
     s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
     return;
   }
 
-  if (now_us >= s_pll.next_correction_us &&
+  /* Slew in flight: walk the applied value one bounded step toward the
+   * target and defer new corrections until it lands. On completion,
+   * re-baseline so the next cumulative window measures the corrected
+   * clock only. */
+  int32_t target_q16 = state->media_clock.pll_target_ppm_q16;
+  int32_t applied_q16 = state->media_clock.pll_applied_ppm_q16;
+  if (applied_q16 != target_q16) {
+    int32_t slew_q16 = target_q16 - applied_q16;
+    if (slew_q16 > AVB_PLL_SLEW_MAX_PPM_Q16)
+      slew_q16 = AVB_PLL_SLEW_MAX_PPM_Q16;
+    if (slew_q16 < -AVB_PLL_SLEW_MAX_PPM_Q16)
+      slew_q16 = -AVB_PLL_SLEW_MAX_PPM_Q16;
+    if (mclk_hw_tune_ppm_q16(applied_q16 + slew_q16) == 0) {
+      applied_q16 += slew_q16;
+      state->media_clock.pll_applied_ppm_q16 = applied_q16;
+      if (applied_q16 == target_q16) {
+        s_pll.base_i2s_bytes = bytes_now;
+        s_pll.base_gptp_ns = gptp_now_ns;
+        s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+      }
+    }
+    return;
+  }
+
+  if (AVB_PLL_CORRECTION_INTERVAL_US > 0 &&
+      now_us >= s_pll.next_correction_us &&
       (cumul_ppm_q16 > AVB_PLL_CORRECTION_DEADBAND_Q16 ||
        cumul_ppm_q16 < -AVB_PLL_CORRECTION_DEADBAND_Q16)) {
     /* Accumulate the per-cycle error into the integrator. Random
@@ -508,20 +565,17 @@ void avb_pll_tick(avb_state_s *state) {
       step_q16 = AVB_PLL_MAX_STEP_PPM_Q16;
     if (step_q16 < -AVB_PLL_MAX_STEP_PPM_Q16)
       step_q16 = -AVB_PLL_MAX_STEP_PPM_Q16;
-    int32_t new_applied = state->media_clock.pll_applied_ppm_q16 - step_q16;
-    /* Clamp total applied — anything beyond ±100 ppm is a bad measurement,
+    int32_t new_target = applied_q16 - step_q16;
+    /* Clamp total — anything beyond ±100 ppm is a bad measurement,
      * not a real crystal offset for any commercially sane oscillator. */
-    if (new_applied > AVB_PLL_MAX_APPLIED_PPM_Q16)
-      new_applied = AVB_PLL_MAX_APPLIED_PPM_Q16;
-    if (new_applied < -AVB_PLL_MAX_APPLIED_PPM_Q16)
-      new_applied = -AVB_PLL_MAX_APPLIED_PPM_Q16;
-    if (mclk_hw_tune_ppm_q16(new_applied) == 0) {
-      state->media_clock.pll_applied_ppm_q16 = new_applied;
-      /* Reset baseline so the next cumulative measurement is
-       * relative to the new hardware state. */
-      s_pll.base_i2s_bytes = bytes_now;
-      s_pll.base_gptp_ns = gptp_now_ns;
-    }
+    if (new_target > AVB_PLL_MAX_APPLIED_PPM_Q16)
+      new_target = AVB_PLL_MAX_APPLIED_PPM_Q16;
+    if (new_target < -AVB_PLL_MAX_APPLIED_PPM_Q16)
+      new_target = -AVB_PLL_MAX_APPLIED_PPM_Q16;
+    /* Set the slew destination only — the ticks above walk the applied
+     * value there and re-baseline when it lands. The baseline is not
+     * reset here: the window stays frozen while the slew runs. */
+    state->media_clock.pll_target_ppm_q16 = new_target;
     s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
   }
 

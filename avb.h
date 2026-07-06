@@ -655,6 +655,7 @@ typedef struct avb_state_s {
     int32_t pll_last_ppm_error_q16;       /* last 5 s window, Q16 */
     int32_t pll_cumulative_ppm_error_q16; /* since baseline, Q16 */
     int32_t pll_applied_ppm_q16;          /* last correction written to HW */
+    int32_t pll_target_ppm_q16;           /* slew destination for applied */
 
     /* Milan GET_COUNTERS media_reset counter — bumped by the PLL when
      * gPTP discontinuity detection resets the baseline. Read by

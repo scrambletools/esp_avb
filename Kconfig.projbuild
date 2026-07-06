@@ -152,6 +152,27 @@ menu "AVB Configuration"
             cadence modulation, or when an external media-clock chain
             cannot tolerate any talker-side rate steering.
 
+    config ESP_AVB_PLL_CORRECTION_INTERVAL_S
+        int "Listener media-clock correction interval (s, 0 = fixed clock)"
+        default 30
+        range 0 600
+        depends on ESP_AVB
+        help
+            How often the listener media-clock recovery loop folds the
+            measured byte-rate-vs-reference error into an MCLK (APLL)
+            correction target. The target is never applied as a step:
+            the applied value slews toward it at a bounded rate
+            (~0.1 ppm/s), because instantaneous MCLK steps — even
+            ~1 ppm — can be audible through some codecs' clocking,
+            while slow continuous drift far below the pitch JND is not.
+
+            Set to 0 to never retune MCLK (fixed media clock). The
+            loop keeps measuring and reporting drift for diagnostics;
+            the jitter buffer then absorbs rate mismatch until it
+            drops/dups. Use 0 for codecs that audibly react to any
+            MCLK coefficient change, or to isolate the recovery loop
+            while diagnosing audio artifacts.
+
     # ----------------------------------------------------------------
     # Per-port topology — derived from esp_ptp's taxonomy.
     #
