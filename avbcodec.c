@@ -12,6 +12,7 @@
 #include "avb.h"
 #include "es8311_codec.h"
 #include "es8388_codec.h"
+#include "es8389_codec.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
@@ -37,8 +38,10 @@ static const avb_codec_caps_s s_es8311_caps = {
                        .gain_default_tenth_db = 60},
 };
 
+/* ES8388: 24-bit, max 96 kHz (datasheet); 2-ch ADC/DAC. DAC digital
+ * volume -96..0 dB (0.5 dB step), mic PGA 0..24 dB (3 dB step). */
 static const avb_codec_caps_s s_es8388_caps = {
-    .sample_rates = {.sample_rates = {48000, 96000, 192000}, .num_rates = 3},
+    .sample_rates = {.sample_rates = {48000, 96000}, .num_rates = 2},
     .bit_rates = {.bit_rates = {24}, .num_rates = 1},
     .max_input_channels = 2,
     .max_output_channels = 2,
@@ -48,6 +51,24 @@ static const avb_codec_caps_s s_es8388_caps = {
                        .vol_default_tenth_db = -100,
                        .gain_min_tenth_db = 0,
                        .gain_max_tenth_db = 240,
+                       .gain_step_tenth_db = 30,
+                       .gain_default_tenth_db = 90},
+};
+
+/* ES8389: 24-bit, up to 192 kHz; 2-ch ADC/DAC. DAC digital volume
+ * -95.5..+32 dB (0.5 dB step) and mic PGA 0..36.5 dB (~3 dB step) per
+ * the esp_codec_dev es8389 driver vol_range and PGA gain table. */
+static const avb_codec_caps_s s_es8389_caps = {
+    .sample_rates = {.sample_rates = {48000, 96000, 192000}, .num_rates = 3},
+    .bit_rates = {.bit_rates = {24}, .num_rates = 1},
+    .max_input_channels = 2,
+    .max_output_channels = 2,
+    .control_ranges = {.vol_min_tenth_db = -955,
+                       .vol_max_tenth_db = 320,
+                       .vol_step_tenth_db = 5,
+                       .vol_default_tenth_db = -100,
+                       .gain_min_tenth_db = 0,
+                       .gain_max_tenth_db = 365,
                        .gain_step_tenth_db = 30,
                        .gain_default_tenth_db = 90},
 };
@@ -85,6 +106,8 @@ const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type) {
     return &s_es8311_caps;
   case avb_codec_type_es8388:
     return &s_es8388_caps;
+  case avb_codec_type_es8389:
+    return &s_es8389_caps;
   default:
     return NULL;
   }
@@ -259,6 +282,46 @@ static esp_err_t codec_factory_es8388(avb_state_s *state,
   return ESP_OK;
 }
 
+static esp_err_t codec_factory_es8389(avb_state_s *state,
+                                      i2c_master_bus_handle_t bus,
+                                      const audio_codec_gpio_if_t *gpio_if,
+                                      codec_factory_result_s *out) {
+  const avb_codec_caps_s *caps = avb_codec_get_caps(avb_codec_type_es8389);
+  if (!codec_caps_support_sample_rate(caps, state->config.default_sample_rate)) {
+    ESP_LOGE(TAG, "ES8389: unsupported sample rate %lu",
+             state->config.default_sample_rate);
+    return ESP_FAIL;
+  }
+  audio_codec_i2c_cfg_t i2c_cfg = {.addr = ES8389_CODEC_DEFAULT_ADDR,
+                                   .bus_handle = bus};
+  const audio_codec_ctrl_if_t *ctrl = audio_codec_new_i2c_ctrl(&i2c_cfg);
+  if (!ctrl) {
+    ESP_LOGE(TAG, "ES8389: failed to create I2C control interface");
+    return ESP_FAIL;
+  }
+  /* The hat feeds an external MCLK from the P4 (GPIO16), so use_mclk=true.
+   * That makes the driver run off the provided MCLK in slave mode and skip
+   * its internal MCLK=fs*bits*4 coefficient path (es8389.c set_fs), which
+   * assumes a different ratio than our 384x clock. mclk_div carries the
+   * actual MCLK/LRCK ratio. */
+  es8389_codec_cfg_t cfg = {
+      .ctrl_if = ctrl,
+      .gpio_if = gpio_if,
+      .codec_mode = ESP_CODEC_DEV_WORK_MODE_BOTH,
+      .pa_pin = state->config.codec_pins.pa,
+      .pa_reverted = state->config.codec_pins.pa_reverted,
+      .master_mode = false,
+      .use_mclk = true,
+      .mclk_div = AVB_MCLK_MULTIPLE,
+  };
+  out->codec_if = es8389_codec_new(&cfg);
+  if (!out->codec_if) {
+    ESP_LOGE(TAG, "ES8389: failed to create codec interface");
+    return ESP_FAIL;
+  }
+  return ESP_OK;
+}
+
 /* Configure the codec selected by state->config.codec_type.
  *
  * Generic shell handles I2C bus + GPIO + sample-format/enable + AECP control
@@ -312,6 +375,9 @@ esp_err_t avb_config_codec(avb_state_s *state) {
     break;
   case avb_codec_type_es8388:
     err = codec_factory_es8388(state, bus, gpio_if, &result);
+    break;
+  case avb_codec_type_es8389:
+    err = codec_factory_es8389(state, bus, gpio_if, &result);
     break;
   default:
     ESP_LOGE(TAG, "Unsupported codec type: %d", state->config.codec_type);

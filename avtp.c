@@ -2090,19 +2090,61 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
 
 /* Stream Output (Talker) */
 
-/* CRF media-clock output task (talker). Sends one AudioSample CRF timestamp
- * per PDU using the Milan-compatible 48 kHz profile advertised in AEM. */
-static void avb_crf_stream_out_task(void *task_param) {
-  struct stream_out_params_s *params = (struct stream_out_params_s *)task_param;
-  if (!params) {
-    vTaskDelete(NULL);
-    return;
-  }
-  avb_state_s *state = (avb_state_s *)params->state;
-  uint8_t frame[TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + 28] = {0};
-  uint8_t *avtp = frame + TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN;
-  uint8_t seq_num = 0;
+/* CRF media-clock output (talker). Sends one AudioSample CRF timestamp per PDU
+ * using the Milan-compatible 48 kHz profile advertised in AEM.
+ *
+ * Paced by a 2 ms esp_timer (task dispatch), NOT a busy-wait task: at the
+ * 100 Hz FreeRTOS tick a task cannot sleep for 2 ms, so the previous task spun
+ * on esp_timer_get_time() at near-max priority (configMAX_PRIORITIES-2, core 1).
+ * That second RT spinner alongside the audio talker could starve the gPTP loop
+ * long enough to trip the AVB Lite fallback and drop the endpoint out of the
+ * clock domain. The timer callback runs on the esp_timer task and only stamps +
+ * transmits one frame -- the same approach ptpd uses to pace Pdelay_Req. */
 
+struct avb_crf_out_ctx_s {
+  esp_timer_handle_t timer;
+  esp_eth_handle_t eth_handle;
+  uint16_t stream_index;
+  uint8_t seq_num;
+  size_t frame_len;
+  uint8_t frame[TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + 28];
+};
+
+/* Single CRF output stream (AVB_DEFAULT_CRF_OUTPUT_INDEX). */
+static struct avb_crf_out_ctx_s *s_crf_out;
+
+static void avb_crf_send_cb(void *arg) {
+  struct avb_crf_out_ctx_s *ctx = (struct avb_crf_out_ctx_s *)arg;
+  uint8_t *avtp = ctx->frame + TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN;
+
+  struct timespec ts;
+  uint64_t crf_ts_ns = 0;
+  if (ptpd_now(&ts) == 0) {
+    crf_ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  }
+  avtp[2] = ctx->seq_num++;
+  for (int i = 0; i < 8; i++) {
+    avtp[27 - i] = (uint8_t)(crf_ts_ns & 0xFF);
+    crf_ts_ns >>= 8;
+  }
+  avb_net_transmit_raw(ctx->eth_handle, ctx->frame, ctx->frame_len);
+}
+
+/* Build the CRF frame header and start the 2 ms send timer. Consumes params
+ * (frees it on both success and failure). */
+static int avb_crf_stream_out_start(avb_state_s *state,
+                                    struct stream_out_params_s *params) {
+  struct avb_crf_out_ctx_s *ctx = calloc(1, sizeof(*ctx));
+  if (!ctx) {
+    free(params);
+    return ERROR;
+  }
+  ctx->eth_handle = params->eth_handle;
+  ctx->stream_index = params->stream_index;
+  ctx->frame_len = TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + 28;
+
+  uint8_t *frame = ctx->frame;
+  uint8_t *avtp = frame + TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN;
   memcpy(frame, &params->dest_addr, ETH_ADDR_LEN);
   memcpy(frame + ETH_ADDR_LEN, state->port[0].internal_mac_addr, ETH_ADDR_LEN);
   frame[12] = 0x81;
@@ -2129,34 +2171,26 @@ static void avb_crf_stream_out_task(void *task_param) {
   avtp[18] = 0x00;
   avtp[19] = 0x60; /* timestamp_interval = 96 samples */
 
-  int64_t next_send_time = esp_timer_get_time();
-  avbinfo("CRF stream out %d started", params->stream_index);
-  while (!state->output_streams[params->stream_index].stop_streaming) {
-    while (esp_timer_get_time() < next_send_time) {
-    }
-    int64_t now = esp_timer_get_time();
-    if (now - next_send_time > 20000) {
-      next_send_time = now + 2000;
-    } else {
-      next_send_time += 2000; /* 96 samples @ 48 kHz */
-    }
-
-    struct timespec ts;
-    uint64_t crf_ts_ns = 0;
-    if (ptpd_now(&ts) == 0) {
-      crf_ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-    }
-    avtp[2] = seq_num++;
-    for (int i = 0; i < 8; i++) {
-      avtp[27 - i] = (uint8_t)(crf_ts_ns & 0xFF);
-      crf_ts_ns >>= 8;
-    }
-    avb_net_transmit_raw(params->eth_handle, frame, sizeof(frame));
-  }
-
-  avbinfo("CRF stream out %d stopped", params->stream_index);
   free(params);
-  vTaskDelete(NULL);
+
+  const esp_timer_create_args_t targs = {
+      .callback = avb_crf_send_cb,
+      .arg = ctx,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "avb_crf_out",
+  };
+  if (esp_timer_create(&targs, &ctx->timer) != ESP_OK) {
+    free(ctx);
+    return ERROR;
+  }
+  s_crf_out = ctx;
+  if (esp_timer_start_periodic(ctx->timer, 2000 /* us = 2 ms */) != ESP_OK) {
+    esp_timer_delete(ctx->timer);
+    free(ctx);
+    s_crf_out = NULL;
+    return ERROR;
+  }
+  return OK;
 }
 
 /* Start the AVB stream output task (talker)
@@ -2211,10 +2245,12 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   params->format_subtype = fmt->aaf_pcm.subtype; // 0=61883, 2=AAF, 4=CRF
 
   if (params->format_subtype == avtp_subtype_crf) {
+    if (avb_crf_stream_out_start(state, params) != OK) {
+      return ERROR; /* helper freed params */
+    }
     state->output_streams[index].stop_streaming = false;
     state->output_streams[index].streaming = true;
-    xTaskCreatePinnedToCore(avb_crf_stream_out_task, "AVB-CRF-OUT", 4096,
-                            (void *)params, configMAX_PRIORITIES - 2, NULL, 1);
+    avbinfo("CRF stream out %d started", index);
     return OK;
   }
 
@@ -2266,6 +2302,13 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
 int avb_stop_stream_out(avb_state_s *state, uint16_t index) {
   state->output_streams[index].stop_streaming = true;
   state->output_streams[index].streaming = false;
+  if (s_crf_out && s_crf_out->stream_index == index) {
+    /* Tear down the CRF media-clock send timer (see avb_crf_send_cb). */
+    esp_timer_stop(s_crf_out->timer);
+    esp_timer_delete(s_crf_out->timer);
+    free(s_crf_out);
+    s_crf_out = NULL;
+  }
   avbinfo("Stream out %d stopped", index);
   return OK;
 }

@@ -177,7 +177,7 @@ static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
         AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
                                  channels_per_stream);
     avtp_stream_format_aaf_pcm_s aaf =
-        AVB_DEFAULT_FORMAT_AAF(32, avb_aaf_rate_from_hz(hz),
+        AVB_DEFAULT_FORMAT_AAF(24, avb_aaf_rate_from_hz(hz),
                                channels_per_stream, false);
     uint16_t spf = avb_samples_per_frame_from_hz(hz);
     aaf.samples_per_frame_h = (spf >> 8) & 0x03;
@@ -569,7 +569,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
       state->supported_sample_rates.num_rates,
       state->config.channels_per_stream);
   avtp_stream_format_aaf_pcm_s format = AVB_DEFAULT_FORMAT_AAF(
-      32, avb_aaf_rate_from_hz(state->config.default_sample_rate),
+      24, avb_aaf_rate_from_hz(state->config.default_sample_rate),
       state->config.channels_per_stream, false);
 
   // setup listener stream flags, and stream info flags, default vlan id and

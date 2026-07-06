@@ -67,7 +67,8 @@ typedef enum {
 /* Codec types */
 typedef enum {
   avb_codec_type_es8311, // Everest Semiconductor ES8311
-  avb_codec_type_es8388  // Everest Semiconductor ES8388
+  avb_codec_type_es8388, // Everest Semiconductor ES8388
+  avb_codec_type_es8389  // Everest Semiconductor ES8389
 } avb_codec_type_t;
 
 /* Codec control ranges (in tenths of dB for AECP control values) */
