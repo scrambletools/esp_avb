@@ -631,14 +631,20 @@ msrp_talker_find_or_insert(int port, const unique_id_t *stream_id,
 bool mrp_talker_advertise_active(int port, const unique_id_t *stream_id) {
   msrp_talker_entry_t *e =
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
-  return e != NULL && e->sm.registrar == mrp_registrar_in;
+  /* LV counts as registered: per 802.1Q the Registrar deregisters only
+   * when the LeaveTimer expires into MT. Treating leave-pending as
+   * gone made the listener declaration flap AskingFailed for the
+   * LeaveTimer window after every peer LeaveAll cycle. */
+  return e != NULL && (e->sm.registrar == mrp_registrar_in ||
+                       e->sm.registrar == mrp_registrar_lv);
 }
 
 bool mrp_talker_failed_active(int port, const unique_id_t *stream_id,
                               uint8_t *failure_code_out) {
   msrp_talker_entry_t *e =
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_failed);
-  if (e == NULL || e->sm.registrar != mrp_registrar_in) {
+  if (e == NULL || (e->sm.registrar != mrp_registrar_in &&
+                    e->sm.registrar != mrp_registrar_lv)) {
     return false;
   }
   if (failure_code_out) {
@@ -1367,23 +1373,44 @@ static void mrp_on_domain_registrar_change(avb_state_s *state, int port,
 #endif
 }
 
-/* Dispatch rLA to every SM on this port. Called when a received
- * MRPDU carries the LeaveAll bit. */
-static void msrp_dispatch_leaveall(int port) {
-  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
-    if (s_msrp_talkers[port][i].valid) {
-      mrp_sm_step(&s_msrp_talkers[port][i].sm, mrp_event_r_la);
+/* Dispatch rLA to the SMs of ONE attribute type on this port.
+ *
+ * Per 802.1Q §10.7.6 a LeaveAll event applies to all attributes of
+ * the ASSOCIATED ATTRIBUTE TYPE only — not the whole port. Peers
+ * (macOS in particular) split a LeaveAll cycle across several MRPDUs,
+ * e.g. a Domain-only PDU carrying its own LeaveAll bit right after
+ * the talker PDU re-joined its streams. A port-wide dispatch here
+ * knocked the TalkerAdvertise registrar back to LV from a PDU that
+ * contained no talker re-join, and the next periodic listener
+ * re-declaration flapped Ready→AskingFailed, pausing the peer talker
+ * for seconds every LeaveAll cycle. */
+static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
+  switch (attr_type) {
+  case msrp_attr_type_talker_advertise:
+  case msrp_attr_type_talker_failed:
+    for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+      if (s_msrp_talkers[port][i].valid &&
+          s_msrp_talkers[port][i].attr_type == attr_type) {
+        mrp_sm_step(&s_msrp_talkers[port][i].sm, mrp_event_r_la);
+      }
     }
-  }
-  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
-    if (s_msrp_listeners[port][i].valid) {
-      mrp_sm_step(&s_msrp_listeners[port][i].sm, mrp_event_r_la);
+    break;
+  case msrp_attr_type_listener:
+    for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
+      if (s_msrp_listeners[port][i].valid) {
+        mrp_sm_step(&s_msrp_listeners[port][i].sm, mrp_event_r_la);
+      }
     }
-  }
-  for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
-    if (s_msrp_domains[port][i].valid) {
-      mrp_sm_step(&s_msrp_domains[port][i].sm, mrp_event_r_la);
+    break;
+  case msrp_attr_type_domain:
+    for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
+      if (s_msrp_domains[port][i].valid) {
+        mrp_sm_step(&s_msrp_domains[port][i].sm, mrp_event_r_la);
+      }
     }
+    break;
+  default:
+    break;
   }
 }
 
@@ -1470,7 +1497,7 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
 
   int offset = 0;
   msrp_attr_header_s header;
-  bool leaveall_dispatched = false;
+  uint8_t leaveall_types = 0; /* bitmask of attr types already dispatched */
 
   while ((size_t)offset + sizeof(msrp_attr_header_s) <=
          sizeof(msg->messages_raw)) {
@@ -1480,10 +1507,12 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
 
     size_t attr_size = octets_to_uint(header.attr_list_len, 2) + 4;
 
-    /* LeaveAll bit fires once per PDU, applies to all SMs on this port. */
-    if (header.vechead_leaveall && !leaveall_dispatched) {
-      msrp_dispatch_leaveall(port);
-      leaveall_dispatched = true;
+    /* LeaveAll fires once per attribute type per PDU and applies only
+     * to that type's SMs (see msrp_dispatch_leaveall). */
+    if (header.vechead_leaveall && header.attr_type < 8 &&
+        !(leaveall_types & (1u << header.attr_type))) {
+      msrp_dispatch_leaveall(port, header.attr_type);
+      leaveall_types |= (1u << header.attr_type);
     }
 
     switch (header.attr_type) {
