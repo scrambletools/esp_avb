@@ -1240,7 +1240,27 @@ typedef struct {
 } jitter_ring_t;
 
 #define JITTER_RING_SIZE 16384
-#define JITTER_PREFILL   576    /* ~2 ms at 48 kHz stereo 24-bit */
+/* Startup prefill = the ring's operating fill = listener-internal
+ * latency (~28 ms at 48 kHz stereo 24-bit). This must be a substantial
+ * fraction of the ring, not a token couple of ms, for two reasons:
+ *
+ *   1. Media-clock sensor validity. The PLL measures bytes delivered
+ *      to I2S DMA. That rate equals the LOCAL playout rate only while
+ *      the DMA stays backpressured, which requires the drain to always
+ *      have material — i.e. ring fill > 0 with margin. With a ~2 ms
+ *      prefill the ring ran empty, the DMA never filled, and the
+ *      byte counter tracked the TALKER's arrival rate instead: the
+ *      PLL saw zero response to MCLK retune and ramped its correction
+ *      to the clamp (observed: +37 ppm applied, inst pinned at the
+ *      talker offset). Half-ring fill buys ~19 min of backpressured
+ *      operation even at 25 ppm of uncorrected clock mismatch —
+ *      orders more than the PLL needs to lock.
+ *
+ *   2. Stall absorption. The ring is sized to ride out flash-cache
+ *      -disable windows (≤50 ms); the cushion actually available is
+ *      the operating fill, not the ring capacity.
+ */
+#define JITTER_PREFILL   8192   /* ~28 ms at 48 kHz stereo 24-bit */
 
 static inline uint32_t ring_readable(const jitter_ring_t *r) {
   return atomic_load_explicit(&r->head, memory_order_acquire) -
@@ -1315,6 +1335,21 @@ typedef struct {
   uint32_t media_locked_count;
   uint32_t media_unlocked_count;
   bool ever_locked;
+  bool drain_locked; /* playout gate passed; owned by the drain callback */
+  /* Presentation-time playout gate. Producer (RX handler) anchors the
+   * first packet written into an EMPTY ring — its first byte sits at
+   * ring tail, so its avtp_timestamp is the presentation time of the
+   * next byte the drain will emit. Consumer (drain) holds playout
+   * until gPTP reaches that timestamp plus the configured extra
+   * latency. gate_armed is the release/acquire hand-off for the two
+   * plain fields. */
+  _Atomic bool gate_armed;
+  uint32_t gate_avtp_ts;  /* anchor packet's avtp_timestamp (ns, 32-bit) */
+  int64_t gate_arm_us;    /* esp_timer at anchor capture (staleness guard) */
+  /* gate diagnostics — written once per lock by drain, read by stats */
+  volatile uint8_t diag_gate_mode;   /* 0=never locked, 1=presentation, 2=prefill */
+  volatile int32_t diag_gate_err_ns; /* start lateness vs target (pt mode) */
+  volatile uint32_t diag_gate_fill;  /* ring fill at playout start */
   volatile int64_t last_packet_us;    /* esp_timer at most recent packet RX */
   /* first-packet snapshot (written by handler, printed by main loop) */
   uint8_t diag_subtype;
@@ -1388,26 +1423,76 @@ static void stream_in_drain_cb(void *arg) {
   if (!ctx)
     return;
 
-  /* Hold the drain off until the ring has reached the startup prefill.
-   * The resulting fill depth becomes the deterministic listener-internal
-   * latency from packet arrival to DAC output. */
-  static bool locked = false;
-  if (!locked) {
-    if (ring_readable(&ctx->ring) < JITTER_PREFILL)
+  /* Playout gate. Primary mode: presentation-time-driven — hold the
+   * drain until gPTP reaches the anchor packet's avtp_timestamp plus
+   * the configured extra latency (minus the output-pipeline delay).
+   * The byte at ring tail then hits the DAC at its presentation time
+   * + EXTRA_LATENCY, deterministically: every listener with the same
+   * setting plays in sample-accurate sync. Fallback mode (no anchor:
+   * tu=1 stream, no valid gPTP, stale anchor, or ring pressure):
+   * byte-prefill gate, which gives arrival-relative latency only.
+   * Gate state lives in ctx so a stream restart re-gates freshly. */
+#define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
+#define GATE_ANCHOR_STALE_US (2 * 1000 * 1000) /* 32-bit ns wrap guard */
+  if (!ctx->drain_locked) {
+    uint32_t fill = ring_readable(&ctx->ring);
+    if (fill == 0)
       return;
-    locked = true;
+    bool start = false;
+    bool pt_mode = false;
+    int32_t pt_err_ns = 0;
+    if (atomic_load_explicit(&ctx->gate_armed, memory_order_acquire)) {
+      struct timespec now_ts;
+      int64_t anchor_age_us = esp_timer_get_time() - ctx->gate_arm_us;
+      if (anchor_age_us > GATE_ANCHOR_STALE_US) {
+        /* Anchor older than half the 32-bit ns wrap: comparison is
+         * ambiguous. Fall back to prefill. */
+        if (fill >= JITTER_PREFILL)
+          start = true;
+      } else if (ptpd_now(&now_ts) == 0) {
+        uint32_t now32 = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
+                                    (uint64_t)now_ts.tv_nsec);
+        uint32_t target = ctx->gate_avtp_ts +
+                          (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US *
+                                     1000U) -
+                          STREAM_IN_OUTPUT_DELAY_NS;
+        int32_t diff = (int32_t)(now32 - target);
+        if (diff >= 0) { /* target reached (or anchor already late) */
+          start = true;
+          pt_mode = true;
+          pt_err_ns = diff;
+        }
+      } else if (fill >= JITTER_PREFILL) {
+        start = true; /* no gPTP yet — arrival-relative fallback */
+      }
+    } else if (fill >= JITTER_PREFILL) {
+      start = true; /* no trustworthy anchor — arrival-relative fallback */
+    }
+    /* Ring-pressure escape: never let the gate hold so long that the
+     * producer starts dropping. */
+    if (!start && fill > (3 * ctx->ring.capacity) / 4)
+      start = true;
+    if (!start)
+      return;
+    ctx->drain_locked = true;
     if (!ctx->ever_locked) {
       ctx->ever_locked = true;
     }
     ctx->media_locked_count++;
+    /* No logging here (esp_timer task) — stash for the stats printer. */
+    ctx->diag_gate_mode = pt_mode ? 1 : 2;
+    ctx->diag_gate_err_ns = pt_err_ns;
+    ctx->diag_gate_fill = fill;
   }
 
   uint32_t avail = ring_readable(&ctx->ring);
   if (avail == 0) {
     ctx->drain_underrun++;
-    /* Ring drained — probably lost stream. Next packet arrival will
-     * rebuild to prefill before draining resumes. */
-    locked = false;
+    /* Ring drained — probably lost stream. Re-arm the presentation
+     * anchor so the next packet re-gates playout at its own
+     * presentation time (resync) instead of resuming arbitrarily. */
+    ctx->drain_locked = false;
+    atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
     if (ctx->ever_locked) {
       ctx->media_unlocked_count++;
       ctx->ever_locked = false;
@@ -1622,6 +1707,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * across. AM824 prefixes a label byte; skip it. Extra channels are
    * ignored. */
   uint32_t total = (uint32_t)samples * 6; /* stereo 24-bit */
+  uint32_t pre_fill = ring_readable(&ctx->ring);
   if (total > 0 && ring_writable(&ctx->ring) >= total) {
     uint32_t h = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
     uint32_t mask = ctx->ring.capacity - 1;
@@ -1662,6 +1748,20 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->ring_write_ok++;
     if (!ctx->diag_i2s_bytes)
       ctx->diag_i2s_bytes = (int)total;
+    /* Presentation anchor: first packet into an empty ring with a
+     * trustworthy timestamp (tu clear). Its first byte is at ring
+     * tail, so its avtp_timestamp is the presentation time of the
+     * drain's next byte. tu=1 packets never arm — the drain then
+     * falls back to the byte-prefill gate. */
+    if (pre_fill == 0 && !(avtp_data[3] & 0x01) &&
+        !atomic_load_explicit(&ctx->gate_armed, memory_order_relaxed)) {
+      ctx->gate_avtp_ts = ((uint32_t)avtp_data[12] << 24) |
+                          ((uint32_t)avtp_data[13] << 16) |
+                          ((uint32_t)avtp_data[14] << 8) |
+                          (uint32_t)avtp_data[15];
+      ctx->gate_arm_us = esp_timer_get_time();
+      atomic_store_explicit(&ctx->gate_armed, true, memory_order_release);
+    }
   } else if (total > 0) {
     ctx->ring_write_fail++;
   }
@@ -1720,7 +1820,8 @@ void avb_stream_in_print_diag(void) {
   uint32_t rx_drops = avb_net_stream_rx_drops();
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
-          "qfill=%lu id_skip=%lu seq_gap=%lu rx_drops=%lu locked=%lu/%lu",
+          "qfill=%lu id_skip=%lu seq_gap=%lu rx_drops=%lu locked=%lu/%lu "
+          "gate=%s(err=%ldns fill=%lu)",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -1731,7 +1832,11 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)ctx->seq_num_mismatch,
           (unsigned long)rx_drops,
           (unsigned long)ctx->media_locked_count,
-          (unsigned long)ctx->media_unlocked_count);
+          (unsigned long)ctx->media_unlocked_count,
+          ctx->diag_gate_mode == 1   ? "pt"
+          : ctx->diag_gate_mode == 2 ? "prefill"
+                                     : "none",
+          (long)ctx->diag_gate_err_ns, (unsigned long)ctx->diag_gate_fill);
   last_pkt = packets;
   last_ok = ok;
   last_fail = fail;
