@@ -2314,15 +2314,18 @@ static int avb_crf_stream_out_start(avb_state_s *state,
   avtp[1] = 0x80; /* sv=1, version=0 */
   avtp[3] = 0x00;
   memcpy(avtp + 4, &params->stream_id, UNIQUE_ID_LEN);
-  /* pull=0 (1.0x), base_frequency=48000 */
-  avtp[12] = 0x00;
-  avtp[13] = 0x00;
-  avtp[14] = 0xBB;
-  avtp[15] = 0x80;
+  /* pull=0 (1.0x), base_frequency = configured sample rate; the
+   * timestamp_interval keeps the 500 PDU/s cadence (96 samples @48 kHz) */
+  uint32_t crf_rate = state->config.default_sample_rate;
+  uint16_t crf_interval = (uint16_t)(crf_rate / 500);
+  avtp[12] = (crf_rate >> 24) & 0x1F;
+  avtp[13] = (crf_rate >> 16) & 0xFF;
+  avtp[14] = (crf_rate >> 8) & 0xFF;
+  avtp[15] = crf_rate & 0xFF;
   avtp[16] = 0x00;
   avtp[17] = 0x08; /* one 64-bit timestamp */
-  avtp[18] = 0x00;
-  avtp[19] = 0x60; /* timestamp_interval = 96 samples */
+  avtp[18] = (crf_interval >> 8) & 0xFF;
+  avtp[19] = crf_interval & 0xFF;
 
   free(params);
 

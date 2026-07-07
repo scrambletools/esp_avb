@@ -19,8 +19,12 @@
 #include <stdatomic.h>    /* media-clock byte counter in i2s_tx_on_sent_cb */
 
 #define I2C_NUM (0)
+/* MCLK/fs ratio. 384 keeps MCLK at 18.432/36.864 MHz through 96 kHz; at
+ * 192 kHz drop to 192 (still 24-bit compatible: divisible by 3) so MCLK
+ * stays at 36.864 MHz instead of an infeasible 73.7 MHz. */
+#define AVB_MCLK_MULTIPLE_FOR_RATE(rate) ((rate) > 96000 ? 192 : 384)
 #define AVB_MCLK_MULTIPLE                                                      \
-  (384) // If not using 24-bit data width, 256 should be enough
+  AVB_MCLK_MULTIPLE_FOR_RATE(state->config.default_sample_rate)
 
 #define TAG "AVB-CODEC"
 

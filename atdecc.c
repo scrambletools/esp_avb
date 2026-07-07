@@ -473,7 +473,8 @@ int avb_send_aecp_rsp_read_descr_stream(avb_state_s *state,
       (!is_output && index == avb_get_crf_input_index(state)) ||
       (is_output && index == avb_get_crf_output_index(state));
   avtp_stream_format_s crf_format = {0};
-  uint8_t crf_bytes[8] = AVB_CRF_AUDIO_SAMPLE_48K_FORMAT_BYTES;
+  uint8_t crf_bytes[8];
+  avb_crf_format_for_rate(state->config.default_sample_rate, crf_bytes);
   memcpy(&crf_format, crf_bytes, sizeof(crf_bytes));
 
   const avtp_stream_format_s *formats_list;
@@ -2184,7 +2185,8 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
         (is_output && index == avb_get_crf_output_index(state));
     bool format_supported = false;
     if (is_crf_stream) {
-      uint8_t crf_bytes[8] = AVB_CRF_AUDIO_SAMPLE_48K_FORMAT_BYTES;
+      uint8_t crf_bytes[8];
+      avb_crf_format_for_rate(state->config.default_sample_rate, crf_bytes);
       if (memcmp(requested, crf_bytes, sizeof(crf_bytes)) == 0)
         format_supported = true;
     } else {

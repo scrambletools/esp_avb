@@ -609,9 +609,11 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
       memcpy(&state->input_streams[i], &input_stream,
              sizeof(avb_listener_stream_s));
     }
-    /* CRF input carries the IEEE 1722 CRF media-clock format */
+    /* CRF input carries the IEEE 1722 CRF media-clock format at the
+     * configured sample rate */
     uint16_t crf_index = avb_get_crf_input_index(state);
-    uint8_t crf_bytes[8] = AVB_CRF_AUDIO_SAMPLE_48K_FORMAT_BYTES;
+    uint8_t crf_bytes[8];
+    avb_crf_format_for_rate(state->config.default_sample_rate, crf_bytes);
     memset(&state->input_streams[crf_index].stream_format, 0,
            sizeof(avtp_stream_format_s));
     memcpy(&state->input_streams[crf_index].stream_format, crf_bytes,
@@ -639,14 +641,16 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
       /* Stream dest addr will be set by MAAP after address acquisition */
       memset(&state->output_streams[i].stream_dest_addr, 0, ETH_ADDR_LEN);
     }
-    /* CRF output carries the IEEE 1722 CRF media-clock format */
+    /* CRF output carries the IEEE 1722 CRF media-clock format at the
+     * configured sample rate */
     uint16_t crf_out_index = avb_get_crf_output_index(state);
     if (crf_out_index < state->num_output_streams) {
-      uint8_t crf_bytes[8] = AVB_CRF_AUDIO_SAMPLE_48K_FORMAT_BYTES;
+      uint8_t crf_out_bytes[8];
+      avb_crf_format_for_rate(state->config.default_sample_rate, crf_out_bytes);
       memset(&state->output_streams[crf_out_index].stream_format, 0,
              sizeof(avtp_stream_format_s));
-      memcpy(&state->output_streams[crf_out_index].stream_format, crf_bytes,
-             sizeof(crf_bytes));
+      memcpy(&state->output_streams[crf_out_index].stream_format, crf_out_bytes,
+             sizeof(crf_out_bytes));
     }
   }
 
@@ -662,7 +666,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // bypass the s_state-> stores on at least one build.
   if (state->port[0].medium == avb_port_medium_eth_hwts) {
     struct ptpd_status_s ptp_status;
-    if (ptpd_status(0, &ptp_status) == 0) {
+      if (ptpd_status(0, &ptp_status) == 0) {
       state->ptp_status = ptp_status;
       avb_update_avb_lite_from_ptp(state);
     }
@@ -1542,7 +1546,8 @@ static bool avb_persist_stream_format_supported(avb_state_s *state,
       (is_output && index == avb_get_crf_output_index(state));
 
   if (is_crf_stream) {
-    uint8_t crf_bytes[8] = AVB_CRF_AUDIO_SAMPLE_48K_FORMAT_BYTES;
+    uint8_t crf_bytes[8];
+    avb_crf_format_for_rate(state->config.default_sample_rate, crf_bytes);
     return memcmp(format, crf_bytes, sizeof(crf_bytes)) == 0;
   }
 

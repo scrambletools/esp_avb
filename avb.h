@@ -144,6 +144,21 @@
 #define AVB_CRF_AUDIO_SAMPLE_48K_FORMAT_BYTES                                  \
   {0x04, 0x10, 0x60, 0x01, 0x00, 0x00, 0xBB, 0x80}
 
+/* Build the 8-byte CRF AudioSample stream format for a base sample rate.
+ * timestamp_interval keeps the 500 PDU/s cadence (96 samples @48 kHz,
+ * 192 @96 kHz, 384 @192 kHz), timestamps_per_pdu=1, pull=0 (1.0x). */
+static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
+  uint16_t interval = (uint16_t)(rate / 500);
+  out[0] = 0x04;
+  out[1] = 0x10 | ((interval >> 8) & 0x0F);
+  out[2] = interval & 0xFF;
+  out[3] = 0x01;
+  out[4] = (rate >> 24) & 0x1F;
+  out[5] = (rate >> 16) & 0xFF;
+  out[6] = (rate >> 8) & 0xFF;
+  out[7] = rate & 0xFF;
+}
+
 /* Poll interval for checking for incoming frames on L2TAP FDs */
 #define AVB_POLL_INTERVAL_MS 1
 
