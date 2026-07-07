@@ -161,6 +161,9 @@ static struct {
   int64_t next_print_us;
   int64_t next_correction_us;
   int32_t integrator_ppm_q16;  /* accumulated bias that P-term can't see */
+  /* (gPTP, bytes) pair-sampling health — see read_sample */
+  uint32_t sample_retries;
+  uint32_t sample_spread_max_us;
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -320,9 +323,29 @@ static bool read_sample(avb_state_s *state, uint64_t *bytes_out,
     return true;
   }
 
-  /* Default / AVB_CLOCK_SOURCE_INTERNAL */
-  uint64_t bytes = atomic_load_explicit(&state->media_clock.i2s_bytes_written,
-                                        memory_order_relaxed);
+  /* Default / AVB_CLOCK_SOURCE_INTERNAL.
+   *
+   * The (gPTP, byte-counter) pair must be sampled back-to-back: any
+   * preemption between the two reads shifts bytes relative to the time
+   * window and shows up as a positive rate spike (a ~550 µs preemption
+   * over a 5 s window read as ~+110 ppm — observed periodically before
+   * this guard). Bound the pair with esp_timer and retry when the
+   * sampling spread says we were interrupted. */
+  uint64_t bytes = 0;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    int64_t t0 = esp_timer_get_time();
+    if (ptpd_now(&gptp) != 0)
+      return false;
+    bytes = atomic_load_explicit(&state->media_clock.i2s_bytes_written,
+                                 memory_order_relaxed);
+    int64_t spread_us = esp_timer_get_time() - t0;
+    if (spread_us <= 50)
+      break;
+    s_pll.sample_retries++;
+    if (spread_us > s_pll.sample_spread_max_us)
+      s_pll.sample_spread_max_us = (uint32_t)spread_us;
+  }
+  local_ns = (uint64_t)gptp.tv_sec * 1000000000ULL + (uint64_t)gptp.tv_nsec;
   *bytes_out = bytes;
   *gptp_ns_out = local_ns;
   return true;
@@ -388,6 +411,11 @@ void avb_pll_print_stats(avb_state_s *state) {
           target_centippm / 100,
           (target_centippm < 0 ? -target_centippm : target_centippm) % 100,
           hw_applied_ppm);
+  if (s_pll.sample_retries) {
+    avbinfo("MCLK: sample-pair retries=%u max_spread=%uus",
+            (unsigned)s_pll.sample_retries,
+            (unsigned)s_pll.sample_spread_max_us);
+  }
 
   /* Drift-stat windows reset per log; last_* preserved as latest sample */
   state->media_clock.crf_drift_sum_ns = 0;
