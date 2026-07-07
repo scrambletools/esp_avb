@@ -1202,8 +1202,17 @@ int avb_start(avb_config_s *config) {
      * which freezes ATDECC (Hive can't enumerate), MSRP, MAAP, and ADP.
      * Core 0 has plenty of headroom since emac_rx is driven by IRQs and
      * AVB-IN only runs when stream packets are queued. */
-    xTaskCreatePinnedToCore(avb_task, "AVB", 16384, (void *)config, 21, NULL,
-                            0);
+    /* Copy the caller's config before returning — callers commonly pass a
+     * stack local, and avb_task reads it asynchronously. Once the caller's
+     * frame dies those reads return garbage (observed: talker flag cleared
+     * mid-init when a boot-time ptpd_status stall let the caller's task
+     * reuse the frame, silently skipping MAAP init). Single instance is
+     * enforced above, so one static copy suffices. Pointer members (names,
+     * eth_handle) must still reference storage that outlives avb_start. */
+    static avb_config_s s_config_copy;
+    memcpy(&s_config_copy, config, sizeof(avb_config_s));
+    xTaskCreatePinnedToCore(avb_task, "AVB", 16384, (void *)&s_config_copy,
+                            21, NULL, 0);
     return OK;
   }
   avberr("Another instance of AVB is already running");
