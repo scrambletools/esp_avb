@@ -1240,26 +1240,14 @@ typedef struct {
 } jitter_ring_t;
 
 #define JITTER_RING_SIZE 16384
-/* Startup prefill = the ring's operating fill = listener-internal
- * latency (~28 ms at 48 kHz stereo 24-bit). This must be a substantial
- * fraction of the ring, not a token couple of ms, for two reasons:
- *
- *   1. Media-clock sensor validity. The PLL measures bytes delivered
- *      to I2S DMA. That rate equals the LOCAL playout rate only while
- *      the DMA stays backpressured, which requires the drain to always
- *      have material — i.e. ring fill > 0 with margin. With a ~2 ms
- *      prefill the ring ran empty, the DMA never filled, and the
- *      byte counter tracked the TALKER's arrival rate instead: the
- *      PLL saw zero response to MCLK retune and ramped its correction
- *      to the clamp (observed: +37 ppm applied, inst pinned at the
- *      talker offset). Half-ring fill buys ~19 min of backpressured
- *      operation even at 25 ppm of uncorrected clock mismatch —
- *      orders more than the PLL needs to lock.
- *
- *   2. Stall absorption. The ring is sized to ride out flash-cache
- *      -disable windows (≤50 ms); the cushion actually available is
- *      the operating fill, not the ring capacity.
- */
+/* FALLBACK-mode startup prefill (~28 ms at 48 kHz stereo 24-bit) —
+ * used only when the presentation-time gate cannot arm (tu=1 stream,
+ * no valid gPTP, stale anchor). Arrival-relative latency, sized for
+ * stall absorption since fallback streams get no resync anchor. In
+ * the normal presentation-gated path the operating fill is set by the
+ * talker's presentation offset plus ESP_AVB_LISTENER_EXTRA_LATENCY_US,
+ * and the media-clock sensor is fill-independent (DAC-consumed bytes
+ * from the I2S on_sent callback — see avbcodec.c). */
 #define JITTER_PREFILL   8192   /* ~28 ms at 48 kHz stereo 24-bit */
 
 static inline uint32_t ring_readable(const jitter_ring_t *r) {
@@ -1487,15 +1475,22 @@ static void stream_in_drain_cb(void *arg) {
 
   uint32_t avail = ring_readable(&ctx->ring);
   if (avail == 0) {
-    ctx->drain_underrun++;
-    /* Ring drained — probably lost stream. Re-arm the presentation
-     * anchor so the next packet re-gates playout at its own
-     * presentation time (resync) instead of resuming arbitrarily. */
-    ctx->drain_locked = false;
-    atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
-    if (ctx->ever_locked) {
-      ctx->media_unlocked_count++;
-      ctx->ever_locked = false;
+    /* Empty ring is NORMAL at thin (presentation-time) fill: the
+     * standing buffer is only the talker's transit margin (~2 ms), so
+     * a 1 ms drain tick routinely drains to zero between packet
+     * arrivals while the I2S DMA (2 ms) rides through. Only treat it
+     * as a lost stream — unlock and re-arm the presentation anchor so
+     * the next packet re-gates at its own presentation time — when
+     * packets have actually stopped arriving. */
+    int64_t since_pkt_us = esp_timer_get_time() - ctx->last_packet_us;
+    if (since_pkt_us > 20000) {
+      ctx->drain_underrun++;
+      ctx->drain_locked = false;
+      atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
+      if (ctx->ever_locked) {
+        ctx->media_unlocked_count++;
+        ctx->ever_locked = false;
+      }
     }
     return;
   }
@@ -1538,13 +1533,10 @@ static void stream_in_drain_cb(void *arg) {
                         memory_order_release);
   ctx->drain_count++;
 
-  /* PLL counter: bytes delivered to the I2S DMA. The avb_pll module
-   * uses this plus gPTP time to compute the listener vs. source rate
-   * and retune MCLK. */
-  if (ctx->state) {
-    atomic_fetch_add_explicit(&ctx->state->media_clock.i2s_bytes_written,
-                              (uint64_t)bytes_written, memory_order_relaxed);
-  }
+  /* The media-clock PLL counter is fed by the I2S TX on_sent DMA
+   * callback (avbcodec.c), not here: bytes-into-DMA only equals the
+   * local playout rate while the DMA is backpressured, which fails at
+   * thin (presentation-time) fill levels. */
 }
 
 /* CRF stream RX handler — counts CRF AVTPDUs and records the most

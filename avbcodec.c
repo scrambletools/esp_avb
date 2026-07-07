@@ -16,6 +16,7 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
+#include <stdatomic.h>    /* media-clock byte counter in i2s_tx_on_sent_cb */
 
 #define I2C_NUM (0)
 #define AVB_MCLK_MULTIPLE                                                      \
@@ -122,6 +123,16 @@ static bool codec_caps_support_sample_rate(const avb_codec_caps_s *caps,
   return false;
 }
 
+/* TX DMA completion callback — accumulates DAC-consumed bytes for the
+ * media-clock PLL. ISR context: one relaxed atomic add, nothing else. */
+static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
+                                        i2s_event_data_t *event, void *arg) {
+  avb_state_s *state = (avb_state_s *)arg;
+  atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_written,
+                            (uint64_t)event->size, memory_order_relaxed);
+  return false;
+}
+
 /* Configure the I2S driver
  * Typically the I2S driver must be reconfigured when the stream params change
  *
@@ -138,9 +149,8 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   /* Small DMA descriptors (6 frames = 1 AAF Class A packet worth,
    * 125 µs at 48 kHz). 16 of them = 2 ms TX ring — Milan Class A's
    * max_transit_time window. The listener drain in avtp.c runs as an
-   * esp_timer 1 ms task that calls i2s_channel_write, so the I2S
-   * driver paces playout at the DAC rate without needing on_sent
-   * callback bookkeeping. */
+   * esp_timer 1 ms task that calls i2s_channel_write; the I2S driver
+   * paces playout at the DAC rate. */
   chan_cfg.dma_frame_num = 6;
   chan_cfg.dma_desc_num = 16;
   ESP_ERROR_CHECK(
@@ -186,6 +196,20 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   // Initialize the I2S TX and RX channels
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_tx_handle, &std_cfg));
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_rx_handle, &std_cfg));
+
+  /* Media-clock sensor: count bytes the DAC actually consumed via the
+   * TX DMA on_sent callback. This ticks at the true local playout rate
+   * regardless of jitter-buffer fill — with auto_clear the DMA keeps
+   * consuming (zeros) through underruns — so the avb_pll loop can
+   * measure the local media clock at any listener latency, including
+   * strict presentation-time playout where the standing fill is only
+   * the talker's transit margin. (Counting bytes written INTO the DMA,
+   * as before, tracked the talker's arrival rate whenever the DMA was
+   * not backpressured, blinding the loop at thin fill.) Must be
+   * registered before i2s_channel_enable. */
+  i2s_event_callbacks_t tx_cbs = {.on_sent = i2s_tx_on_sent_cb};
+  ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_tx_handle,
+                                                      &tx_cbs, state));
 
   // Enable the I2S TX and RX channels
   ESP_ERROR_CHECK(i2s_channel_enable(state->i2s_tx_handle));

@@ -154,25 +154,26 @@ menu "AVB Configuration"
 
     config ESP_AVB_LISTENER_EXTRA_LATENCY_US
         int "Listener playout latency added beyond presentation time (µs)"
-        default 24000
+        default 0
         range 0 40000
         depends on ESP_AVB
         help
             The listener starts playout when gPTP reaches the stream's
             AVTP presentation timestamp plus this offset (minus the
-            fixed output-pipeline delay). 0 plays exactly at the
-            talker's intended presentation time; larger values trade
-            latency for jitter-buffer depth. The resulting buffer fill
-            (presentation offset + this value) must be deep enough to
-            keep the I2S DMA backpressured or the media-clock loop
-            loses its rate sensor — with typical 2 ms talker offsets,
-            values below ~10000 start to erode stall absorption and
-            clock-recovery authority. All listeners configured with
-            the same value play in sample-accurate sync with each
-            other; only 0 is sync-accurate with third-party listeners.
-            When stream timestamps are flagged uncertain (tu=1) or
-            gPTP is not yet valid, playout falls back to a fixed
-            byte-prefill gate.
+            fixed output-pipeline delay). The default 0 plays exactly
+            at the talker's intended presentation time — sync-accurate
+            with third-party listeners. The media-clock loop measures
+            the local playout rate from the I2S DMA completion
+            callback, so clock recovery works at any fill; the cost of
+            0 is cushion: the standing buffer is only the talker's
+            transit margin (typically ~2 ms), so scheduling stalls
+            longer than that produce a brief dropout followed by an
+            automatic presentation-time resync. Raise this on
+            deployments that prefer stall immunity over strict sync;
+            all listeners configured with the same value still play in
+            sample-accurate sync with each other. When stream
+            timestamps are flagged uncertain (tu=1) or gPTP is not yet
+            valid, playout falls back to a fixed byte-prefill gate.
 
     config ESP_AVB_PLL_CORRECTION_INTERVAL_S
         int "Listener media-clock correction interval (s, 0 = fixed clock)"
