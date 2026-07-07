@@ -449,6 +449,41 @@ void avb_pll_tick(avb_state_s *state) {
     return;
   s_pll.next_print_us = now_us + 5 * 1000 * 1000; /* 5 s */
 
+#if CONFIG_ESP_AVB_AUTO_CRF_CLOCK_SOURCE
+  /* Auto clock source: follow CRF stream liveness. The CRF reference
+   * pairs the talker's media clock directly against the DAC byte
+   * counter, keeping local PTP servo phase noise out of the rate
+   * measurement (observed as ±100 ppm window spikes on the gPTP
+   * path). Switch only when gPTP is valid enough to judge anchor
+   * freshness; on a switch, re-seed the measurement baselines — the
+   * applied MCLK trim carries over (both references are nominally the
+   * same rate). */
+  {
+    struct timespec gptp_ts;
+    if (ptpd_now(&gptp_ts) == 0) {
+      uint64_t local_ns = (uint64_t)gptp_ts.tv_sec * 1000000000ULL +
+                          (uint64_t)gptp_ts.tv_nsec;
+      uint64_t crf_ts, crf_bytes;
+      bool crf_fresh = read_crf_anchor(state, &crf_ts, &crf_bytes) &&
+                       (local_ns > crf_ts
+                            ? (local_ns - crf_ts) < AVB_PLL_CRF_ANCHOR_STALE_NS
+                            : true);
+      uint16_t active = state->media_clock.active_clock_source_index;
+      if (crf_fresh && active != AVB_CLOCK_SOURCE_CRF_INPUT) {
+        state->media_clock.active_clock_source_index =
+            AVB_CLOCK_SOURCE_CRF_INPUT;
+        s_pll.valid = false; /* re-seed baselines on the new reference */
+        ESP_LOGI(TAG, "clock source auto-switched to CRF input (live)");
+      } else if (!crf_fresh && active == AVB_CLOCK_SOURCE_CRF_INPUT) {
+        state->media_clock.active_clock_source_index =
+            AVB_CLOCK_SOURCE_INTERNAL;
+        s_pll.valid = false;
+        ESP_LOGI(TAG, "clock source auto-reverted to INTERNAL (CRF stale)");
+      }
+    }
+  }
+#endif
+
   uint64_t bytes_now, gptp_now_ns;
   if (!read_sample(state, &bytes_now, &gptp_now_ns)) {
     s_pll.valid = false;

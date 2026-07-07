@@ -175,6 +175,23 @@ menu "AVB Configuration"
             timestamps are flagged uncertain (tu=1) or gPTP is not yet
             valid, playout falls back to a fixed byte-prefill gate.
 
+    config ESP_AVB_AUTO_CRF_CLOCK_SOURCE
+        bool "Auto-select CRF input as media clock source when live"
+        default y
+        depends on ESP_AVB
+        help
+            Follow CRF stream liveness automatically: when a connected
+            CRF input stream is delivering fresh timestamps, switch the
+            media clock source to CRF INPUT; when the CRF reference
+            goes stale, revert to INTERNAL (gPTP). The CRF reference
+            pairs the talker's media clock directly against the local
+            DAC byte counter, keeping local PTP servo phase noise out
+            of the clock-recovery measurement entirely — measurably
+            smoother than the gPTP-referenced path. A controller's
+            SET_CLOCK_SOURCE is still accepted, but a subsequent CRF
+            liveness change overrides it; disable this option for
+            strictly controller-managed clock domains.
+
     config ESP_AVB_PLL_CORRECTION_INTERVAL_S
         int "Listener media-clock correction interval (s, 0 = fixed clock)"
         default 30
