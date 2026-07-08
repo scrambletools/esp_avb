@@ -171,19 +171,33 @@ static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
                                       size_t sample_rate_count,
                                       uint8_t channels_per_stream) {
   size_t n = 0;
-  for (size_t i = 0; i < sample_rate_count && n + 1 < max_formats; i++) {
+  for (size_t i = 0; i < sample_rate_count && n + 3 <= max_formats; i++) {
     uint32_t hz = sample_rates[i];
     avtp_stream_format_am824_s am824 =
         AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
                                  channels_per_stream);
-    avtp_stream_format_aaf_pcm_s aaf =
+    /* Milan-canonical packetization for both AAF variants:
+     * samples_per_frame = one Class A interval (rate/8000). The wire
+     * field is 10 bits split 6+4 across the struct's _h / low-nibble
+     * members. */
+    uint16_t spf = avb_samples_per_frame_from_hz(hz);
+    /* Milan Base format (Milan v1.3 §6.2): 32-bit integer, bit_depth
+     * 32. Our 24-bit codec pads the low byte as a talker and truncates
+     * as a listener — both legal for this format. */
+    avtp_stream_format_aaf_pcm_s aaf32 =
+        AVB_DEFAULT_FORMAT_AAF(32, avb_aaf_rate_from_hz(hz),
+                               channels_per_stream, false);
+    aaf32.samples_per_frame_h = (spf >> 4) & 0x3F;
+    aaf32.samples_per_frame = spf & 0x0F;
+    /* 24-significant-bit variant — what macOS advertises natively. */
+    avtp_stream_format_aaf_pcm_s aaf24 =
         AVB_DEFAULT_FORMAT_AAF(24, avb_aaf_rate_from_hz(hz),
                                channels_per_stream, false);
-    uint16_t spf = avb_samples_per_frame_from_hz(hz);
-    aaf.samples_per_frame_h = (spf >> 8) & 0x03;
-    aaf.samples_per_frame = spf & 0xFF;
+    aaf24.samples_per_frame_h = (spf >> 4) & 0x3F;
+    aaf24.samples_per_frame = spf & 0x0F;
     formats[n++].am824 = am824;
-    formats[n++].aaf_pcm = aaf;
+    formats[n++].aaf_pcm = aaf32;
+    formats[n++].aaf_pcm = aaf24;
   }
   return n;
 }
@@ -571,6 +585,12 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   avtp_stream_format_aaf_pcm_s format = AVB_DEFAULT_FORMAT_AAF(
       24, avb_aaf_rate_from_hz(state->config.default_sample_rate),
       state->config.channels_per_stream, false);
+  /* Milan-canonical samples_per_frame for the boot rate (the macro
+   * default of 6 only matches at 48 kHz). 10-bit field split 6+4. */
+  uint16_t default_spf =
+      avb_samples_per_frame_from_hz(state->config.default_sample_rate);
+  format.samples_per_frame_h = (default_spf >> 4) & 0x3F;
+  format.samples_per_frame = default_spf & 0x0F;
 
   // setup listener stream flags, and stream info flags, default vlan id and
   // stream format
