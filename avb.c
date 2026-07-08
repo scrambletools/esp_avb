@@ -872,7 +872,14 @@ static int avb_periodic_send(avb_state_s *state) {
   if (state->config.listener) {
     timespecsub(&time_now, &state->port[0].last_transmitted_msrp_listener,
                             &delta);
+    static const uint8_t zero_sid[UNIQUE_ID_LEN] = {0};
     for (int i = 0; i < state->num_input_streams; i++) {
+      /* Never declare a Listener attribute with a zero stream_id — a
+       * malformed attribute can poison the whole MRPDU at a bridge,
+       * deregistering every other attribute we carry in it. */
+      if (memcmp(state->input_streams[i].stream_id, zero_sid,
+                 UNIQUE_ID_LEN) == 0)
+        continue;
       if (state->input_streams[i].connected &&
           timespec_to_ms(&delta) > MSRP_LISTENER_CONN_INTERVAL_MSEC) {
         state->port[0].last_transmitted_msrp_listener = time_now;

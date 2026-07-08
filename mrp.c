@@ -549,6 +549,14 @@ typedef struct {
    * every admit-declare. */
   uint16_t last_propagated_mfs;
   uint16_t last_propagated_mfi;
+  /* Mid-life value change quarantine: after an Lv for the old value,
+   * hold off re-declaring the new one until the peer's LeaveTimer has
+   * fully deregistered the old attribute. Re-declaring the same
+   * StreamID with a new TSpec while the peer's registrar is still in
+   * LV leaves SRP switches with a limbo reservation — they stop
+   * propagating the stream's advertise entirely until a LeaveAll
+   * cycles it out (minutes). 0 = no quarantine. */
+  int64_t redeclare_after_us;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -1602,6 +1610,47 @@ static mrp_event_e mrp_declare_event(const mrp_sm_state_t *sm) {
   }
 }
 
+static int mrp_send_attr(avb_state_s *state, int port, void *attr,
+                         int attr_list_len, const char *label);
+
+/* Transmit an immediate Lv carrying the entry's currently declared
+ * value. In MRP the attribute value IS its identity: a mid-life value
+ * change (TSpec after SET_STREAM_FORMAT, MAAP dest, class/VID flip)
+ * makes the new declaration a different attribute, so downstream
+ * keeps the stale registration and treats the new declare as a
+ * conflicting second talker for the same stream ID until a LeaveAll
+ * cycles it out (observed: listeners stuck AskingFailed until
+ * reboot). Deregistering the old value first keeps the stream ID
+ * unambiguous. */
+static void mrp_tx_talker_value_leave(avb_state_s *state, int port,
+                                      msrp_talker_entry_t *e) {
+  msrp_talker_message_u msg = e->wire;
+  int attr_list_len;
+  if (e->attr_type == msrp_attr_type_talker_advertise) {
+    msg.header.attr_type = msrp_attr_type_talker_advertise;
+    msg.header.attr_len = 25;
+    attr_list_len = 30;
+    msg.talker.event_data[0] = int_to_3pe(mrp_attr_event_lv, 0, 0);
+  } else {
+    msg.header.attr_type = msrp_attr_type_talker_failed;
+    msg.header.attr_len = 34;
+    attr_list_len = 39;
+    msg.talker_failed.event_data[0] = int_to_3pe(mrp_attr_event_lv, 0, 0);
+  }
+  int_to_octets(&attr_list_len, msg.header.attr_list_len, 2);
+  msg.header.vechead_leaveall = 0;
+  msg.header.vechead_num_vals = 1;
+  mrp_send_attr(state, port, &msg, attr_list_len, "talker value leave");
+}
+
+/* Reset an entry's SMs so the next declare propagates as New!. */
+static void mrp_sm_reset_for_new_value(mrp_sm_state_t *sm) {
+  sm->applicant = mrp_applicant_vo;
+  sm->registrar = mrp_registrar_mt;
+  sm->leave_timer_us = 0;
+  sm->pending_tx = mrp_tx_none;
+}
+
 void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
@@ -1611,9 +1660,34 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
       port, stream_id, msrp_attr_type_talker_advertise);
   if (e == NULL)
     return;
-  memset(&e->wire, 0, sizeof(e->wire));
-  mrp_build_talker_info(state, &e->wire.talker.info, stream_id,
+  /* Build the candidate value first so a mid-life change can be
+   * detected against the currently declared one. */
+  msrp_talker_message_u fresh;
+  memset(&fresh, 0, sizeof(fresh));
+  mrp_build_talker_info(state, &fresh.talker.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
+  if (memcmp(&e->wire.talker.info, &fresh.talker.info,
+             sizeof(fresh.talker.info)) != 0) {
+    static const uint8_t zero_id[UNIQUE_ID_LEN] = {0};
+    if (memcmp(e->wire.talker.info.stream_id, zero_id, UNIQUE_ID_LEN) != 0) {
+      /* Value changed mid-life: deregister the old value (twice, for
+       * loss robustness) and quarantine the re-declare until the
+       * peer's LeaveTimer (600-1000 ms) has fully torn the old
+       * registration down. */
+      mrp_tx_talker_value_leave(state, port, e);
+      mrp_tx_talker_value_leave(state, port, e);
+      e->redeclare_after_us = esp_timer_get_time() + 1500000;
+      avbinfo("MSRP: talker advertise value changed — withdrew old value");
+    }
+    mrp_sm_reset_for_new_value(&e->sm);
+    e->wire = fresh;
+  }
+  if (e->redeclare_after_us != 0) {
+    if (esp_timer_get_time() < e->redeclare_after_us)
+      return; /* periodic loop retries after the quarantine */
+    e->redeclare_after_us = 0;
+  }
+  e->wire = fresh;
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_port_arm_join_timer(state, port);
 }

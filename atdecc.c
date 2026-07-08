@@ -3992,6 +3992,18 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   uint16_t index = octets_to_uint(response->listener_uid, 2);
   avb_listener_stream_s *stream = &state->input_streams[index];
 
+  /* A success response carrying an all-zero stream_id is invalid (a
+   * talker mid-teardown or reconfiguring can produce one). Accepting
+   * it would mark the stream connected with no identity, and the
+   * periodic MSRP loop would then declare a Listener attribute for
+   * stream 0x0 — bridges may discard the whole MRPDU carrying it,
+   * which silently kills every other declaration in the same PDU. */
+  static const uint8_t zero_sid[UNIQUE_ID_LEN] = {0};
+  if (memcmp(response->stream_id, zero_sid, UNIQUE_ID_LEN) == 0) {
+    avbwarn("ACMP: connect response with zero stream_id — refusing");
+    return acmp_status_talker_misbehaving;
+  }
+
   // Copy identity + stream parameters from the talker's response.
   // Works for both plain 1722.1 CONNECT_TX_RESPONSE and Milan
   // PROBE_TX_RESPONSE (same wire format).
