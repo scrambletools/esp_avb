@@ -113,8 +113,9 @@ static uint32_t build_sine_lut(uint8_t **lut_out, int channels, int bit_depth,
     return 0;
   }
 
-  float amplitude =
-      (bit_depth == 24) ? 20000.0f : 32767.0f; // quiet: match mic level (~±20k)
+  /* -20 dBFS nominal (x0.7 below lands ~-23 dBFS): loud enough to
+   * register on listener meters, far from clipping. */
+  float amplitude = (bit_depth == 24) ? 838860.0f : 3277.0f;
   float phase_inc = 2.0f * M_PI * freq / (float)sample_rate;
   float phase = 0.0f;
 
@@ -2425,9 +2426,14 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
     params->sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
   }
 
-  // Audio source: mic input by default, sine wave for testing
+  // Audio source: codec input by default, generated sine for bench tests
+#ifdef CONFIG_ESP_AVB_TALKER_TEST_TONE
+  params->use_sine_wave = true;
+  params->sine_freq = (float)CONFIG_ESP_AVB_TALKER_TEST_TONE_HZ;
+#else
   params->use_sine_wave = false;
-  params->sine_freq = 1000.0f; // 1 kHz test tone (if sine enabled)
+  params->sine_freq = 1000.0f;
+#endif
 
   // Calculate samples per packet based on stream class
   // Class A: 125us (8000 packets/sec), Class B: 250us (4000 packets/sec)

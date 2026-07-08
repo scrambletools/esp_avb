@@ -126,6 +126,25 @@ menu "AVB Configuration"
             disabled, ESP-AVB will not switch its public AVB Lite status on even
             if PTP is running in standard profile.
 
+    config ESP_AVB_TALKER_TEST_TONE
+        bool "Talker test tone (sine) instead of codec input"
+        default n
+        depends on ESP_AVB
+        help
+            Stream a generated sine wave on the talker audio output
+            instead of reading the codec ADC. Proves the talker ->
+            listener path end to end independent of the analog input
+            chain (source level, PGA gain, input routing). Roughly
+            -23 dBFS on every channel.
+
+    config ESP_AVB_TALKER_TEST_TONE_HZ
+        int "Test tone frequency (Hz)"
+        default 1000
+        range 20 20000
+        depends on ESP_AVB_TALKER_TEST_TONE
+        help
+            Frequency of the generated test tone.
+
     config ESP_AVB_TALKER_CADENCE_LOCK_INTERVAL_S
         int "Talker cadence rate-lock interval (s, 0 = free-run)"
         default 60
