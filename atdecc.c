@@ -1563,7 +1563,11 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
                           const char *label) {
   msrp_attr_header_s *header = (msrp_attr_header_s *)attr;
-  size_t attr_size = 4 + attr_list_len; /* attr hdr w/o vechead + attr list */
+  /* attr_list_len includes the 2-byte EndMark; copy only the real
+   * attribute bytes and let the zeroed msg supply the EndMark (see
+   * mrp_send_attr — a struct-sourced EndMark can carry RX junk that
+   * parses as a phantom zero-value vector downstream). */
+  size_t attr_size = 4 + attr_list_len - 2;
   aecp_message_u msg;
   struct timespec ts;
   memset(&msg, 0, sizeof(msg));
@@ -1573,7 +1577,7 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
   msg.cvu.common.header.sv = 0;
   msg.cvu.common.header.msg_type = aecp_msg_type_vendor_unique_command;
   msg.cvu.common.header.status_valtime = aecp_status_success;
-  uint16_t msg_len = sizeof(aecp_cvu_common_s) + attr_size;
+  uint16_t msg_len = sizeof(aecp_cvu_common_s) + 4 + attr_list_len;
   uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
   msg.cvu.common.header.control_data_len_h = (cdl >> 8) & 0x07;
   msg.cvu.common.header.control_data_len = cdl & 0xFF;

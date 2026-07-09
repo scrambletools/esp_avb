@@ -2313,7 +2313,14 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
                          int attr_list_len, const char *label) {
-  size_t attr_size = 4 + attr_list_len; /* attr hdr w/o vechead + attr list */
+  /* attr_list_len includes the 2-byte EndMark. Copy only the real
+   * attribute bytes from the caller's struct; the EndMark must come
+   * from the zeroed msgbuf. Copying it from the struct transmits
+   * whatever the last RX memcpy left in the trailing event slots —
+   * a non-zero EndMark parses downstream as a second vector with an
+   * all-zero FirstValue (e.g. a Listener declaration for stream 0),
+   * which poisons the bridge's attribute table. */
+  size_t attr_size = 4 + attr_list_len - 2; /* hdr + list w/o EndMark */
   struct timespec ts;
   int ret;
 
