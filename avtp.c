@@ -783,7 +783,15 @@ static void avb_stream_out_task(void *task_param) {
   i2s_ring_size -= i2s_ring_size % i2s_read_size;
   if (i2s_ring_size < i2s_read_size * 4)
     i2s_ring_size = i2s_read_size * 4; /* minimum 4 packets */
-  int i2s_ring_head = 0, i2s_ring_tail = 0;
+  /* Monotonic byte counters — MUST be 64-bit. As 32-bit ints they
+   * cross 2^31 after ~31 min of 192 kHz stereo 24-bit capture
+   * (1.152 MB/s), C's % on the now-negative value yields a NEGATIVE
+   * write_pos, and i2s_channel_read then DMA-writes up to a full
+   * ring of mic audio BELOW the heap block — stomping neighboring
+   * allocations/task stacks (observed: core 1 Instruction access
+   * fault with the stack sprayed with near-silence audio, every
+   * ~1871 s of the overnight 192 kHz soak). */
+  uint64_t i2s_ring_head = 0, i2s_ring_tail = 0;
   if (!params->use_sine_wave) {
     i2s_ring = calloc(1, i2s_ring_size);
     if (!i2s_ring) {
@@ -795,9 +803,9 @@ static void avb_stream_out_task(void *task_param) {
      * dma_frame_num), so we fill as much as we can. */
     int frame_size = i2s_channels * i2s_bytes_per_sample;
     int prefill_target = i2s_ring_size / 2; /* ~2.5ms of audio */
-    while (i2s_ring_head < prefill_target) {
-      int write_pos = i2s_ring_head % i2s_ring_size;
-      int space = i2s_ring_size - i2s_ring_head;
+    while (i2s_ring_head < (uint64_t)prefill_target) {
+      int write_pos = (int)(i2s_ring_head % (uint64_t)i2s_ring_size);
+      int space = i2s_ring_size - (int)i2s_ring_head;
       int chunk = i2s_ring_size - write_pos;
       if (chunk > space)
         chunk = space;
@@ -813,7 +821,7 @@ static void avb_stream_out_task(void *task_param) {
         break; /* timeout — give up pre-fill */
       i2s_ring_head += got;
     }
-    avbinfo("Stream out: I2S ring pre-filled %d bytes", i2s_ring_head);
+    avbinfo("Stream out: I2S ring pre-filled %d bytes", (int)i2s_ring_head);
   }
 
   /* Sample PTP and send-time as late as possible — all logging and pre-fill
@@ -1093,11 +1101,11 @@ static void avb_stream_out_task(void *task_param) {
     } else {
       /* Read mic audio via local ring — refill from I2S when low,
        * consume i2s_read_size bytes per packet */
-      int ring_avail = i2s_ring_head - i2s_ring_tail;
+      int ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
       if (ring_avail < i2s_read_size) {
         /* Refill: read as much as possible from I2S into ring */
         int ring_space = i2s_ring_size - ring_avail;
-        int write_pos = i2s_ring_head % i2s_ring_size;
+        int write_pos = (int)(i2s_ring_head % (uint64_t)i2s_ring_size);
         int chunk = i2s_ring_size - write_pos; /* to end of buffer */
         if (chunk > ring_space)
           chunk = ring_space;
@@ -1119,12 +1127,12 @@ static void avb_stream_out_task(void *task_param) {
         } else {
           i2s_zero_reads++;
         }
-        ring_avail = i2s_ring_head - i2s_ring_tail;
+        ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
       }
       skip_refill:
       /* Consume i2s_read_size bytes from ring */
       if (ring_avail >= i2s_read_size) {
-        int read_pos = i2s_ring_tail % i2s_ring_size;
+        int read_pos = (int)(i2s_ring_tail % (uint64_t)i2s_ring_size);
         int first = i2s_ring_size - read_pos;
         if (first >= i2s_read_size) {
           memcpy(i2s_buf, i2s_ring + read_pos, i2s_read_size);
