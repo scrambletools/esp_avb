@@ -2288,8 +2288,10 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
   int channels, bytes_per_sample, sample_rate, avtp_hdr;
   uint8_t subtype = fmt->aaf_pcm.subtype;
   if (subtype == avtp_subtype_crf) {
-    /* CRF: ETH + VLAN + AVTP CRF header + one 64-bit timestamp. */
-    return (uint16_t)(14 /*ETH*/ + 4 /*VLAN*/ + 28 /*CRF AVTPDU*/);
+    /* CRF: ETH + VLAN + AVTP CRF header + 6 64-bit timestamps (Milan
+     * 300 ts/s cadence, see avb_crf_format_for_rate). */
+    return (uint16_t)(14 /*ETH*/ + 4 /*VLAN*/ +
+                      (20 + AVB_CRF_TS_PER_PDU * 8) /*CRF AVTPDU*/);
   }
   if (subtype == avtp_subtype_61883) {
     channels = fmt->am824.dbs;

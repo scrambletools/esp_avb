@@ -2255,13 +2255,29 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
  * clock domain. The timer callback runs on the esp_timer task and only stamps +
  * transmits one frame -- the same approach ptpd uses to pace Pdelay_Req. */
 
+#define AVB_CRF_PDU_LEN (20 + AVB_CRF_TS_PER_PDU * 8)
+
+/* CRF timestamps are future-dated by Max Transit Time per IEEE
+ * 1722-2016 §10.7 Eq. 14 (Class A budget; at 192 kHz this is exactly
+ * 384 sample periods, so it stays on the media-clock grid). */
+#define AVB_CRF_MAX_TRANSIT_NS 2000000
+/* Re-anchor the timestamp grid if it drifts this far from gPTP now +
+ * lead (esp_timer xtal vs gPTP drift, or a PTP time step). */
+#define AVB_CRF_GRID_RESYNC_NS 10000000
+
 struct avb_crf_out_ctx_s {
   esp_timer_handle_t timer;
   esp_eth_handle_t eth_handle;
   uint16_t stream_index;
   uint8_t seq_num;
   size_t frame_len;
-  uint8_t frame[TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + 28];
+  uint32_t rate;         /* media clock base frequency (Hz) */
+  uint32_t step_ns;      /* whole ns between consecutive CRF timestamps */
+  uint32_t step_rem;     /* fractional remainder (units of 1/rate ns) */
+  uint64_t next_ts_ns;   /* next grid timestamp to emit */
+  uint32_t frac_acc;     /* fractional accumulator (units of 1/rate ns) */
+  bool grid_valid;
+  uint8_t frame[TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + AVB_CRF_PDU_LEN];
 };
 
 /* Single CRF output stream (AVB_DEFAULT_CRF_OUTPUT_INDEX). */
@@ -2272,14 +2288,54 @@ static void avb_crf_send_cb(void *arg) {
   uint8_t *avtp = ctx->frame + TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN;
 
   struct timespec ts;
-  uint64_t crf_ts_ns = 0;
-  if (ptpd_now(&ts) == 0) {
-    crf_ts_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  if (ptpd_now(&ts) != 0)
+    return;
+  uint64_t now_ns =
+      (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+  /* IEEE 1722-2016 §10.7 Eq. 14: CRF timestamps are a CONTINUOUS grid
+   * of media-clock event times, future-dated by Max Transit Time —
+   * NOT re-anchored to "now" every PDU. Listeners phase-lock to the
+   * grid (media stream avtp_timestamps must align to it within ±25 %
+   * of a sample period, §10.8); a per-PDU wall-clock anchor makes the
+   * macOS media-clock servo run persistently fast (+8..17 % measured).
+   * The grid advances by exact fractional accumulation so it never
+   * drifts from base_frequency; it re-anchors only if it diverges
+   * from gPTP time (xtal drift vs the 20 ms esp_timer, or PTP step). */
+  uint64_t target = now_ns + AVB_CRF_MAX_TRANSIT_NS;
+  if (!ctx->grid_valid ||
+      (ctx->next_ts_ns > target + AVB_CRF_GRID_RESYNC_NS) ||
+      (ctx->next_ts_ns + AVB_CRF_GRID_RESYNC_NS < target)) {
+    /* Anchor on the media-clock sample grid (multiples of 1/rate s
+     * from the gPTP epoch), rounded up from now + lead. Split into
+     * seconds + ns to stay within 64-bit intermediates. */
+    uint64_t sec = target / 1000000000ULL;
+    uint64_t ns = target % 1000000000ULL;
+    uint64_t n_in_sec =
+        (ns * ctx->rate + 999999999ULL) / 1000000000ULL; /* ceil */
+    uint64_t n = sec * ctx->rate + n_in_sec; /* samples since epoch */
+    uint64_t rem = n % ctx->rate;
+    ctx->next_ts_ns =
+        (n / ctx->rate) * 1000000000ULL + (rem * 1000000000ULL) / ctx->rate;
+    ctx->frac_acc = (uint32_t)((rem * 1000000000ULL) % ctx->rate);
+    ctx->grid_valid = true;
   }
+
   avtp[2] = ctx->seq_num++;
-  for (int i = 0; i < 8; i++) {
-    avtp[27 - i] = (uint8_t)(crf_ts_ns & 0xFF);
-    crf_ts_ns >>= 8;
+  for (int k = 0; k < AVB_CRF_TS_PER_PDU; k++) {
+    uint64_t crf_ts_ns = ctx->next_ts_ns;
+    uint8_t *slot = avtp + 20 + k * 8;
+    for (int i = 7; i >= 0; i--) {
+      slot[i] = (uint8_t)(crf_ts_ns & 0xFF);
+      crf_ts_ns >>= 8;
+    }
+    /* Advance exactly timestamp_interval/rate seconds. */
+    ctx->next_ts_ns += ctx->step_ns;
+    ctx->frac_acc += ctx->step_rem;
+    if (ctx->frac_acc >= ctx->rate) {
+      ctx->next_ts_ns++;
+      ctx->frac_acc -= ctx->rate;
+    }
   }
   avb_net_transmit_raw(ctx->eth_handle, ctx->frame, ctx->frame_len);
 }
@@ -2295,7 +2351,7 @@ static int avb_crf_stream_out_start(avb_state_s *state,
   }
   ctx->eth_handle = params->eth_handle;
   ctx->stream_index = params->stream_index;
-  ctx->frame_len = TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + 28;
+  ctx->frame_len = TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + AVB_CRF_PDU_LEN;
 
   uint8_t *frame = ctx->frame;
   uint8_t *avtp = frame + TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN;
@@ -2313,20 +2369,28 @@ static int avb_crf_stream_out_start(avb_state_s *state,
 
   avtp[0] = avtp_subtype_crf;
   avtp[1] = 0x80; /* sv=1, version=0 */
-  avtp[3] = 0x00;
+  avtp[3] = 0x01; /* type = CRF_AUDIO_SAMPLE */
   memcpy(avtp + 4, &params->stream_id, UNIQUE_ID_LEN);
-  /* pull=0 (1.0x), base_frequency = configured sample rate; the
-   * timestamp_interval keeps the 500 PDU/s cadence (96 samples @48 kHz) */
-  uint32_t crf_rate = state->config.default_sample_rate;
-  uint16_t crf_interval = (uint16_t)(crf_rate / 500);
+  /* pull=0 (1.0x). Milan CRF is always the 48 kHz reference — one
+   * timestamp per PDU, interval 96, 500 PDU/s — independent of the
+   * audio sampling rate (see avb_crf_format_for_rate). */
+  uint32_t crf_rate = AVB_CRF_BASE_FREQ_HZ;
+  uint16_t crf_interval = (uint16_t)(crf_rate / AVB_CRF_TS_PER_SEC);
   avtp[12] = (crf_rate >> 24) & 0x1F;
   avtp[13] = (crf_rate >> 16) & 0xFF;
   avtp[14] = (crf_rate >> 8) & 0xFF;
   avtp[15] = crf_rate & 0xFF;
   avtp[16] = 0x00;
-  avtp[17] = 0x08; /* one 64-bit timestamp */
+  avtp[17] = AVB_CRF_TS_PER_PDU * 8; /* crf_data_length */
   avtp[18] = (crf_interval >> 8) & 0xFF;
   avtp[19] = crf_interval & 0xFF;
+  /* Exact per-timestamp spacing: interval samples at base_frequency,
+   * kept exact via whole-ns step + fractional remainder accumulator. */
+  ctx->rate = crf_rate;
+  uint64_t step_total = (uint64_t)crf_interval * 1000000000ULL;
+  ctx->step_ns = (uint32_t)(step_total / crf_rate);
+  ctx->step_rem = (uint32_t)(step_total % crf_rate);
+  ctx->grid_valid = false;
 
   free(params);
 
@@ -2341,7 +2405,10 @@ static int avb_crf_stream_out_start(avb_state_s *state,
     return ERROR;
   }
   s_crf_out = ctx;
-  if (esp_timer_start_periodic(ctx->timer, 2000 /* us = 2 ms */) != ESP_OK) {
+  if (esp_timer_start_periodic(ctx->timer,
+                               1000000 * AVB_CRF_TS_PER_PDU /
+                                   AVB_CRF_TS_PER_SEC /* 20 ms = 50 PDU/s */)
+      != ESP_OK) {
     esp_timer_delete(ctx->timer);
     free(ctx);
     s_crf_out = NULL;
