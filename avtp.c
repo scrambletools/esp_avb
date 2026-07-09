@@ -1497,8 +1497,11 @@ static void stream_in_drain_cb(void *arg) {
   }
 
   /* Cap per-tick drain so we don't push unbounded audio into I2S DMA
-   * in one call; ~3.5 ms at 48 kHz stereo 24-bit. */
-  #define DRAIN_MAX_BYTES 1024
+   * in one call. Must exceed one tick of media at the highest rate —
+   * 192 kHz stereo 24-bit needs 1152 B/ms; 1024 capped consumption at
+   * 170.7 k samples/s and the ring shed ~11 % of every 192 kHz stream.
+   * 4096 = ~3.5 ms at 192 kHz (matches the old headroom at 48 kHz). */
+  #define DRAIN_MAX_BYTES 4096
   uint32_t to_read = avail;
   if (to_read > DRAIN_MAX_BYTES)
     to_read = DRAIN_MAX_BYTES;

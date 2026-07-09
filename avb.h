@@ -189,8 +189,11 @@ static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
 /* Configuration index settings */
 #define DEFAULT_CONFIG_INDEX 0
 
-/* AVTP data limits */
-#define AVTP_STREAM_DATA_PER_MSG 512 // max stream data bytes per AVTP packet
+/* AVTP data limits. Must cover the largest Class A packet we accept:
+ * 8ch x 32-bit at 192 kHz = 24 samples x 8 x 4 = 768 B (AAF), 776 B
+ * with the AM824 CIP header. 512 silently dropped every packet of a
+ * 192 kHz 8ch stream in the listener RX path. */
+#define AVTP_STREAM_DATA_PER_MSG 1024 // max stream data bytes per AVTP packet
 
 /* AEM descriptor limits */
 #define AEM_MAX_DESC_LEN                                                       \
