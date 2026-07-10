@@ -227,6 +227,14 @@ static volatile uint32_t s_stream_rx_drops = 0;
 static volatile uint32_t s_ptp_rx_seen = 0;
 uint32_t avb_net_ptp_rx_seen(void) { return s_ptp_rx_seen; }
 
+/* PTP-frame L2TAP handoff outcome counters (wedge diagnosis): after
+ * esp_vfs_l2tap_eth_filter_frame, frame_len==0 means an fd matched and
+ * consumed the frame; frame_len>0 means no fd matched (dropped here). */
+static volatile uint32_t s_ptp_l2tap_consumed = 0;
+static volatile uint32_t s_ptp_l2tap_unmatched = 0;
+uint32_t avb_net_ptp_l2tap_consumed(void) { return s_ptp_l2tap_consumed; }
+uint32_t avb_net_ptp_l2tap_unmatched(void) { return s_ptp_l2tap_unmatched; }
+
 /* RX-into-avb_unified_rx_cb breakdown — every frame that enters the
  * unified dispatcher gets tallied so we can localize where a frame is
  * dropped (esp_wifi RX vs. classifier vs. handler). */
@@ -452,7 +460,10 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
     if (frame_len > 0) {
       /* No L2TAP fd matched (gPTP daemon not yet up, or socket closed) —
        * free the unconsumed buffer ourselves. */
+      s_ptp_l2tap_unmatched++;
       free(buf);
+    } else {
+      s_ptp_l2tap_consumed++;
     }
     return ESP_OK;
   }

@@ -270,7 +270,10 @@ static void avb_cpu_stats_tick(void) {
    * means L2TAP tail-dropped on full queue. */
   uint32_t cur_ptp = avb_net_ptp_rx_seen();
   uint32_t dptp = cur_ptp - s_prev_ptp_rx_seen;
-  avbinfo("  ====> PTP frames seen in emac_rx_cb this window: %u", dptp);
+  extern uint32_t avb_net_ptp_l2tap_consumed(void);
+  extern uint32_t avb_net_ptp_l2tap_unmatched(void);
+  avbinfo("  ====> PTP frames: emac_rx=%u l2tap_consumed=%u l2tap_unmatched=%u",
+          dptp, avb_net_ptp_l2tap_consumed(), avb_net_ptp_l2tap_unmatched());
   s_prev_ptp_rx_seen = cur_ptp;
 
   /* Per-ethertype RX breakdown into avb_unified_rx_cb (monotonic totals).
