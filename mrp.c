@@ -1497,66 +1497,163 @@ msrp_rx_domain_attr(int port, const msrp_domain_message_s *wire) {
  * on_*_registrar_change application callbacks for each attribute.
  * Single MSRP RX entry point — avb_process_rx_message just calls
  * here. */
+/* FirstValue wire length per MSRP attribute type (§35.2.2.8). */
+static int msrp_first_value_len(uint8_t attr_type) {
+  switch (attr_type) {
+  case msrp_attr_type_talker_advertise:
+    return 25;
+  case msrp_attr_type_talker_failed:
+    return 34;
+  case msrp_attr_type_listener:
+    return 8;
+  case msrp_attr_type_domain:
+    return 4;
+  default:
+    return -1;
+  }
+}
+
+/* Add a small integer to a big-endian byte field (stream_id / DA
+ * increments for packed vector values, §35.2.2.8.1). */
+static void msrp_be_add(uint8_t *buf, int len, uint32_t add) {
+  for (int i = len - 1; i >= 0 && add; i--) {
+    uint32_t s = (uint32_t)buf[i] + (add & 0xFF);
+    buf[i] = (uint8_t)s;
+    add = (add >> 8) + (s >> 8);
+  }
+}
+
+/* Safety cap on packed values processed per vector. */
+#define MSRP_RX_MAX_VALUES 64
+
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
                  size_t length, eth_addr_t *src_addr) {
   (void)length;
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
     return;
 
+  /* An MRPDU carries a sequence of MESSAGES (attr_type + attr_len +
+   * attr_list_len + AttributeList); each AttributeList carries one or
+   * more VECTOR ATTRIBUTES (VectorHeader + FirstValue + packed event
+   * vectors), terminated by a 2-byte EndMark. Bridges pack their whole
+   * table into multi-vector, multi-value PDUs after a LeaveAll — the
+   * previous implementation processed only the FIRST vector's FIRST
+   * value of each message and skipped the rest, so devices that joined
+   * an established network never registered attributes that happened
+   * to land later in the list (observed: a talker's advertise was the
+   * 5th vector of the bridge's re-declaration and its listeners stayed
+   * AskingFailed forever). */
+  const uint8_t *raw = msg->messages_raw;
   int offset = 0;
-  msrp_attr_header_s header;
   uint8_t leaveall_types = 0; /* bitmask of attr types already dispatched */
 
-  while ((size_t)offset + sizeof(msrp_attr_header_s) <=
-         sizeof(msg->messages_raw)) {
-    memcpy(&header, &msg->messages_raw[offset], sizeof(msrp_attr_header_s));
-    if (header.attr_type == msrp_attr_type_none)
+  while ((size_t)offset + 4 <= sizeof(msg->messages_raw)) {
+    uint8_t attr_type = raw[offset];
+    if (attr_type == msrp_attr_type_none)
       break;
-
-    size_t attr_size = octets_to_uint(header.attr_list_len, 2) + 4;
-
-    /* LeaveAll fires once per attribute type per PDU and applies only
-     * to that type's SMs (see msrp_dispatch_leaveall). */
-    if (header.vechead_leaveall && header.attr_type < 8 &&
-        !(leaveall_types & (1u << header.attr_type))) {
-      msrp_dispatch_leaveall(port, header.attr_type);
-      leaveall_types |= (1u << header.attr_type);
+    size_t list_len = ((size_t)raw[offset + 2] << 8) | raw[offset + 3];
+    size_t list_end = (size_t)offset + 4 + list_len;
+    if (list_end > sizeof(msg->messages_raw))
+      break; /* malformed length */
+    int fv_len = msrp_first_value_len(attr_type);
+    if (fv_len < 0) {
+      offset = (int)list_end;
+      continue; /* unknown attr type — skip whole message */
     }
 
-    switch (header.attr_type) {
-    case msrp_attr_type_domain: {
-      msrp_domain_message_s wire;
-      memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      mrp_reg_transition_e tr = msrp_rx_domain_attr(port, &wire);
-      /* Fire unconditionally: the callback runs endpoint validation
-       * every RX and gates MAP propagation on `tr` internally. */
-      mrp_on_domain_registrar_change(state, port, &wire, tr);
-      break;
+    size_t voff = (size_t)offset + 4;
+    while (voff + 2 <= list_end) {
+      uint16_t vh = ((uint16_t)raw[voff] << 8) | raw[voff + 1];
+      if (vh == 0)
+        break; /* EndMark */
+      bool leaveall = (vh & 0x2000) != 0;
+      int num_vals = vh & 0x1FFF;
+      int n3 = (num_vals + 2) / 3;
+      int n4 = (attr_type == msrp_attr_type_listener) ? (num_vals + 3) / 4 : 0;
+      size_t vec_len = 2 + (size_t)fv_len + (size_t)n3 + (size_t)n4;
+      if (num_vals == 0 || voff + vec_len > list_end)
+        break; /* malformed vector */
+
+      /* LeaveAll fires once per attribute type per PDU and applies
+       * only to that type's SMs (see msrp_dispatch_leaveall). */
+      if (leaveall && attr_type < 8 &&
+          !(leaveall_types & (1u << attr_type))) {
+        msrp_dispatch_leaveall(port, attr_type);
+        leaveall_types |= (1u << attr_type);
+      }
+
+      const uint8_t *fv = &raw[voff + 2];
+      const uint8_t *pe3 = fv + fv_len;
+      const uint8_t *pe4 = pe3 + n3;
+
+      int cap = num_vals > MSRP_RX_MAX_VALUES ? MSRP_RX_MAX_VALUES : num_vals;
+      for (int v = 0; v < cap; v++) {
+        int e1, e2, e3;
+        three_pe_to_int(pe3[v / 3], &e1, &e2, &e3);
+        int ev = (v % 3 == 0) ? e1 : (v % 3 == 1) ? e2 : e3;
+
+        switch (attr_type) {
+        case msrp_attr_type_domain: {
+          if (v > 0)
+            break; /* packed domain values not expected; first only */
+          msrp_domain_message_s wire;
+          memset(&wire, 0, sizeof(wire));
+          memcpy(&wire.header, &raw[offset], 4);
+          wire.header.vechead_num_vals = 1;
+          memcpy(&wire.sr_class_id, fv, 4);
+          wire.attr_event[0] = int_to_3pe(ev, 0, 0);
+          mrp_reg_transition_e tr = msrp_rx_domain_attr(port, &wire);
+          /* Fire unconditionally: the callback runs endpoint validation
+           * every RX and gates MAP propagation on `tr` internally. */
+          mrp_on_domain_registrar_change(state, port, &wire, tr);
+          break;
+        }
+        case msrp_attr_type_talker_advertise:
+        case msrp_attr_type_talker_failed: {
+          msrp_talker_message_u wire;
+          memset(&wire, 0, sizeof(wire));
+          memcpy(&wire.header, &raw[offset], 4);
+          wire.header.vechead_num_vals = 1;
+          memcpy(&wire.talker.info, fv, (size_t)fv_len);
+          /* Packed value v = FirstValue with stream_id AND DA + v. */
+          msrp_be_add(wire.talker.info.stream_id, UNIQUE_ID_LEN, (uint32_t)v);
+          msrp_be_add((uint8_t *)&wire.talker.info.stream_dest_addr,
+                      ETH_ADDR_LEN, (uint32_t)v);
+          if (attr_type == msrp_attr_type_talker_advertise)
+            wire.talker.event_data[0] = int_to_3pe(ev, 0, 0);
+          else
+            wire.talker_failed.event_data[0] = int_to_3pe(ev, 0, 0);
+          mrp_reg_transition_e tr = msrp_rx_talker_attr(port, attr_type, &wire);
+          mrp_on_talker_registrar_change(state, port, attr_type, &wire, tr,
+                                         src_addr);
+          break;
+        }
+        case msrp_attr_type_listener: {
+          msrp_listener_message_s wire;
+          memset(&wire, 0, sizeof(wire));
+          memcpy(&wire.header, &raw[offset], 4);
+          wire.header.vechead_num_vals = 1;
+          memcpy(&wire.stream_id, fv, UNIQUE_ID_LEN);
+          msrp_be_add((uint8_t *)&wire.stream_id, UNIQUE_ID_LEN, (uint32_t)v);
+          wire.event_decl_data[0].event = int_to_3pe(ev, 0, 0);
+          /* 4pe declaration for value v: 2-bit fields packed MSB-first. */
+          uint8_t d4 = pe4[v / 4];
+          uint8_t decl = (d4 >> (6 - 2 * (v % 4))) & 0x3;
+          wire.event_decl_data[1].declaration.event1 = decl;
+          bool peer_decl_changed = false;
+          mrp_reg_transition_e tr =
+              msrp_rx_listener_attr(port, &wire, &peer_decl_changed);
+          mrp_on_listener_registrar_change(state, port, &wire, tr,
+                                           peer_decl_changed, src_addr);
+          break;
+        }
+        default:
+          break;
+        }
+      }
+      voff += vec_len;
     }
-    case msrp_attr_type_talker_advertise:
-    case msrp_attr_type_talker_failed: {
-      msrp_talker_message_u wire;
-      memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      mrp_reg_transition_e tr =
-          msrp_rx_talker_attr(port, header.attr_type, &wire);
-      mrp_on_talker_registrar_change(state, port, header.attr_type, &wire, tr,
-                                     src_addr);
-      break;
-    }
-    case msrp_attr_type_listener: {
-      msrp_listener_message_s wire;
-      memcpy(&wire, &msg->messages_raw[offset], sizeof(wire));
-      bool peer_decl_changed = false;
-      mrp_reg_transition_e tr =
-          msrp_rx_listener_attr(port, &wire, &peer_decl_changed);
-      mrp_on_listener_registrar_change(state, port, &wire, tr,
-                                       peer_decl_changed, src_addr);
-      break;
-    }
-    default:
-      break; /* unknown attr — skip */
-    }
-    offset += attr_size;
+    offset = (int)list_end;
   }
 }
 
