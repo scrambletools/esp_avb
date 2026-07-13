@@ -3266,20 +3266,6 @@ static int find_or_add_talker_listener_by_identity(avb_talker_stream_s *stream,
   return idx;
 }
 
-static void remove_talker_listener_by_index(avb_talker_stream_s *stream,
-                                            int idx) {
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  if (idx < 0 || idx >= count)
-    return;
-  for (int i = idx; i < count - 1; i++) {
-    stream->connected_listeners[i] = stream->connected_listeners[i + 1];
-  }
-  count--;
-  int_to_octets(&count, stream->connection_count, 2);
-  memset(&stream->connected_listeners[count], 0,
-         sizeof(stream->connected_listeners[0]));
-}
-
 int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
                                         bool disconnect) {
   int ret = OK;
@@ -3320,7 +3306,7 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
      * immediately so stale periodic MSRP Ready declarations cannot restart the
      * stream while we wait for an MSRP Leave (which may be delayed or lost). */
     if (listener_idx != NOT_FOUND) {
-      remove_talker_listener_by_index(stream, listener_idx);
+      avb_remove_talker_listener_by_index(stream, listener_idx);
       avbinfo("ACMP: listener disconnected from stream %d (count=%d)",
               talker_uid, octets_to_uint(stream->connection_count, 2));
     } else {

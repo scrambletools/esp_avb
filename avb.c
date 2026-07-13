@@ -202,6 +202,26 @@ static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
   return n;
 }
 
+/* Remove one entry from a talker stream's connected_listeners[] table,
+ * compacting the tail and keeping connection_count in sync. Shared by
+ * the ACMP disconnect path (atdecc.c) and the MSRP leave/age-out path
+ * (mrp.c); lives here because atdecc.c is not compiled in every build. */
+void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream,
+                                         int idx) {
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
+    count = AVB_MAX_NUM_CONNECTED_LISTENERS;
+  if (idx < 0 || idx >= count)
+    return;
+  for (int i = idx; i < count - 1; i++) {
+    stream->connected_listeners[i] = stream->connected_listeners[i + 1];
+  }
+  count--;
+  int_to_octets(&count, stream->connection_count, 2);
+  memset(&stream->connected_listeners[count], 0,
+         sizeof(stream->connected_listeners[0]));
+}
+
 /* Initialize AVB state and create L2TAP FDs */
 static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // Copy config to state

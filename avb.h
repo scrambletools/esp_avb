@@ -961,6 +961,7 @@ void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
 uint32_t aaf_code_to_sample_rate(uint8_t code);
 int avb_start_stream_out(avb_state_s *state, uint16_t index);
 int avb_stop_stream_out(avb_state_s *state, uint16_t index);
+void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream, int idx);
 
 /* Codec functions */
 const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type);

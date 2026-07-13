@@ -1224,6 +1224,39 @@ static void mrp_on_listener_registrar_change(
     if (memcmp(wire->stream_id, stream->stream_id, UNIQUE_ID_LEN) != 0)
       continue;
 
+    /* Registrar aged out — LeaveTimer expiry after a LeaveAll with no
+     * re-declaration and no wire Lv (the peer vanished silently). On
+     * this path src_addr is NULL and the stored wire event is the
+     * stale last Join, so it must be handled before the event-based
+     * branches below. Registrar MT means nobody on this port declares
+     * Listener for this stream anymore: clear readiness on every row
+     * and purge rows that never completed ACMP, so connection_count
+     * tracks live listeners again. */
+    if (src_addr == NULL) {
+      if (tr == mrp_reg_transition_deregister) {
+        int count = octets_to_uint(stream->connection_count, 2);
+        if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
+          count = AVB_MAX_NUM_CONNECTED_LISTENERS;
+        for (int lidx = count - 1; lidx >= 0; lidx--) {
+          stream->connected_listeners[lidx].msrp_ready = false;
+          stream->connected_listeners[lidx].asking_failed = false;
+          if (!stream->connected_listeners[lidx].acmp_connected) {
+            avb_remove_talker_listener_by_index(stream, lidx);
+          }
+        }
+        avbinfo("MSRP: listener registration aged out for stream %d "
+                "(count=%d)",
+                i, octets_to_uint(stream->connection_count, 2));
+        bool should_stop = !any_listener_ready(stream) ||
+                           (!state->config.milan_compliant &&
+                            !any_listener_acmp_connected(stream));
+        if (should_stop && stream->streaming) {
+          avb_stop_stream_out(state, i);
+        }
+      }
+      break;
+    }
+
     /* Listener leaving — wire-level rLv. */
     if (attr_event == mrp_attr_event_lv) {
       int lidx = find_connected_listener(stream, src_addr);
@@ -1231,6 +1264,14 @@ static void mrp_on_listener_registrar_change(
         avbinfo("MSRP: listener leaving stream %d", i);
         stream->connected_listeners[lidx].msrp_ready = false;
         stream->connected_listeners[lidx].asking_failed = false;
+        /* Purge MSRP-only rows (never completed ACMP) on leave —
+         * ACMP DISCONNECT_TX never matches them by identity, so
+         * leaving them in place inflates connection_count forever.
+         * ACMP-backed rows stay; DISCONNECT_TX remains authoritative
+         * for those. */
+        if (!stream->connected_listeners[lidx].acmp_connected) {
+          avb_remove_talker_listener_by_index(stream, lidx);
+        }
         bool should_stop = !any_listener_ready(stream) ||
                            (!state->config.milan_compliant &&
                             !any_listener_acmp_connected(stream));
@@ -2175,6 +2216,16 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
       mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
       mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
+      /* LV→MT expiry is reg_transition_none under the IN-centric edge
+       * rule, but it is the only signal that a peer which aged out via
+       * LeaveAll (never sent a wire Lv — rebooted, unplugged) is really
+       * gone: rLA itself fires no callback. Surface the expiry as a
+       * deregister; src_addr NULL tells the endpoint bookkeeping this
+       * is "whole registration gone", not one source leaving. */
+      if (tr == mrp_reg_transition_none && before == mrp_registrar_lv &&
+          e->sm.registrar == mrp_registrar_mt) {
+        tr = mrp_reg_transition_deregister;
+      }
       if (tr != mrp_reg_transition_none) {
         mrp_on_listener_registrar_change(state, port, &e->wire, tr,
                                          /*peer_decl_changed=*/true, NULL);
