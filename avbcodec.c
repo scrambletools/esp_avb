@@ -22,7 +22,15 @@
 /* MCLK/fs ratio. 384 keeps MCLK at 18.432/36.864 MHz through 96 kHz; at
  * 192 kHz drop to 192 (still 24-bit compatible: divisible by 3) so MCLK
  * stays at 36.864 MHz instead of an infeasible 73.7 MHz. */
-#define AVB_MCLK_MULTIPLE_FOR_RATE(rate) ((rate) > 96000 ? 192 : 384)
+/* MCLK ratios must match rows the ES8389 coeff table actually has:
+ * 48 kHz -> 384 (18.432 MHz), 96 kHz -> 256 and 192 kHz -> 128 (both
+ * 24.576 MHz — the codec's design-center master clock). The previous
+ * 192 ratio produced 36.864 MHz, which has NO table row: the codec's
+ * ADC/DAC modulator ratios were never programmed (ADC halved its
+ * output rate, DAC ran noisy and intermittently muted). 128/256 are
+ * not multiples of 3, so I2S must run 32-bit slots (see slot_cfg). */
+#define AVB_MCLK_MULTIPLE_FOR_RATE(rate)                                       \
+  ((rate) > 96000 ? 128 : (rate) == 96000 ? 256 : 384)
 #define AVB_MCLK_MULTIPLE                                                      \
   AVB_MCLK_MULTIPLE_FOR_RATE(state->config.default_sample_rate)
 
@@ -150,13 +158,19 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   /* Auto-clear stale DMA content so the DAC emits silence on underrun
    * rather than a loop of old samples. */
   chan_cfg.auto_clear = true;
-  /* Small DMA descriptors (6 frames = 1 AAF Class A packet worth,
-   * 125 µs at 48 kHz). 16 of them = 2 ms TX ring — Milan Class A's
-   * max_transit_time window. The listener drain in avtp.c runs as an
-   * esp_timer 1 ms task that calls i2s_channel_write; the I2S driver
-   * paces playout at the DAC rate. */
+  /* DMA pool must exceed one 1 ms drain period of audio at the highest
+   * rate, or i2s_channel_write can never fit a full drain batch and the
+   * excess is dropped at the jitter-ring write (measured ~16% sample
+   * loss at 192 kHz with the old 16-descriptor / 1 KB pool). Keep the
+   * small 6-frame descriptors — empirically, raising dma_frame_num to
+   * 24 (192 B buffers) silenced the DAC entirely at 192 kHz (cause not
+   * yet understood; 64 B buffers are proven) — and scale the descriptor
+   * COUNT instead: 64 × 64 B = 4 KB ≈ 2.7 ms at 192 kHz stereo
+   * 24-in-32. The listener drain in avtp.c runs as an esp_timer 1 ms
+   * task that calls i2s_channel_write; the I2S driver paces playout at
+   * the DAC rate. */
   chan_cfg.dma_frame_num = 6;
-  chan_cfg.dma_desc_num = 16;
+  chan_cfg.dma_desc_num = 64;
   ESP_ERROR_CHECK(
       i2s_new_channel(&chan_cfg, &state->i2s_tx_handle, &state->i2s_rx_handle));
   i2s_std_config_t std_cfg = {
@@ -196,6 +210,12 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    * matches AVTP wire order so the stream-in handler can memcpy AAF
    * payloads straight to the jitter ring with no per-sample shuffle. */
   std_cfg.slot_cfg.big_endian = true;
+  /* 24-bit PCM carried MSB-justified in 32-bit slots: [MSB MID LSB 00]
+   * in memory (big_endian). 32-bit slots lift the IDF requirement that
+   * mclk_multiple be a multiple of 3, which is what allows the 128/256
+   * ratios the ES8389 needs at 96/192 kHz. */
+  std_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_32BIT;
+  std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
 
   // Initialize the I2S TX and RX channels
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_tx_handle, &std_cfg));
@@ -225,7 +245,7 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    * sample rate changes with config. */
   state->media_clock.listener_sample_rate = state->config.default_sample_rate;
   state->media_clock.listener_byterate =
-      state->config.default_sample_rate * 2u * 3u;
+      state->config.default_sample_rate * 2u * 4u; /* 24-in-32 slots */
 
   /* Initialise the media-clock PLL now that I2S (and hence APLL) is up */
   uint32_t nominal_mclk =
@@ -416,7 +436,8 @@ esp_err_t avb_config_codec(avb_state_s *state) {
   }
 
   esp_codec_dev_sample_info_t fs = {
-      .bits_per_sample = state->config.default_bits_per_sample,
+      /* Match the 32-bit I2S slots (PCM is 24-in-32, MSB-justified). */
+      .bits_per_sample = 32,
       .channel = 2,
       .sample_rate = state->config.default_sample_rate,
       .mclk_multiple = AVB_MCLK_MULTIPLE,

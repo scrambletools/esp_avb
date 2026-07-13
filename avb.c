@@ -1303,7 +1303,7 @@ static void identify_tone_task(void *param) {
       -990239, -1195498, -1425006, -1682125, -1970389, -2293550};
 
   int frames_per_ms = 48;
-  uint8_t buf[48 * 6]; /* 1ms worth of 24-bit stereo */
+  uint8_t buf[48 * 8]; /* 1ms worth of 24-in-32 stereo */
   uint32_t duration_ms = 500;
   uint32_t phase = 0;
 
@@ -1322,7 +1322,8 @@ static void identify_tone_task(void *param) {
       int regs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
                     0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x11,
                     0x12, 0x13, 0x14, 0x31, 0x32, 0x33, 0x34, 0x35,
-                    0x37, 0x44, 0x45, 0xFD, 0xFE, 0xFF};
+                    0x37, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+                    0x47, 0x48, 0x49, 0x4A, 0xFD, 0xFE, 0xFF};
       char line[192];
       size_t pos = 0;
       pos += snprintf(line + pos, sizeof(line) - pos, "ES8311 regs:");
@@ -1368,10 +1369,12 @@ static void identify_tone_task(void *param) {
       p[0] = (val >> 16) & 0xFF;
       p[1] = (val >> 8) & 0xFF;
       p[2] = val & 0xFF;
-      p[3] = p[0];
-      p[4] = p[1];
-      p[5] = p[2];
-      p += 6;
+      p[3] = 0;
+      p[4] = p[0];
+      p[5] = p[1];
+      p[6] = p[2];
+      p[7] = 0;
+      p += 8;
       phase++;
     }
     size_t bw = 0;
@@ -1424,7 +1427,8 @@ static void avb_audio_test_task(void *param) {
       int regs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
                     0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x11,
                     0x12, 0x13, 0x14, 0x31, 0x32, 0x33, 0x34, 0x35,
-                    0x37, 0x44, 0x45, 0xFD, 0xFE, 0xFF};
+                    0x37, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+                    0x47, 0x48, 0x49, 0x4A, 0xFD, 0xFE, 0xFF};
       char line[192];
       size_t pos = 0;
       pos += snprintf(line + pos, sizeof(line) - pos, "ES8311 regs:");
@@ -1466,7 +1470,7 @@ static void avb_audio_test_task(void *param) {
   const int32_t amp = 4194304; /* ~0.5 of full-scale 24-bit */
   uint32_t frames_per_ms = actual_rate / 1000;
   if (frames_per_ms < 1) frames_per_ms = 1;
-  size_t buf_len = frames_per_ms * 6; /* 24-bit stereo = 6 bytes/frame */
+  size_t buf_len = frames_per_ms * 8; /* 24-in-32 stereo = 8 bytes/frame */
   uint8_t *buf = malloc(buf_len);
   if (buf) {
     float phase = 0.0f;
@@ -1478,8 +1482,9 @@ static void avb_audio_test_task(void *param) {
         p[0] = (v >> 16) & 0xFF;
         p[1] = (v >> 8)  & 0xFF;
         p[2] = v         & 0xFF;
-        p[3] = p[0]; p[4] = p[1]; p[5] = p[2];
-        p += 6;
+        p[3] = 0;
+        p[4] = p[0]; p[5] = p[1]; p[6] = p[2]; p[7] = 0;
+        p += 8;
         phase += phase_inc;
         if (phase >= two_pi) phase -= two_pi;
       }
