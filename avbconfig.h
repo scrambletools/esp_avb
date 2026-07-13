@@ -109,7 +109,7 @@
    .eth_handle = NULL,                                                         \
    .codec_type = avb_codec_type_es8311,                                        \
    .default_sample_rate = 48000,                                               \
-   .default_presentation_time_offset_ns = 2000000,                             \
+   .default_presentation_time_offset_ns = 12000000,                             \
    .default_bits_per_sample = 24,                                              \
    .input_channels_usable = 1,                                                 \
    .output_channels_usable = 1,                                                \

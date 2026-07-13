@@ -472,20 +472,22 @@ static uint8_t sample_rate_to_aaf_code(uint32_t sample_rate) {
 static void i2s24_to_am824_mono(const uint8_t *in, uint8_t *out,
                                 int num_samples, int stream_channels) {
   for (int s = 0; s < num_samples; s++) {
-    /* L channel from I2S — byte[0]=MSB, byte[1]=MID, byte[2]=LSB
-     * (big_endian=true in slot_cfg matches AVTP wire order) */
-    uint8_t msb = in[0], mid = in[1], lsb = in[2];
-    in += 3; /* skip L */
-    in += 3; /* skip R (mono codec, same or silence) */
+    /* Carry only ADC-L — byte[0]=MSB, byte[1]=MID, byte[2]=LSB
+     * (big_endian=true in slot_cfg matches AVTP wire order). The XLR
+     * mic lands on ADC-L (MIC1); ADC-R has no connected input on this
+     * board and captures only floating-input hiss (measured: constant
+     * −42 dBFS on the listener's R output), so send digital silence on
+     * every channel past ch0 rather than the noise. */
+    const uint8_t *l = in;
+    in += 8; /* 24-in-32 I2S slots, stereo capture frame */
     for (int ch = 0; ch < stream_channels; ch++) {
-      if (ch < 2) {
-        /* Duplicate mono mic to ch0 and ch1 */
-        out[0] = 0x40;
-        out[1] = msb;
-        out[2] = mid;
-        out[3] = lsb;
+      const uint8_t *src = (ch == 0) ? l : NULL;
+      out[0] = 0x40;
+      if (src) {
+        out[1] = src[0];
+        out[2] = src[1];
+        out[3] = src[2];
       } else {
-        out[0] = 0x40;
         out[1] = 0;
         out[2] = 0;
         out[3] = 0;
@@ -498,21 +500,22 @@ static void i2s24_to_am824_mono(const uint8_t *in, uint8_t *out,
 static void i2s24_to_aaf_mono(const uint8_t *in, uint8_t *out, int num_samples,
                               int stream_channels) {
   for (int s = 0; s < num_samples; s++) {
-    uint8_t msb = in[0], mid = in[1], lsb = in[2];
-    in += 3; /* skip L */
-    in += 3; /* skip R */
+    /* Carry only ADC-L (see i2s24_to_am824_mono — ADC-R is an
+     * unconnected input on this board, floating-input hiss only). */
+    const uint8_t *l = in;
+    in += 8; /* 24-in-32 I2S slots, stereo capture frame */
     for (int ch = 0; ch < stream_channels; ch++) {
-      if (ch < 2) {
-        out[0] = msb;
-        out[1] = mid;
-        out[2] = lsb;
-        out[3] = 0;
+      const uint8_t *src = (ch == 0) ? l : NULL;
+      if (src) {
+        out[0] = src[0];
+        out[1] = src[1];
+        out[2] = src[2];
       } else {
         out[0] = 0;
         out[1] = 0;
         out[2] = 0;
-        out[3] = 0;
       }
+      out[3] = 0;
       out += 4;
     }
   }
@@ -581,7 +584,7 @@ static void avb_stream_out_task(void *task_param) {
    * Extra channels (ch2-7) are zero-padded in the AVTP conversion.
    * Codec configures I2S with 24-bit data / 24-bit slot = 3 bytes/sample. */
   int i2s_channels = 2;         /* ES8311 mic is stereo */
-  int i2s_bytes_per_sample = 3; /* 24-bit slot */
+  int i2s_bytes_per_sample = 4; /* 24-in-32 slot: [MSB MID LSB 00] */
   int i2s_read_size =
       params->samples_per_packet * i2s_channels * i2s_bytes_per_sample;
 
@@ -697,6 +700,14 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t avtp_media_ts = 0;
   uint32_t avtp_ts_increment = (uint32_t)((uint64_t)params->samples_per_packet *
                                           1000000000ULL / params->sample_rate);
+  /* 61883-6 SYT_INTERVAL by rate family (IEC 61883-6 Table 4):
+   * ≤48 kHz → 8, 88.2/96 kHz → 16, 176.4/192 kHz → 32. Used with DBC
+   * to pick which data block the avtp_timestamp refers to. */
+  uint32_t syt_interval = params->sample_rate <= 48000   ? 8
+                          : params->sample_rate <= 96000 ? 16
+                                                         : 32;
+  uint32_t ns_per_sample = (uint32_t)((1000000000ULL + params->sample_rate / 2) /
+                                      params->sample_rate);
 
   /* Per-window min/max — seeded as INT32_MAX/MIN so the first sample
    * always captures as both ends of the range. Reset by the 1 Hz
@@ -772,6 +783,17 @@ static void avb_stream_out_task(void *task_param) {
   int mcr_hold_remaining = MCR_HOLD_PACKETS;
   bool tu_active = false;
   int tu_hold_remaining = 0;
+  /* Presentation-timestamp rate lock. ts_rate_corr_q16 is the extra
+   * ns/packet (Q16) added on top of the nominal increment so the
+   * timestamp clock advances at the MEASURED gPTP rate instead of the
+   * nominal esp_timer rate (~±30 ppm apart). Updated once per ~1 s
+   * window with a ±0.25 ns/pkt (≈2 ppm) step clamp: convergence is
+   * slow and one-directional, so listener clock-recovery loops (macOS
+   * SYT recovery chased the earlier sign-flipping slew into audible
+   * oscillation) see an essentially constant timestamp rate.
+   * ts_rate_frac_q16 carries the sub-ns remainder between packets. */
+  int32_t ts_rate_corr_q16 = 0;
+  int32_t ts_rate_frac_q16 = 0;
 
 /* I2S RX local ring — absorbs DMA buffer timing mismatch.
  * Read larger chunks when available, consume i2s_read_size per packet. */
@@ -992,11 +1014,17 @@ static void avb_stream_out_task(void *task_param) {
       next_send_time += params->interval;
     }
 
-    /* Advance AVTP media clock by exact nominal increment. TX cadence
-     * is gPTP-paced by the filtered scheduler above, so our counter
-     * tracks gPTP rate correctly without per-packet clock_gettime
-     * jitter leaking into presentation timestamps. */
-    avtp_media_ts += avtp_ts_increment;
+    /* Advance AVTP media clock by the nominal increment plus the
+     * rate-lock correction (Q16 sub-ns carry). The nominal-only
+     * advance accumulated residual pacing error (~35 ppm) without
+     * bound — measured 86 ms of presentation-timestamp staleness on
+     * the wire after 40 min, which strict listeners (macOS) answer
+     * with silence while lenient ones (our pt-gate fallback, 8D)
+     * keep playing. */
+    ts_rate_frac_q16 += ts_rate_corr_q16;
+    int32_t ts_whole_ns = ts_rate_frac_q16 >> 16;
+    ts_rate_frac_q16 -= ts_whole_ns << 16;
+    avtp_media_ts += avtp_ts_increment + (uint32_t)ts_whole_ns;
 
     /* Check for gPTP BTC change every ~1 second (8000 packets at 125us) */
     if ((loop_count & 0x1FFF) == 0 && loop_count > 0) {
@@ -1012,22 +1040,85 @@ static void avb_stream_out_task(void *task_param) {
        * valid if we've actually taken a gPTP reference; skipped on the
        * very first publish. */
       int32_t drift_ppm_q8 = 0;
-      if (drift_ref_valid) {
+      {
+        /* One gPTP read per ~1 s window, independent of the cadence
+         * filter — the previous placement inside the gptp_cadence_ready
+         * path meant that with CADENCE_LOCK_INTERVAL_S=0 the drift stat
+         * AND the timestamp anchor below never armed (drift printed
+         * 0.00 and timestamps walked off unbounded). */
         struct timespec ts_now;
         if (ptpd_now(&ts_now) == 0) {
           int64_t now_gptp_ns = (int64_t)ts_now.tv_sec * 1000000000LL +
                                 (int64_t)ts_now.tv_nsec;
           int64_t now_esp_us = esp_timer_get_time();
-          int64_t gptp_elapsed_ns = now_gptp_ns - drift_gptp_ref_ns;
-          int64_t esp_elapsed_ns = (now_esp_us - drift_esp_ref_us) * 1000LL;
-          if (esp_elapsed_ns > 100000000LL /* > 100 ms of baseline */) {
-            int64_t diff_ns = gptp_elapsed_ns - esp_elapsed_ns;
-            /* ppm × 256 = diff/esp_elapsed × 1e6 × 256 */
-            drift_ppm_q8 = (int32_t)((diff_ns * 1000000LL * 256LL) / esp_elapsed_ns);
+          bool drift_fresh = false;
+          if (drift_ref_valid) {
+            int64_t gptp_elapsed_ns = now_gptp_ns - drift_gptp_ref_ns;
+            int64_t esp_elapsed_ns = (now_esp_us - drift_esp_ref_us) * 1000LL;
+            if (esp_elapsed_ns > 100000000LL /* > 100 ms of baseline */) {
+              int64_t diff_ns = gptp_elapsed_ns - esp_elapsed_ns;
+              /* ppm × 256 = diff/esp_elapsed × 1e6 × 256 */
+              drift_ppm_q8 =
+                  (int32_t)((diff_ns * 1000000LL * 256LL) / esp_elapsed_ns);
+              drift_fresh = true;
+            }
           }
-          /* Re-baseline so next window's measurement is independent. */
+          /* (Re-)baseline so next window's measurement is independent. */
           drift_gptp_ref_ns = now_gptp_ns;
           drift_esp_ref_us = now_esp_us;
+          drift_ref_valid = true;
+
+          /* Presentation-timestamp rate lock. The timestamp clock must
+           * advance at the true gPTP rate; packets are paced by
+           * esp_timer, so the correct per-packet increment is
+           * nominal × (1 + drift), with drift_ppm_q8 the rate error
+           * measured directly above. Slew ts_rate_corr_q16 toward that
+           * measured target with a ±0.25 ns/pkt (≈2 ppm) step per
+           * window — earlier error-nulling slews flipped sign every
+           * second (±40 ppm square wave) and macOS's SYT clock
+           * recovery chased them into audible oscillation; a
+           * rate-target lock converges one-directionally in ~15 s and
+           * then holds essentially constant. A clamped ±0.5 ns/pkt
+           * (≈4 ppm) offset-pull drains residual phase error; > 5 ms
+           * error (BTC change, servo step, long stall) hard re-anchors
+           * with tu so listeners resync. */
+          int32_t ts_err = (int32_t)(avtp_media_ts - (uint32_t)now_gptp_ns);
+          if (ts_err > 5000000 || ts_err < -5000000) {
+            avtp_media_ts = (uint32_t)now_gptp_ns;
+            ts_rate_corr_q16 = 0;
+            ts_rate_frac_q16 = 0;
+            tu_active = true;
+            tu_hold_remaining = MCR_HOLD_PACKETS;
+          } else {
+            /* Target extra ns/pkt (Q16) from the measured rate error:
+             * interval_ns × drift_ppm_q8 / (256 × 1e6). On windows
+             * with no qualifying drift measurement, hold the current
+             * rate rather than dragging it toward zero. */
+            int64_t target_q16 =
+                drift_fresh
+                    ? (((int64_t)params->interval * 1000LL * drift_ppm_q8)
+                       << 16) / (256LL * 1000000LL)
+                    : ts_rate_corr_q16;
+            /* Offset pull: drain ts_err at ≤4 ppm. */
+            int64_t off_q16 = -(((int64_t)ts_err) << 16) / (8192 * 4);
+            if (off_q16 > 32768)
+              off_q16 = 32768;
+            else if (off_q16 < -32768)
+              off_q16 = -32768;
+            int64_t want = target_q16 + off_q16;
+            /* Clamp total correction to ±128 ppm (±16 ns/pkt). */
+            if (want > (16LL << 16))
+              want = 16LL << 16;
+            else if (want < -(16LL << 16))
+              want = -(16LL << 16);
+            /* Step toward the target ≤0.25 ns/pkt (≈2 ppm) per window. */
+            int64_t step = want - ts_rate_corr_q16;
+            if (step > 16384)
+              step = 16384;
+            else if (step < -16384)
+              step = -16384;
+            ts_rate_corr_q16 += (int32_t)step;
+          }
         }
       }
 
@@ -1058,14 +1149,14 @@ static void avb_stream_out_task(void *task_param) {
     }
 
     /* Update per-packet fields in tx_frame.
-     * sv=1 always, tv=1 always, mr per state, tu per gPTP status. */
-    uint8_t hdr1 = 0x81; /* sv=1, version=0, mr=0, tv=1 */
+     * sv=1 always, mr per state, tu per gPTP status. tv per the
+     * 61883-6 SYT rule below (AAF: always valid, first sample). */
+    uint8_t hdr1 = 0x80; /* sv=1, version=0, mr=0 */
     if (mcr_hold_remaining > 0) {
       if (mr_state)
         hdr1 |= 0x08; /* mr=1 */
       mcr_hold_remaining--;
     }
-    avtp[1] = hdr1;
     avtp[3] = tu_active ? 0x01 : 0x00;
     if (tu_hold_remaining > 0) {
       tu_hold_remaining--;
@@ -1075,17 +1166,38 @@ static void avb_stream_out_task(void *task_param) {
     avtp[2] = seq_num++;
     uint32_t presentation_ts =
         avtp_media_ts + params->presentation_time_offset_ns;
+    bool ts_valid = true;
+
+    if (is_am824) {
+      /* Update DBC in CIP header, and apply the IEEE 1722 61883-6
+       * timestamp rule: with SYT=0xFFFF the avtp_timestamp refers to
+       * the data block at the next SYT_INTERVAL boundary — the first
+       * block i in this PDU with (DBC + i) mod SYT_INTERVAL == 0 —
+       * NOT to the PDU's first sample; PDUs containing no boundary
+       * carry tv=0. Stamping every PDU's first sample with tv=1 made
+       * spec-strict listeners (macOS) place samples with a cyclic
+       * error of up to SYT_INTERVAL-1 samples (24 spp vs interval 32
+       * at 192 kHz → 0/8/16/invalid pattern, ±125 µs) — audible as
+       * constant grainy glitching that lenient listeners never see. */
+      uint8_t *cip = avtp + TX_AVTP_HDR_LEN;
+      cip[3] = (uint8_t)(dbc & 0xFF);
+      uint32_t phase = (uint32_t)dbc % syt_interval;
+      uint32_t k = (syt_interval - phase) % syt_interval;
+      if (k >= (uint32_t)params->samples_per_packet) {
+        ts_valid = false; /* no SYT_INTERVAL boundary in this PDU */
+      } else {
+        presentation_ts += k * ns_per_sample;
+      }
+      dbc += params->samples_per_packet;
+    }
+
+    if (ts_valid)
+      hdr1 |= 0x01; /* tv=1 */
+    avtp[1] = hdr1;
     avtp[12] = (presentation_ts >> 24) & 0xFF;
     avtp[13] = (presentation_ts >> 16) & 0xFF;
     avtp[14] = (presentation_ts >> 8) & 0xFF;
     avtp[15] = presentation_ts & 0xFF;
-
-    if (is_am824) {
-      /* Update DBC in CIP header */
-      uint8_t *cip = avtp + TX_AVTP_HDR_LEN;
-      cip[3] = (uint8_t)(dbc & 0xFF);
-      dbc += params->samples_per_packet;
-    }
 
     /* Get audio data and convert directly into tx_frame */
     uint8_t *audio_dst = tx_frame + audio_offset;
@@ -1248,7 +1360,7 @@ typedef struct {
   _Atomic uint32_t tail;   /* read position (consumer only) */
 } jitter_ring_t;
 
-#define JITTER_RING_SIZE 16384
+#define JITTER_RING_SIZE 65536
 /* FALLBACK-mode startup prefill (~28 ms at 48 kHz stereo 24-bit) —
  * used only when the presentation-time gate cannot arm (tu=1 stream,
  * no valid gPTP, stale anchor). Arrival-relative latency, sized for
@@ -1513,8 +1625,8 @@ static void stream_in_drain_cb(void *arg) {
   uint32_t to_read = avail;
   if (to_read > DRAIN_MAX_BYTES)
     to_read = DRAIN_MAX_BYTES;
-  /* Align to frame boundary (6 bytes = stereo 24-bit sample pair) */
-  to_read = (to_read / 6) * 6;
+  /* Align to frame boundary (8 bytes = stereo 24-in-32 sample pair) */
+  to_read = (to_read / 8) * 8;
   if (to_read == 0)
     return;
 
@@ -1710,7 +1822,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * AAF wire format, which lets us memcpy the 3 sample bytes straight
    * across. AM824 prefixes a label byte; skip it. Extra channels are
    * ignored. */
-  uint32_t total = (uint32_t)samples * 6; /* stereo 24-bit */
+  uint32_t total = (uint32_t)samples * 8; /* stereo 24-in-32 slots */
   uint32_t pre_fill = ring_readable(&ctx->ring);
   if (total > 0 && ring_writable(&ctx->ring) >= total) {
     uint32_t h = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
@@ -1724,8 +1836,9 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
         uint32_t p0 = (h + offset + 0) & mask;
         uint32_t p1 = (h + offset + 1) & mask;
         uint32_t p2 = (h + offset + 2) & mask;
+        uint32_t p3 = (h + offset + 3) & mask;
         if (subtype == avtp_subtype_aaf) {
-          /* AAF: [MSB, MID, LSB, pad] → I2S memory [MSB, MID, LSB] */
+          /* AAF: [MSB, MID, LSB, pad] → I2S memory [MSB, MID, LSB, 0] */
           if (src_offset + 2 < pcm_len) {
             rbuf[p0] = pcm_data[src_offset + 0];
             rbuf[p1] = pcm_data[src_offset + 1];
@@ -1733,7 +1846,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
           } else {
             rbuf[p0] = rbuf[p1] = rbuf[p2] = 0;
           }
-        } else { /* AM824: [label, MSB, MID, LSB] → [MSB, MID, LSB] */
+        } else { /* AM824: [label, MSB, MID, LSB] → [MSB, MID, LSB, 0] */
           if (src_offset + 3 < pcm_len) {
             rbuf[p0] = pcm_data[src_offset + 1];
             rbuf[p1] = pcm_data[src_offset + 2];
@@ -1742,7 +1855,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
             rbuf[p0] = rbuf[p1] = rbuf[p2] = 0;
           }
         }
-        offset += 3;
+        rbuf[p3] = 0; /* LSB pad of the 32-bit slot */
+        offset += 4;
       }
     }
     /* Publish — drain can't see any of the bytes we just wrote until
@@ -1841,6 +1955,20 @@ void avb_stream_in_print_diag(void) {
           : ctx->diag_gate_mode == 2 ? "prefill"
                                      : "none",
           (long)ctx->diag_gate_err_ns, (unsigned long)ctx->diag_gate_fill);
+  /* Ground-truth snapshot of what the drain is feeding the DAC: 12
+   * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
+   * "ring holds real audio, fault is downstream of i2s_channel_write"
+   * from "ring holds silence/garbage, fault is in extraction". */
+  {
+    uint32_t t = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+    uint32_t mask = ctx->ring.capacity - 1;
+    uint8_t snap[12];
+    for (int i = 0; i < 12; i++)
+      snap[i] = ctx->ring.buf[(t + i) & mask];
+    avbinfo("STREAM-RING tail: %02x%02x%02x %02x%02x%02x | %02x%02x%02x %02x%02x%02x",
+            snap[0], snap[1], snap[2], snap[3], snap[4], snap[5], snap[6],
+            snap[7], snap[8], snap[9], snap[10], snap[11]);
+  }
   last_pkt = packets;
   last_ok = ok;
   last_fail = fail;
