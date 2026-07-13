@@ -20,6 +20,7 @@
 
 #include "avb.h"
 #include "esp_ptp.h"
+#include "esp_cpu.h"
 #include "esp_timer.h"
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
@@ -273,8 +274,39 @@ void avb_net_rx_breakdown(uint32_t *total, uint32_t *avtp, uint32_t *msrp,
  *   0x88f7 (PTP)  → L2TAP filter on EMAC ingress; ptp_handler on Wi-Fi
  *   default        → L2TAP filter then esp_netif_receive (ARP, IP, etc.)
  */
+/* Hot-path cycle profiler: total dispatcher cycles and stream-handler
+ * cycles, accumulated per frame; read+reset by the stats printer to
+ * localize emac_rx CPU burn (our callback vs the esp_eth driver). */
+static volatile uint32_t s_prof_cb_frames = 0;
+static volatile uint32_t s_prof_cb_cycles = 0;
+static volatile uint32_t s_prof_stream_frames = 0;
+static volatile uint32_t s_prof_stream_cycles = 0;
+void avb_net_rx_prof(uint32_t *cb_frames, uint32_t *cb_cycles,
+                     uint32_t *stream_frames, uint32_t *stream_cycles) {
+  if (cb_frames) *cb_frames = s_prof_cb_frames;
+  if (cb_cycles) *cb_cycles = s_prof_cb_cycles;
+  if (stream_frames) *stream_frames = s_prof_stream_frames;
+  if (stream_cycles) *stream_cycles = s_prof_stream_cycles;
+  s_prof_cb_frames = s_prof_cb_cycles = 0;
+  s_prof_stream_frames = s_prof_stream_cycles = 0;
+}
+
+static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
+                                         uint8_t *buf, uint32_t len,
+                                         void *priv, void *info);
+
 static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
                                    uint32_t len, void *priv, void *info) {
+  uint32_t c0 = esp_cpu_get_cycle_count();
+  esp_err_t r = avb_unified_rx_cb_inner(eth_handle, buf, len, priv, info);
+  s_prof_cb_cycles += esp_cpu_get_cycle_count() - c0;
+  s_prof_cb_frames++;
+  return r;
+}
+
+static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
+                                         uint8_t *buf, uint32_t len,
+                                         void *priv, void *info) {
   if (len < ETH_HEADER_LEN) {
     free(buf);
     return ESP_OK;
@@ -385,7 +417,10 @@ static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
      * handler → free. */
     if (s_stream_handler && len > 18) {
       /* Strip ETH header (14) + VLAN tag (4) = 18 bytes → raw AVTP */
+      uint32_t c0 = esp_cpu_get_cycle_count();
       s_stream_handler(buf + 18, len - 18, s_stream_ctx);
+      s_prof_stream_cycles += esp_cpu_get_cycle_count() - c0;
+      s_prof_stream_frames++;
     }
     free(buf);
     return ESP_OK;

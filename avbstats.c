@@ -287,6 +287,20 @@ static void avb_cpu_stats_tick(void) {
   avbinfo("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
           rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other);
 
+  /* Hot-path cycle profile of the unified RX dispatcher (per stats
+   * window, self-resetting). cyc/frame localizes emac_rx CPU burn:
+   * high cb-avg = our dispatch/handler; low cb-avg with emac_rx task
+   * still hot = the esp_eth driver side. */
+  {
+    extern void avb_net_rx_prof(uint32_t *, uint32_t *, uint32_t *,
+                                uint32_t *);
+    uint32_t cbf, cbc, stf, stc;
+    avb_net_rx_prof(&cbf, &cbc, &stf, &stc);
+    avbinfo("  ====> RX prof: cb=%u frames avg=%u cyc | stream=%u frames "
+            "avg=%u cyc",
+            cbf, cbf ? cbc / cbf : 0, stf, stf ? stc / stf : 0);
+  }
+
 #ifdef AVB_WIFI_RX_STATS
   /* L1/L2 RX localization for the C6 Wi-Fi RX-stall. Three layers, all
    * printed here in the slow stats task — NO logging in the RX hot path:
