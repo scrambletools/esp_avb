@@ -127,7 +127,19 @@ static int mclk_hw_tune_ppm_q16(int32_t ppm_q16) {
              target_hz);
     return -1;
   }
-  rtc_clk_apll_coeff_set(o_div, sdm0, sdm1, sdm2);
+  /* Latch the new SDM coefficients directly (clk_ll_apll_set_config)
+   * instead of rtc_clk_apll_coeff_set: the rtc_clk variant runs a full
+   * analog recalibration on every call, which disturbs the APLL output
+   * long enough that the ES8389 (I2S slave, MCLK-referenced) mutes and
+   * latches — root cause of the runtime DAC death that tracked the
+   * first retunes after media lock (proven 2026-07-11 by suppressing
+   * retunes: 38 suppressed, output survived; with retunes, dead within
+   * the first correction cycles). The bare SDM latch is the same
+   * sequence rtc_clk_apll_coeff_set performs BEFORE calibration, and
+   * the sigma-delta modulator absorbs ppm-scale steps smoothly. Within
+   * our ±hundreds-ppm tuning range o_div/sdm2 never change from the
+   * boot values, so skipping calibration is safe. */
+  clk_ll_apll_set_config(o_div, sdm0, sdm1, sdm2);
   s_hw.actual_apll_hz = real_hz;
   /* Hardware readback truth-check: the `hw=` figure in the stats line
    * is derived from actual_apll_hz (bookkeeping); this log line proves
