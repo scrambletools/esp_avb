@@ -1445,7 +1445,39 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
    * 6 (no-op) per the spec when num_vals < 3. */
   mrp_registrar_state_e before = e->sm.registrar;
   mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
-  return mrp_reg_transition(before, e->sm.registrar);
+  mrp_reg_transition_e trans = mrp_reg_transition(before, e->sm.registrar);
+  if (attr_type == msrp_attr_type_talker_failed &&
+      trans == mrp_reg_transition_register) {
+    const uint8_t *sid = wire->talker.info.stream_id;
+    ESP_LOGW("avb_srp",
+             "MSRP: TALKER_FAILED registered for stream "
+             "%02x%02x%02x%02x%02x%02x%02x%02x, code=%u",
+             sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
+             wire->talker_failed.failure_code);
+  }
+  /* §35.2.4: TALKER_ADVERTISE and TALKER_FAILED are alternate
+   * declarations of the same Talker attribute, so registering one
+   * displaces the other. Without this a transient TALKER_FAILED
+   * latches forever — the bridge sends no Failed-type PDUs once
+   * healthy, so no per-type LeaveAll ever ages the stale registrar
+   * out, and decl_event keeps reporting ReadyFailed. */
+  if (e->sm.registrar == mrp_registrar_in ||
+      e->sm.registrar == mrp_registrar_lv) {
+    msrp_attr_type_t twin_type = (attr_type == msrp_attr_type_talker_failed)
+                                     ? msrp_attr_type_talker_advertise
+                                     : msrp_attr_type_talker_failed;
+    msrp_talker_entry_t *twin = msrp_talker_find(
+        port, (const unique_id_t *)&wire->talker.info.stream_id, twin_type);
+    if (twin != NULL && twin->sm.registrar != mrp_registrar_mt) {
+      twin->sm.registrar = mrp_registrar_mt;
+      ESP_LOGW("avb_srp", "MSRP: talker %s displaced stale %s registration",
+               (attr_type == msrp_attr_type_talker_failed) ? "FAILED"
+                                                           : "ADVERTISE",
+               (attr_type == msrp_attr_type_talker_failed) ? "ADVERTISE"
+                                                           : "FAILED");
+    }
+  }
+  return trans;
 }
 
 /* Process one LISTENER attribute. */
