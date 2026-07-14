@@ -4,8 +4,10 @@
  *
  * ESP_AVB Component — CPU/task diagnostic
  *
- * Temporary investigative tool. Prints per-task %CPU, per-core
- * utilization, and stack high-water marks every AVB_STATS_WINDOW_MS.
+ * Collects per-task %CPU, per-core utilization, and stack high-water
+ * marks every AVB_STATS_WINDOW_MS. The verbose per-task/CPU/RX dumps
+ * log at debug level (compiled out at the default log level); only
+ * the heap line and abnormal EMAC counters appear at info.
  * Computes deltas between two snapshots of uxTaskGetSystemState so
  * each window is independent.
  *
@@ -174,9 +176,9 @@ static void avb_cpu_stats_tick(void) {
   }
 
   uint32_t idle0_delta = 0, idle1_delta = 0;
-  avbinfo("CPU-STATS: window=%lldms (%u tasks)", window_us / 1000,
+  avbdebug("CPU-STATS: window=%lldms (%u tasks)", window_us / 1000,
           (unsigned)cur_n);
-  avbinfo("  %-16s core prio  %%cpu  stackHW  state", "task");
+  avbdebug("  %-16s core prio  %%cpu  stackHW  state", "task");
 
   for (UBaseType_t i = 0; i < cur_n; i++) {
     /* Find matching prior entry by stable xTaskNumber. */
@@ -230,7 +232,7 @@ static void avb_cpu_stats_tick(void) {
       break;
     }
 
-    avbinfo("  %-16s %4s %4u  %3u%%  %7u  %s", cur[i].pcTaskName, core_s,
+    avbdebug("  %-16s %4s %4u  %3u%%  %7u  %s", cur[i].pcTaskName, core_s,
             (unsigned)cur[i].uxCurrentPriority, pct,
             (unsigned)cur[i].usStackHighWaterMark, state_s);
 
@@ -249,7 +251,7 @@ static void avb_cpu_stats_tick(void) {
       100 - (uint32_t)((uint64_t)idle0_delta * 100u / (uint64_t)window_us);
   uint32_t cpu1_busy =
       100 - (uint32_t)((uint64_t)idle1_delta * 100u / (uint64_t)window_us);
-  avbinfo("  ====> CPU0 busy=%u%% idle=%u%%  |  CPU1 busy=%u%% idle=%u%%",
+  avbdebug("  ====> CPU0 busy=%u%% idle=%u%%  |  CPU1 busy=%u%% idle=%u%%",
           cpu0_busy, 100 - cpu0_busy, cpu1_busy, 100 - cpu1_busy);
 
   /* Break AVB-OUT's CPU time down into "real work" vs. busy-wait spin.
@@ -260,7 +262,7 @@ static void avb_cpu_stats_tick(void) {
     uint64_t dwork = cur_work - s_prev_avbout_work_us;
     uint32_t work_pct =
         (uint32_t)((dwork * 100ull) / (uint64_t)window_us);
-    avbinfo("  ====> AVB-OUT real work=%u%% (rest of its slot is busy-wait)",
+    avbdebug("  ====> AVB-OUT real work=%u%% (rest of its slot is busy-wait)",
             work_pct);
   }
   s_prev_avbout_work_us = cur_work;
@@ -272,7 +274,7 @@ static void avb_cpu_stats_tick(void) {
   uint32_t dptp = cur_ptp - s_prev_ptp_rx_seen;
   extern uint32_t avb_net_ptp_l2tap_consumed(void);
   extern uint32_t avb_net_ptp_l2tap_unmatched(void);
-  avbinfo("  ====> PTP frames: emac_rx=%u l2tap_consumed=%u l2tap_unmatched=%u",
+  avbdebug("  ====> PTP frames: emac_rx=%u l2tap_consumed=%u l2tap_unmatched=%u",
           dptp, avb_net_ptp_l2tap_consumed(), avb_net_ptp_l2tap_unmatched());
   s_prev_ptp_rx_seen = cur_ptp;
 
@@ -284,7 +286,7 @@ static void avb_cpu_stats_tick(void) {
   uint32_t rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other;
   avb_net_rx_breakdown(&rx_total, &rx_avtp, &rx_msrp, &rx_mvrp, &rx_vlan,
                        &rx_other);
-  avbinfo("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
+  avbdebug("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
           rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other);
 
   /* Hot-path cycle profile of the unified RX dispatcher (per stats
@@ -296,14 +298,15 @@ static void avb_cpu_stats_tick(void) {
                                 uint32_t *);
     uint32_t cbf, cbc, stf, stc;
     avb_net_rx_prof(&cbf, &cbc, &stf, &stc);
-    avbinfo("  ====> RX prof: cb=%u frames avg=%u cyc | stream=%u frames "
+    avbdebug("  ====> RX prof: cb=%u frames avg=%u cyc | stream=%u frames "
             "avg=%u cyc",
             cbf, cbf ? cbc / cbf : 0, stf, stf ? stc / stf : 0);
   }
 
 #ifdef AVB_WIFI_RX_STATS
-  /* L1/L2 RX localization for the C6 Wi-Fi RX-stall. Three layers, all
-   * printed here in the slow stats task — NO logging in the RX hot path:
+  /* L1/L2 RX localization for the C6 Wi-Fi RX-stall. Three layers,
+   * all collected here in the slow stats task and logged at debug
+   * level — NO logging in the RX hot path:
    *   L1 = esp_wifi driver/MAC counters (esp_wifi_get_rx_statistics):
    *        frames the radio+driver actually received, below our callback.
    *   L2 = avb_net_wifi_rx_cb_count(): entries into avb_wifi_rx_cb,
@@ -324,12 +327,12 @@ static void avb_cpu_stats_tick(void) {
   esp_test_rx_statistics_t rxs;
   memset(&rxs, 0, sizeof(rxs));
   if (s_rx_stats_enabled && esp_wifi_get_rx_statistics(0, &rxs) == ESP_OK) {
-    avbinfo("  ====> WIFI L1 rx legacy=%u ht=%u ht_retry=%u rx_isr=%u "
+    avbdebug("  ====> WIFI L1 rx legacy=%u ht=%u ht_retry=%u rx_isr=%u "
             "rx_nblks=%u | L2 wifi_cb=%u",
             rxs.legacy, rxs.ht, rxs.ht_retry, rxs.rx_isr, rxs.rx_nblks,
             avb_net_wifi_rx_cb_count());
   } else {
-    avbinfo("  ====> WIFI L1 rx stats pending/unavailable | L2 wifi_cb=%u",
+    avbdebug("  ====> WIFI L1 rx stats pending/unavailable | L2 wifi_cb=%u",
             avb_net_wifi_rx_cb_count());
   }
 #endif
@@ -356,20 +359,26 @@ static void avb_cpu_stats_tick(void) {
    * from esp_wifi instead and these registers don't exist. */
 #if SOC_EMAC_SUPPORTED
   uint32_t dma_miss = EMAC_DMA.dmamissedfr.val;
-  avbinfo("  ====> EMAC DMA missed_fc=%u overflow_fc=%u bmfc_ovf=%u bfoc_ovf=%u",
-          (unsigned)(dma_miss & 0xFFFF),
-          (unsigned)((dma_miss >> 17) & 0x7FF),
-          (unsigned)((dma_miss >> 16) & 1),
-          (unsigned)((dma_miss >> 28) & 1));
+  /* Quiet when clean: these registers are all-zero in normal operation,
+   * so an info-level line only appears when frames were actually lost. */
+  if (dma_miss != 0) {
+    avbinfo("  ====> EMAC DMA missed_fc=%u overflow_fc=%u bmfc_ovf=%u bfoc_ovf=%u",
+            (unsigned)(dma_miss & 0xFFFF),
+            (unsigned)((dma_miss >> 17) & 0x7FF),
+            (unsigned)((dma_miss >> 16) & 1),
+            (unsigned)((dma_miss >> 28) & 1));
+  }
   /* RX un-wedge guard activity (see avb_emac_rx_unwedge_tick): all
    * three counters are 0 in normal operation. Nonzero kicks/toggles
    * mean the guard caught a suspended DMA; nonzero recovers mean a
    * full MTL FIFO reset was needed. */
-  avbinfo("  ====> EMAC unwedge kicks=%u toggles=%u recovers=%u rs=%u",
-          (unsigned)s_emac_kick_count,
-          (unsigned)s_emac_toggle_count,
-          (unsigned)s_emac_recover_count,
-          (unsigned)((EMAC_DMA.dmastatus.val >> 17) & 0x7));
+  if (s_emac_kick_count || s_emac_toggle_count || s_emac_recover_count) {
+    avbinfo("  ====> EMAC unwedge kicks=%u toggles=%u recovers=%u rs=%u",
+            (unsigned)s_emac_kick_count,
+            (unsigned)s_emac_toggle_count,
+            (unsigned)s_emac_recover_count,
+            (unsigned)((EMAC_DMA.dmastatus.val >> 17) & 0x7));
+  }
 #endif
 
   /* Stream-in (listener) + stream-out (talker) + MCLK / PLL state —

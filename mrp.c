@@ -1089,11 +1089,9 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
      * met by any 802.11 medium, so the stream is not admissible. Per
      * 802.1Q-2018 §35.2.4.3, declare TALKER_FAILED with
      * insufficient_bandwidth_for_traffic_class so the downstream
-     * listener sees ReadyFailed and reports the problem upward. The
-     * earlier "silent skip" looked equivalent but actually masked the
-     * failure — ACMP/MSRP both reported SUCCESS while no audio could
-     * ever flow, because the talker never learned the path was
-     * broken.
+     * listener sees ReadyFailed and reports the problem upward
+     * (a silent skip would let ACMP/MSRP report SUCCESS on a path
+     * that can never carry audio).
      *
      * Bench-experiment escape hatch: allow_class_a_over_wifi lets a
      * deployment opt into propagating Class A onto Wi-Fi anyway, at
@@ -2186,13 +2184,13 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
     return false;
   bool fired = false;
-  /* Each Registrar that expires LV→MT crosses a deregister transition
-   * that the application layer must see — endpoint bookkeeping clears
-   * the per-stream MSRP failure_code, bridge MAP releases the admitted
-   * bandwidth and withdraws the propagated declaration. Without these
-   * callbacks, every LeaveAll cycle leaks admission on the bridge
-   * (every rJoin after expiry fires a fresh register+admit, but the
-   * matching release never happens). */
+  /* LV→MT expiry is reg_transition_none under the IN-centric edge
+   * rule (the deregister edge fired at IN→LV, when the callback ran
+   * from the RX path). Talker/domain loops therefore fire no callback
+   * here. LISTENER attributes are the exception: a peer that ages out
+   * via LeaveAll never sends a wire Lv, and the rLA dispatch fires no
+   * callbacks, so the listener loop below surfaces the expiry as an
+   * explicit deregister for the talker-side bookkeeping. */
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
     if (!e->valid)

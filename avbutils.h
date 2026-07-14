@@ -23,6 +23,10 @@
 #define avbinfo(format, ...) ESP_LOGI("AVB", format, ##__VA_ARGS__)
 #define avbwarn(format, ...) ESP_LOGW("AVB", format, ##__VA_ARGS__)
 #define avberr(format, ...) ESP_LOGE("AVB", format, ##__VA_ARGS__)
+/* Verbose diagnostics (per-window task/CPU/RX dumps). Compiled out at
+ * the default log level; raise CONFIG_LOG_MAXIMUM_LEVEL to DEBUG and
+ * esp_log_level_set("AVB", ESP_LOG_DEBUG) to see them. */
+#define avbdebug(format, ...) ESP_LOGD("AVB", format, ##__VA_ARGS__)
 
 #define ETH_MAX_PAYLOAD_LENGTH 1486
 
