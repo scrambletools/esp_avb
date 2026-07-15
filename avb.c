@@ -1678,6 +1678,113 @@ static void avb_persist_fill_output_stream_record(
   dst->stream.presentation_time_offset_ns = src->presentation_time_offset_ns;
 }
 
+/* Rewrite the stream journal as one latest record per stream and erase
+ * the rest. The journal is append-only with a unique NVS key per
+ * record, so binding churn eventually exhausts the namespace and every
+ * later append fails with ESP_ERR_NVS_NOT_ENOUGH_SPACE — after which
+ * new bindings silently stop persisting (observed at seq 192: CRF
+ * rebinds never survived a reboot). Runs at boot after replay and as
+ * the retry path when an append hits the space limit. */
+static esp_err_t avb_persist_compact_stream_journal(void) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (err != ESP_OK)
+    return err;
+
+  uint32_t latest_in[AVB_PERSIST_MAX_INPUT_STREAMS] = {0};
+  uint32_t latest_out[AVB_PERSIST_MAX_OUTPUT_STREAMS] = {0};
+  static avb_persist_input_stream_journal_s in_rec[AVB_PERSIST_MAX_INPUT_STREAMS];
+  static avb_persist_output_stream_journal_s out_rec[AVB_PERSIST_MAX_OUTPUT_STREAMS];
+  memset(in_rec, 0, sizeof(in_rec));
+  memset(out_rec, 0, sizeof(out_rec));
+
+  /* Pass 1: newest record per stream. */
+  nvs_iterator_t it = NULL;
+  err = nvs_entry_find_in_handle(handle, NVS_TYPE_BLOB, &it);
+  while (err == ESP_OK && it) {
+    nvs_entry_info_t info;
+    if (nvs_entry_info(it, &info) == ESP_OK) {
+      bool input = false;
+      uint16_t index = 0;
+      uint32_t seq = 0;
+      if (avb_persist_parse_stream_journal_key(info.key, &input, &index,
+                                               &seq)) {
+        if (input && index < AVB_PERSIST_MAX_INPUT_STREAMS &&
+            seq >= latest_in[index]) {
+          size_t len = sizeof(in_rec[index]);
+          if (nvs_get_blob(handle, info.key, &in_rec[index], &len) == ESP_OK)
+            latest_in[index] = seq;
+        } else if (!input && index < AVB_PERSIST_MAX_OUTPUT_STREAMS &&
+                   seq >= latest_out[index]) {
+          size_t len = sizeof(out_rec[index]);
+          if (nvs_get_blob(handle, info.key, &out_rec[index], &len) == ESP_OK)
+            latest_out[index] = seq;
+        }
+      }
+    }
+    err = nvs_entry_next(&it);
+  }
+  nvs_release_iterator(it);
+
+  /* Pass 2: erase every journal key. Erasing invalidates the iterator,
+   * so re-find from the top each time; boot-time O(n^2) on at most a
+   * few hundred keys. */
+  int erased = 0;
+  for (;;) {
+    char victim[NVS_KEY_NAME_MAX_SIZE] = {0};
+    it = NULL;
+    err = nvs_entry_find_in_handle(handle, NVS_TYPE_BLOB, &it);
+    while (err == ESP_OK && it) {
+      nvs_entry_info_t info;
+      bool input;
+      uint16_t index;
+      uint32_t seq;
+      if (nvs_entry_info(it, &info) == ESP_OK &&
+          avb_persist_parse_stream_journal_key(info.key, &input, &index,
+                                               &seq)) {
+        strlcpy(victim, info.key, sizeof(victim));
+        break;
+      }
+      err = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+    if (victim[0] == 0)
+      break;
+    if (nvs_erase_key(handle, victim) != ESP_OK)
+      break;
+    erased++;
+  }
+
+  /* Pass 3: rewrite the survivors with fresh sequence numbers. */
+  s_persist_journal_seq = 0;
+  int rewritten = 0;
+  for (int i = 0; i < AVB_PERSIST_MAX_INPUT_STREAMS; i++) {
+    if (!latest_in[i])
+      continue;
+    char key[10];
+    uint32_t seq = ++s_persist_journal_seq & 0xFFFFFF;
+    snprintf(key, sizeof(key), "si%1x%06lx", i, (unsigned long)seq);
+    if (nvs_set_blob(handle, key, &in_rec[i], sizeof(in_rec[i])) == ESP_OK)
+      rewritten++;
+  }
+  for (int i = 0; i < AVB_PERSIST_MAX_OUTPUT_STREAMS; i++) {
+    if (!latest_out[i])
+      continue;
+    char key[10];
+    uint32_t seq = ++s_persist_journal_seq & 0xFFFFFF;
+    snprintf(key, sizeof(key), "so%1x%06lx", i, (unsigned long)seq);
+    if (nvs_set_blob(handle, key, &out_rec[i], sizeof(out_rec[i])) == ESP_OK)
+      rewritten++;
+  }
+  err = nvs_commit(handle);
+  nvs_close(handle);
+  if (erased || rewritten) {
+    avbinfo("NVS: compacted stream journal (%d erased, %d live)", erased,
+            rewritten);
+  }
+  return err;
+}
+
 static esp_err_t avb_persist_append_stream_record(bool input, uint16_t index,
                                                   const void *record,
                                                   size_t record_len) {
@@ -1700,6 +1807,20 @@ static esp_err_t avb_persist_append_stream_record(bool input, uint16_t index,
     err = nvs_commit(handle);
   }
   nvs_close(handle);
+  if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+    /* Journal namespace full — compact to one live record per stream
+     * and retry once. */
+    if (avb_persist_compact_stream_journal() == ESP_OK &&
+        nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+      seq = ++s_persist_journal_seq & 0xFFFFFF;
+      snprintf(key, sizeof(key), "%s%1x%06lx", input ? "si" : "so", index,
+               (unsigned long)seq);
+      err = nvs_set_blob(handle, key, record, record_len);
+      if (err == ESP_OK)
+        err = nvs_commit(handle);
+      nvs_close(handle);
+    }
+  }
   if (err != ESP_OK) {
     avberr("NVS: failed to append stream journal %s: %d", key, err);
   } else {
@@ -1793,6 +1914,8 @@ static void avb_persist_replay_stream_journal(avb_state_s *state) {
             (unsigned long)s_persist_journal_seq);
   }
   avb_persist_apply(state);
+  /* Keep the journal bounded across sessions. */
+  avb_persist_compact_stream_journal();
 }
 
 static void avb_persist_gather(avb_state_s *state) {
