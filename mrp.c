@@ -451,7 +451,11 @@ bool mrp_port_tick(avb_state_s *state, int port) {
       suppress = true;
     }
 #endif
-    if (!suppress) {
+    /* AVB Lite: declarations refresh via CVU, not MRPDUs, so a legacy
+     * LeaveAll would demolish peer registrations with no in-protocol
+     * refresh to follow. Staleness is handled by the CVU idle timeout
+     * in mrp_port_dispatch_leave_timers instead. */
+    if (!suppress && !state->avb_lite) {
       p->mrp_leaveall_tx_pending = true;
     }
     p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
@@ -557,6 +561,10 @@ typedef struct {
    * propagating the stream's advertise entirely until a LeaveAll
    * cycles it out (minutes). 0 = no quarantine. */
   int64_t redeclare_after_us;
+  /* CVU idle-timeout stamp (avb_lite.md §6.6 "MSRP-like timeout"):
+   * refreshed on every RX of this attribute; with LeaveAll disabled
+   * in AVB Lite this is the only staleness mechanism. */
+  int64_t last_refresh_us;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -570,6 +578,7 @@ typedef struct {
    * merged value for the talker-facing port. */
   msrp_listener_event_t peer_decl;
   mrp_sm_state_t sm;
+  int64_t last_refresh_us; /* see msrp_talker_entry_t */
 } msrp_listener_entry_t;
 
 typedef struct {
@@ -1473,6 +1482,7 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
   if (e == NULL)
     return mrp_reg_transition_none; /* table full */
   memcpy(&e->wire, wire, sizeof(*wire));
+  e->last_refresh_us = esp_timer_get_time();
   /* Decode the 3pe vector. event_data[] is at the same offset in
    * both talker_adv and talker_failed (after the per-type info
    * block); since both share the union, indexing via .talker works
@@ -1531,6 +1541,7 @@ msrp_rx_listener_attr(int port, const msrp_listener_message_s *wire,
     return mrp_reg_transition_none;
   }
   memcpy(&e->wire, wire, sizeof(*wire));
+  e->last_refresh_us = esp_timer_get_time();
   /* event_decl_data[0] carries both the 3pe attribute event and the
    * 4pe listener-declaration nibble. Decode the attribute event. */
   int e1, e2, e3;
@@ -1647,7 +1658,7 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
 
       /* LeaveAll fires once per attribute type per PDU and applies
        * only to that type's SMs (see msrp_dispatch_leaveall). */
-      if (leaveall && attr_type < 8 &&
+      if (leaveall && !state->avb_lite && attr_type < 8 &&
           !(leaveall_types & (1u << attr_type))) {
         msrp_dispatch_leaveall(port, attr_type);
         leaveall_types |= (1u << attr_type);
@@ -2206,6 +2217,42 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
       fired = true;
     }
   }
+#define MRP_CVU_IDLE_TIMEOUT_US (30 * 1000 * 1000)
+  /* AVB Lite staleness (avb_lite.md §6.6): with LeaveAll disabled the
+   * registrar only leaves IN on an explicit wire Lv — a silently dead
+   * peer would pin its registration forever. Expire registrations not
+   * refreshed for 30 s. The SM-paced CVU refresh cadence is measured
+   * ~3.7 s aggregate across streams, so 30 s gives ~8x margin while
+   * still bounding dead-peer staleness within the MSRP-like envelope through the same deregister
+   * callbacks a LeaveTimer expiry fires. */
+  if (state->avb_lite) {
+    for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
+      msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
+      if (!e->valid || e->sm.registrar != mrp_registrar_in)
+        continue;
+      if (e->last_refresh_us != 0 &&
+          now - e->last_refresh_us > MRP_CVU_IDLE_TIMEOUT_US) {
+        e->sm.registrar = mrp_registrar_mt;
+        mrp_on_talker_registrar_change(state, port, e->attr_type, &e->wire,
+                                       mrp_reg_transition_deregister, NULL);
+        fired = true;
+      }
+    }
+    for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; ++i) {
+      msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
+      if (!e->valid || e->sm.registrar != mrp_registrar_in)
+        continue;
+      if (e->last_refresh_us != 0 &&
+          now - e->last_refresh_us > MRP_CVU_IDLE_TIMEOUT_US) {
+        e->sm.registrar = mrp_registrar_mt;
+        mrp_on_listener_registrar_change(state, port, &e->wire,
+                                         mrp_reg_transition_deregister,
+                                         /*peer_decl_changed=*/true, NULL);
+        fired = true;
+      }
+    }
+  }
+
   for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; ++i) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
     if (!e->valid)
@@ -2506,6 +2553,12 @@ static int mrp_send_attr(avb_state_s *state, int port, void *attr,
 
 #ifdef CONFIG_ESP_AVB_ATDECC
   if (state->avb_lite) {
+    /* CVU SRP (avb_lite.md §6) defines only talker and listener
+     * messages; Domain declarations are meaningless without an
+     * SRP-aware bridge, so drop them instead of spamming the peer. */
+    if (((msrp_attr_header_s *)attr)->attr_type == msrp_attr_type_domain) {
+      return OK;
+    }
     return avb_send_cvu_srp_attr(state, attr, attr_list_len, label);
   }
 #endif

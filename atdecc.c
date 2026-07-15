@@ -1661,7 +1661,7 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
     mrp_rx_msrp(state, 0, &msrp_msg, attr_size, src_addr);
     break;
   default:
-    avbinfo("CVU: unsupported MSRP attribute type 0x%02x", attr->attr_type);
+    avbdebug("CVU: unsupported MSRP attribute type 0x%02x", attr->attr_type);
     return avb_send_cvu_response(state, msg, src_addr, msg_len,
                                  aecp_status_not_implemented);
   }
