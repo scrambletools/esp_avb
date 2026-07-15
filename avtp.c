@@ -469,8 +469,49 @@ static uint8_t sample_rate_to_aaf_code(uint32_t sample_rate) {
  * AM824: [0x40, MSB, MID, LSB] per channel (4 bytes)
  * AAF:   [MSB, MID, LSB, 0x00] per channel (4 bytes)
  */
+/* Mic-path DSP for low-output microphones (e.g. a dynamic mic on the
+ * ES8389, whose PGA tops out at +36.5 dB): a one-pole DC-block strips
+ * the codec MICBIAS offset (measured -12 %FS with a dynamic capsule on
+ * a biased input), then digital gain with 24-bit saturation.
+ * DC-block: y = x - x_prev + a*y_prev, a = 32735/32768 -> -3 dB at
+ * ~30 Hz @192 kHz. Gain factor is Q16, derived from
+ * CONFIG_ESP_AVB_TALKER_MIC_DIGITAL_GAIN_DB at stream start. */
+typedef struct {
+  int32_t x_prev;
+  int32_t y_prev;
+  int32_t gain_q16; /* 65536 = unity */
+} mic_dsp_state_s;
+
+static inline int32_t mic_dsp_sample(mic_dsp_state_s *st, int32_t x) {
+  int64_t y = (int64_t)x - st->x_prev + (((int64_t)st->y_prev * 32735) >> 15);
+  st->x_prev = x;
+  if (y > INT32_MAX)
+    y = INT32_MAX;
+  if (y < INT32_MIN)
+    y = INT32_MIN;
+  st->y_prev = (int32_t)y;
+  int64_t g = (y * st->gain_q16) >> 16;
+  if (g > 0x7FFFFF)
+    g = 0x7FFFFF;
+  if (g < -0x800000)
+    g = -0x800000;
+  return (int32_t)g;
+}
+
+/* Sign-extend a 24-bit BE sample and run it through the mic DSP,
+ * returning 24-bit BE bytes in b[0..2]. */
+static inline void mic_dsp_be24(mic_dsp_state_s *st, const uint8_t *src,
+                                uint8_t *b) {
+  int32_t x = ((int32_t)((src[0] << 24) | (src[1] << 16) | (src[2] << 8))) >> 8;
+  int32_t v = mic_dsp_sample(st, x);
+  b[0] = (v >> 16) & 0xFF;
+  b[1] = (v >> 8) & 0xFF;
+  b[2] = v & 0xFF;
+}
+
 static void i2s24_to_am824_mono(const uint8_t *in, uint8_t *out,
-                                int num_samples, int stream_channels) {
+                                int num_samples, int stream_channels,
+                                mic_dsp_state_s *dsp) {
   for (int s = 0; s < num_samples; s++) {
     /* Carry only ADC-L — byte[0]=MSB, byte[1]=MID, byte[2]=LSB
      * (big_endian=true in slot_cfg matches AVTP wire order). The XLR
@@ -484,9 +525,7 @@ static void i2s24_to_am824_mono(const uint8_t *in, uint8_t *out,
       const uint8_t *src = (ch == 0) ? l : NULL;
       out[0] = 0x40;
       if (src) {
-        out[1] = src[0];
-        out[2] = src[1];
-        out[3] = src[2];
+        mic_dsp_be24(dsp, src, &out[1]);
       } else {
         out[1] = 0;
         out[2] = 0;
@@ -498,7 +537,7 @@ static void i2s24_to_am824_mono(const uint8_t *in, uint8_t *out,
 }
 
 static void i2s24_to_aaf_mono(const uint8_t *in, uint8_t *out, int num_samples,
-                              int stream_channels) {
+                              int stream_channels, mic_dsp_state_s *dsp) {
   for (int s = 0; s < num_samples; s++) {
     /* Carry only ADC-L (see i2s24_to_am824_mono — ADC-R is an
      * unconnected input on this board, floating-input hiss only). */
@@ -507,9 +546,7 @@ static void i2s24_to_aaf_mono(const uint8_t *in, uint8_t *out, int num_samples,
     for (int ch = 0; ch < stream_channels; ch++) {
       const uint8_t *src = (ch == 0) ? l : NULL;
       if (src) {
-        out[0] = src[0];
-        out[1] = src[1];
-        out[2] = src[2];
+        mic_dsp_be24(dsp, src, out);
       } else {
         out[0] = 0;
         out[1] = 0;
@@ -814,6 +851,13 @@ static void avb_stream_out_task(void *task_param) {
    * fault with the stack sprayed with near-silence audio, every
    * ~1871 s of the overnight 192 kHz soak). */
   uint64_t i2s_ring_head = 0, i2s_ring_tail = 0;
+  /* Mic DSP: DC-block always on; digital gain from Kconfig (unity when
+   * 0). powf at task start only. */
+  mic_dsp_state_s mic_dsp = {0};
+  mic_dsp.gain_q16 =
+      (int32_t)(powf(10.0f, (float)CONFIG_ESP_AVB_TALKER_MIC_DIGITAL_GAIN_DB /
+                                 20.0f) *
+                65536.0f);
   if (!params->use_sine_wave) {
     i2s_ring = calloc(1, i2s_ring_size);
     if (!i2s_ring) {
@@ -1259,10 +1303,10 @@ static void avb_stream_out_task(void *task_param) {
       }
       if (is_am824)
         i2s24_to_am824_mono(i2s_buf, audio_dst, params->samples_per_packet,
-                            params->channels);
+                            params->channels, &mic_dsp);
       else
         i2s24_to_aaf_mono(i2s_buf, audio_dst, params->samples_per_packet,
-                          params->channels);
+                          params->channels, &mic_dsp);
     } /* end else (mic path) */
 
     /* Transmit via avbnet's medium-abstracted raw send. */

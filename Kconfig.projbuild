@@ -145,6 +145,18 @@ menu "AVB Configuration"
         help
             Frequency of the generated test tone.
 
+    config ESP_AVB_TALKER_MIC_DIGITAL_GAIN_DB
+        int "Talker mic digital gain (dB)"
+        default 0
+        range 0 40
+        depends on ESP_AVB
+        help
+            Digital gain applied to the mic input in the talker path,
+            after an always-on DC-block. For microphones whose level
+            the codec PGA cannot reach (e.g. a dynamic mic on the
+            ES8389, PGA ceiling +36.5 dB). 0 = unity. Applied with
+            24-bit saturation.
+
     config ESP_AVB_TALKER_CADENCE_LOCK_INTERVAL_S
         int "Talker cadence rate-lock interval (s, 0 = free-run)"
         default 60
