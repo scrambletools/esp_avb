@@ -1309,10 +1309,32 @@ static void avb_stream_out_task(void *task_param) {
                           params->channels, &mic_dsp);
     } /* end else (mic path) */
 
-    /* Transmit via avbnet's medium-abstracted raw send. */
-    if (avb_net_transmit_raw(params->eth_handle, tx_frame, frame_len) !=
-        ESP_OK) {
-      send_fail_count++;
+    /* Transmit via avbnet's medium-abstracted raw send. AVB Lite
+     * unicast transport: the control plane publishes per-listener
+     * destination MACs; patch the DA and send one copy per listener.
+     * No published DAs → one copy to the multicast template DA. */
+    eth_addr_t das[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
+    int nda = avb_stream_tx_addrs_snapshot(
+        &state->output_streams[params->stream_index], das);
+    if (nda == 0) {
+      memcpy(&das[0], &params->dest_addr, ETH_ADDR_LEN);
+      nda = 1;
+    }
+    for (int copy = 0; copy < nda; copy++) {
+      memcpy(tx_frame, &das[copy], ETH_ADDR_LEN);
+      if (avb_net_transmit_raw(params->eth_handle, tx_frame, frame_len) !=
+          ESP_OK) {
+        /* One immediate retry. Per-listener duplication raises TX-ring
+         * pressure enough that the once-per-second control-plane burst
+         * (CVU declarations, beacons) collides with a stream slot —
+         * measured exactly ~1 failed copy/s at fan-out 3, gone with a
+         * retry. The failed frame has already drained by re-entry
+         * (~3.5 µs per 426 B at 1 Gbps). */
+        if (avb_net_transmit_raw(params->eth_handle, tx_frame, frame_len) !=
+            ESP_OK) {
+          send_fail_count++;
+        }
+      }
     }
 
     loop_count++;
@@ -2451,6 +2473,8 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
 struct avb_crf_out_ctx_s {
   esp_timer_handle_t timer;
   esp_eth_handle_t eth_handle;
+  avb_state_s *state;    /* for the unicast DA mailbox */
+  eth_addr_t mcast_da;   /* multicast template DA (MAAP) */
   uint16_t stream_index;
   uint8_t seq_num;
   size_t frame_len;
@@ -2520,7 +2544,23 @@ static void avb_crf_send_cb(void *arg) {
       ctx->frac_acc -= ctx->rate;
     }
   }
-  avb_net_transmit_raw(ctx->eth_handle, ctx->frame, ctx->frame_len);
+  /* AVB Lite unicast transport — same per-listener DA duplication as
+   * the audio stream task (see stream-out TX site). */
+  eth_addr_t das[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
+  int nda = avb_stream_tx_addrs_snapshot(
+      &ctx->state->output_streams[ctx->stream_index], das);
+  if (nda == 0) {
+    memcpy(&das[0], &ctx->mcast_da, ETH_ADDR_LEN);
+    nda = 1;
+  }
+  for (int copy = 0; copy < nda; copy++) {
+    memcpy(ctx->frame, &das[copy], ETH_ADDR_LEN);
+    if (avb_net_transmit_raw(ctx->eth_handle, ctx->frame, ctx->frame_len) !=
+        ESP_OK) {
+      /* One immediate retry — see the stream-out TX loop. */
+      avb_net_transmit_raw(ctx->eth_handle, ctx->frame, ctx->frame_len);
+    }
+  }
 }
 
 /* Build the CRF frame header and start the 2 ms send timer. Consumes params
@@ -2533,6 +2573,8 @@ static int avb_crf_stream_out_start(avb_state_s *state,
     return ERROR;
   }
   ctx->eth_handle = params->eth_handle;
+  ctx->state = state;
+  memcpy(&ctx->mcast_da, &params->dest_addr, ETH_ADDR_LEN);
   ctx->stream_index = params->stream_index;
   ctx->frame_len = TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + AVB_CRF_PDU_LEN;
 

@@ -565,6 +565,11 @@ typedef struct {
    * refreshed on every RX of this attribute; with LeaveAll disabled
    * in AVB Lite this is the only staleness mechanism. */
   int64_t last_refresh_us;
+  /* Source MAC of the peer that declared this attribute (zero for
+   * locally-originated entries). AVB Lite listeners unicast their
+   * CVU listener declarations to this address (avb_lite.md §6
+   * item 2) instead of broadcasting. */
+  eth_addr_t src_mac;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -1299,6 +1304,7 @@ static void mrp_on_listener_registrar_change(
         avberr("MSRP: connected_listeners full for stream %d", i);
         break;
       }
+      stream->connected_listeners[lidx].last_seen_us = esp_timer_get_time();
       bool was_ready = stream->connected_listeners[lidx].msrp_ready;
       stream->connected_listeners[lidx].msrp_ready = true;
       if (!was_ready) {
@@ -1328,6 +1334,7 @@ static void mrp_on_listener_registrar_change(
         avberr("MSRP: connected_listeners full for stream %d", i);
         break;
       }
+      stream->connected_listeners[lidx].last_seen_us = esp_timer_get_time();
       if (!stream->connected_listeners[lidx].msrp_ready) {
         stream->connected_listeners[lidx].msrp_ready = false;
       }
@@ -1476,13 +1483,15 @@ static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
  * callback only on transition edges, not on every RX. */
 static mrp_reg_transition_e
 msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
-                    const msrp_talker_message_u *wire) {
+                    const msrp_talker_message_u *wire, eth_addr_t *src_addr) {
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, (const unique_id_t *)&wire->talker.info.stream_id, attr_type);
   if (e == NULL)
     return mrp_reg_transition_none; /* table full */
   memcpy(&e->wire, wire, sizeof(*wire));
   e->last_refresh_us = esp_timer_get_time();
+  if (src_addr != NULL)
+    memcpy(e->src_mac, src_addr, ETH_ADDR_LEN);
   /* Decode the 3pe vector. event_data[] is at the same offset in
    * both talker_adv and talker_failed (after the per-type info
    * block); since both share the union, indexing via .talker works
@@ -1705,7 +1714,8 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
             wire.talker.event_data[0] = int_to_3pe(ev, 0, 0);
           else
             wire.talker_failed.event_data[0] = int_to_3pe(ev, 0, 0);
-          mrp_reg_transition_e tr = msrp_rx_talker_attr(port, attr_type, &wire);
+          mrp_reg_transition_e tr =
+              msrp_rx_talker_attr(port, attr_type, &wire, src_addr);
           mrp_on_talker_registrar_change(state, port, attr_type, &wire, tr,
                                          src_addr);
           break;
@@ -1790,7 +1800,8 @@ static mrp_event_e mrp_declare_event(const mrp_sm_state_t *sm) {
 }
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
-                         int attr_list_len, const char *label);
+                         int attr_list_len, const char *label,
+                         const eth_addr_t *cvu_dest);
 
 /* Transmit an immediate Lv carrying the entry's currently declared
  * value. In MRP the attribute value IS its identity: a mid-life value
@@ -1819,7 +1830,7 @@ static void mrp_tx_talker_value_leave(avb_state_s *state, int port,
   int_to_octets(&attr_list_len, msg.header.attr_list_len, 2);
   msg.header.vechead_leaveall = 0;
   msg.header.vechead_num_vals = 1;
-  mrp_send_attr(state, port, &msg, attr_list_len, "talker value leave");
+  mrp_send_attr(state, port, &msg, attr_list_len, "talker value leave", NULL);
 }
 
 /* Reset an entry's SMs so the next declare propagates as New!. */
@@ -1974,7 +1985,8 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
 /* Forward decl — definition is below in §6, after the periodic
  * declare helpers. */
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
-                         int attr_list_len, const char *label);
+                         int attr_list_len, const char *label,
+                         const eth_addr_t *cvu_dest);
 
 /* Resolve an Applicant TX action to a concrete 3pe event value (0..5)
  * given the current Registrar state. sJ → JoinIn (1) if Registrar IN,
@@ -2020,7 +2032,8 @@ static void mrp_tx_flush_talker(avb_state_s *state, int port,
   mrp_send_attr(state, port, &msg, attr_list_len,
                 (e->attr_type == msrp_attr_type_talker_advertise)
                     ? "talker advertise"
-                    : "talker failed");
+                    : "talker failed",
+                NULL);
 }
 
 static void mrp_tx_flush_listener(avb_state_s *state, int port,
@@ -2043,7 +2056,25 @@ static void mrp_tx_flush_listener(avb_state_s *state, int port,
   msg.event_decl_data[1].declaration.event2 = 0;
   msg.event_decl_data[1].declaration.event3 = 0;
   msg.event_decl_data[1].declaration.event4 = 0;
-  mrp_send_attr(state, port, &msg, attr_list_len, "listener");
+  /* AVB Lite (avb_lite.md §6 item 2): listener declarations go
+   * unicast to the talker that declared the stream, learned from the
+   * src MAC of its registered TALKER attribute. Broadcast fallback
+   * when no talker registration exists yet (declaring AskingFailed
+   * before the first advertise is heard) or on the plain-MSRP path
+   * (cvu_dest is ignored outside AVB Lite). */
+  const eth_addr_t *dest = NULL;
+  static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
+  msrp_talker_entry_t *t = msrp_talker_find(
+      port, (const unique_id_t *)&e->wire.stream_id,
+      msrp_attr_type_talker_advertise);
+  if (t == NULL || memcmp(t->src_mac, zero_mac, ETH_ADDR_LEN) == 0) {
+    t = msrp_talker_find(port, (const unique_id_t *)&e->wire.stream_id,
+                         msrp_attr_type_talker_failed);
+  }
+  if (t != NULL && memcmp(t->src_mac, zero_mac, ETH_ADDR_LEN) != 0) {
+    dest = (const eth_addr_t *)&t->src_mac;
+  }
+  mrp_send_attr(state, port, &msg, attr_list_len, "listener", dest);
 }
 
 static void mrp_tx_flush_domain(avb_state_s *state, int port,
@@ -2060,7 +2091,7 @@ static void mrp_tx_flush_domain(avb_state_s *state, int port,
   if (pe < 0)
     return;
   msg.attr_event[0] = int_to_3pe(pe, 0, 0);
-  mrp_send_attr(state, port, &msg, attr_list_len, "domain");
+  mrp_send_attr(state, port, &msg, attr_list_len, "domain", NULL);
 }
 
 /* MVRP per-port flush, defined in §7. Iterates s_mvrp_vlans[port]
@@ -2539,7 +2570,8 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
 }
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
-                         int attr_list_len, const char *label) {
+                         int attr_list_len, const char *label,
+                         const eth_addr_t *cvu_dest) {
   /* attr_list_len includes the 2-byte EndMark. Copy only the real
    * attribute bytes from the caller's struct; the EndMark must come
    * from the zeroed msgbuf. Copying it from the struct transmits
@@ -2559,7 +2591,7 @@ static int mrp_send_attr(avb_state_s *state, int port, void *attr,
     if (((msrp_attr_header_s *)attr)->attr_type == msrp_attr_type_domain) {
       return OK;
     }
-    return avb_send_cvu_srp_attr(state, attr, attr_list_len, label);
+    return avb_send_cvu_srp_attr(state, attr, attr_list_len, label, cvu_dest);
   }
 #endif
 
@@ -2601,6 +2633,14 @@ static void maap_generate_addr(avb_state_s *state, eth_addr_t *addr,
   seed = (seed << 8) | state->port[0].internal_mac_addr[4];
   seed = (seed << 8) | state->port[0].internal_mac_addr[5];
   seed += stream_index;
+  /* Escape stride after a defended/conflicted probe. The MAC-derived
+   * base slot's low byte is mac[5] + stream_index, so devices with
+   * sequential MACs land on adjacent slots and one device's stream 1
+   * collides with its neighbor's stream 0. 0x0101 moves both address
+   * bytes per retry; the chain stays deterministic per boot (same
+   * neighbors defending → same final address), which keeps switch-
+   * cached MSRP state valid across reboots. */
+  seed += (uint32_t)state->maap[stream_index].reselect_count * 0x0101u;
   uint16_t offset = seed % MAAP_POOL_SIZE;
   uint8_t *a = (uint8_t *)addr;
   a[0] = 0x91;
@@ -2748,45 +2788,46 @@ int avb_process_maap(avb_state_s *state, maap_message_s *msg) {
                           &m->acquired_addr, 1);
       } else if (m->state == maap_state_probe) {
         /* We're also probing — lower MAC yields. Compare our MAC vs sender.
-         * For simplicity, restart with a new address. */
+         * For simplicity, restart with a new address. The next probe
+         * goes out on the armed timer — probing inline here turns a
+         * persistent conflict into a wire-speed probe/defend storm. */
         avbinfo("MAAP: probe conflict on stream %d, selecting new address", i);
+        m->reselect_count++;
         maap_generate_addr(state, &m->acquired_addr, i);
         m->probe_count = MAAP_PROBE_RETRANSMITS;
         m->timer_expiry_us =
             esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
                                                   MAAP_PROBE_INTERVAL_VAR_MS);
-        avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
-                          NULL, 0);
       }
       break;
 
     case maap_msg_type_defend:
-      /* Our probe was defended — pick a new address */
+      /* Our probe was defended — pick a new address; next probe on
+       * the armed timer (see probe-conflict case). */
       if (m->state == maap_state_probe) {
         avbinfo("MAAP: probe defended on stream %d, selecting new address", i);
+        m->reselect_count++;
         maap_generate_addr(state, &m->acquired_addr, i);
         m->probe_count = MAAP_PROBE_RETRANSMITS;
         m->timer_expiry_us =
             esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
                                                   MAAP_PROBE_INTERVAL_VAR_MS);
-        avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
-                          NULL, 0);
       }
       break;
 
     case maap_msg_type_announce:
-      /* Conflicting announce — yield and restart with new address */
+      /* Conflicting announce — yield and restart with new address;
+       * next probe on the armed timer. */
       if (m->state == maap_state_defend) {
         avbinfo("MAAP: conflicting announce on stream %d, restarting", i);
         m->acquired = false;
+        m->reselect_count++;
         maap_generate_addr(state, &m->acquired_addr, i);
         m->state = maap_state_probe;
         m->probe_count = MAAP_PROBE_RETRANSMITS;
         m->timer_expiry_us =
             esp_timer_get_time() + maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS,
                                                   MAAP_PROBE_INTERVAL_VAR_MS);
-        avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1,
-                          NULL, 0);
       }
       break;
 

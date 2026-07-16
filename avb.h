@@ -64,6 +64,12 @@
 /* Maximum number of listeners connected to a talker stream */
 #define AVB_MAX_NUM_CONNECTED_LISTENERS 10
 
+/* Unicast fan-out limit is Kconfig-gated on AVB Lite compliance;
+ * builds without it still need the tx_da[] mailbox to compile. */
+#ifndef CONFIG_ESP_AVB_LITE_UNICAST_FANOUT
+#define CONFIG_ESP_AVB_LITE_UNICAST_FANOUT 1
+#endif
+
 /* Maximum number of inflight commands */
 #define AVB_MAX_NUM_INFLIGHT_COMMANDS 20
 
@@ -502,6 +508,17 @@ typedef struct {
   bool streaming;                       // true when stream_out_task running
   uint32_t presentation_time_offset_ns; // AVTP presentation offset /
                                         // max_transit_time
+  /* AVB Lite unicast transport (avb_lite.md §6, "Stream transport
+   * addressing"): active per-listener destination MACs, published by
+   * the control plane (AVB main loop) and read lock-free by the TX
+   * paths on the other core (stream-out task, CRF timer). Seqlock:
+   * tx_da_seq is odd while a write is in progress; readers retry on
+   * a seq change. tx_da_count == 0 means transmit to the stream's
+   * multicast (MAAP) address — both the non-Lite default and the
+   * Lite fan-out-exceeded escalation. */
+  volatile uint32_t tx_da_seq;
+  volatile uint8_t tx_da_count;
+  eth_addr_t tx_da[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
   struct {
     eth_addr_t mac_addr;      // from MSRP source
     identity_pair_t identity; // from ACMP connect_tx
@@ -512,6 +529,15 @@ typedef struct {
      * by ACMP GET_TX_STATE_RESPONSE to set REGISTERING_FAILED per
      * Milan v1.3 Table 5.23 — any non-zero entry flips the flag. */
     bool asking_failed;
+    /* Per-listener liveness stamp, refreshed by this listener's own
+     * CVU/MSRP declarations and ACMP activity. Needed because the
+     * MRP listener registrar is keyed by stream_id — with several
+     * listeners on one stream, the survivors' refreshes keep the
+     * shared registrar alive forever, so a vanished listener can
+     * only be detected per-row. AVB Lite ages stale rows on this
+     * stamp (a dead listener's unicast copy otherwise floods as
+     * unknown-unicast indefinitely); plain AVB ignores it. */
+    int64_t last_seen_us;
   } connected_listeners[AVB_MAX_NUM_CONNECTED_LISTENERS];
 } avb_talker_stream_s;
 
@@ -904,8 +930,10 @@ void avb_bridge_forward_stats_wifi_split(uint32_t *wifi_ok_ucast,
 
 /* MVRP and MSRP send functions live in mrp.h. */
 
+/* dest = NULL broadcasts (talker declarations); listener declarations
+ * pass the talker's MAC per avb_lite.md §6 item 2. */
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
-                          const char *label);
+                          const char *label, const eth_addr_t *dest);
 
 /* AVTP / MAAP send functions live in avtp.h. */
 
@@ -963,10 +991,43 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index);
 int avb_stop_stream_out(avb_state_s *state, uint16_t index);
 void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream, int idx);
 
+/* AVB Lite unicast transport — control-plane writer, called from the
+ * AVB main loop. Publishes each output stream's active unicast
+ * destination MACs (from connected_listeners[]) into the tx_da[]
+ * mailbox, or count 0 for multicast (non-Lite, no listeners, or
+ * fan-out exceeded → MAAP escalation). */
+void avb_lite_update_stream_tx_addrs(avb_state_s *state);
+
+/* Lock-free TX-side snapshot of a stream's published unicast DAs.
+ * Safe from the stream-out task / CRF timer while the control plane
+ * updates concurrently. Returns the number of DAs copied into out[]
+ * (0 → caller transmits to its multicast template DA). */
+static inline int avb_stream_tx_addrs_snapshot(const avb_talker_stream_s *stream,
+                                               eth_addr_t *out) {
+  uint32_t s1, s2;
+  int n;
+  do {
+    s1 = stream->tx_da_seq;
+    __sync_synchronize();
+    n = stream->tx_da_count;
+    if (n > CONFIG_ESP_AVB_LITE_UNICAST_FANOUT)
+      n = CONFIG_ESP_AVB_LITE_UNICAST_FANOUT;
+    memcpy(out, stream->tx_da, (size_t)n * sizeof(eth_addr_t));
+    __sync_synchronize();
+    s2 = stream->tx_da_seq;
+  } while (s1 != s2 || (s1 & 1));
+  return n;
+}
+
 /* Codec functions */
 const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type);
 esp_err_t avb_config_i2s(avb_state_s *state);
 esp_err_t avb_config_codec(avb_state_s *state);
+/* Reconfigure I2S + codec to a new sample rate. Only valid while no
+ * stream is running in either direction (codecs need a stop/start
+ * around a rate change); the AECP SET_STREAM_FORMAT handler gates
+ * this with STREAM_IS_RUNNING. */
+esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate);
 int16_t avb_codec_quantize_tenth_db(const codec_control_range_s *ranges,
                                     bool gain, int16_t value_tenth_db);
 void avb_codec_set_vol(avb_state_s *state, float db);

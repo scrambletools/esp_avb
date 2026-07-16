@@ -222,6 +222,96 @@ void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream,
          sizeof(stream->connected_listeners[0]));
 }
 
+/* AVB Lite unicast transport (avb_lite.md §6, "Stream transport
+ * addressing"): publish each output stream's active unicast DAs into
+ * its tx_da[] seqlock mailbox for the TX paths. A listener counts as
+ * active once either half of its connection state is present (MSRP
+ * Ready or ACMP connected); stale entries age out via the CVU idle
+ * timeout. More active listeners than the fan-out limit escalates
+ * the stream to its multicast (MAAP) address — published as count 0,
+ * which the TX paths resolve to their template DA. Called every main
+ * loop tick; publishes (and logs) only on change. */
+/* Per-listener idle limit for AVB Lite. Live listeners refresh their
+ * row at ~1 Hz via CVU declarations; 30 s matches the CVU attribute
+ * idle timeout in mrp.c. */
+#define AVB_LITE_LISTENER_IDLE_US (30 * 1000 * 1000)
+
+void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
+  if (!state->config.talker)
+    return;
+  for (int i = 0; i < state->num_output_streams; i++) {
+    avb_talker_stream_s *s = &state->output_streams[i];
+    eth_addr_t das[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
+    int n = 0;
+    bool escalate = false;
+    if (state->avb_lite) {
+      uint16_t count = octets_to_uint(s->connection_count, 2);
+      if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
+        count = AVB_MAX_NUM_CONNECTED_LISTENERS;
+      /* Age out listeners that stopped refreshing. The MRP listener
+       * registrar is shared per stream_id, so with several listeners
+       * on one stream the survivors keep it alive forever — a
+       * vanished listener is only detectable per-row, and its
+       * unicast copy would otherwise flood as unknown-unicast
+       * indefinitely. Reverse walk: removal compacts the tail. */
+      int64_t now = esp_timer_get_time();
+      for (int j = (int)count - 1; j >= 0; j--) {
+        int64_t seen = s->connected_listeners[j].last_seen_us;
+        if (seen == 0) { /* legacy/ACMP-only row: arm the clock */
+          s->connected_listeners[j].last_seen_us = now;
+          continue;
+        }
+        if (now - seen > AVB_LITE_LISTENER_IDLE_US) {
+          avbwarn("Stream out %d: listener "
+                  "%02x:%02x:%02x:%02x:%02x:%02x aged out (idle > %ds)",
+                  i, s->connected_listeners[j].mac_addr[0],
+                  s->connected_listeners[j].mac_addr[1],
+                  s->connected_listeners[j].mac_addr[2],
+                  s->connected_listeners[j].mac_addr[3],
+                  s->connected_listeners[j].mac_addr[4],
+                  s->connected_listeners[j].mac_addr[5],
+                  (int)(AVB_LITE_LISTENER_IDLE_US / 1000000));
+          avb_remove_talker_listener_by_index(s, j);
+        }
+      }
+      count = octets_to_uint(s->connection_count, 2);
+      if (count == 0 && s->streaming) {
+        avb_stop_stream_out(state, i);
+      }
+      for (int j = 0; j < count; j++) {
+        if (!s->connected_listeners[j].msrp_ready &&
+            !s->connected_listeners[j].acmp_connected)
+          continue;
+        if (n == CONFIG_ESP_AVB_LITE_UNICAST_FANOUT) {
+          escalate = true;
+          break;
+        }
+        memcpy(&das[n++], s->connected_listeners[j].mac_addr, ETH_ADDR_LEN);
+      }
+      if (escalate)
+        n = 0;
+    }
+    if (n == s->tx_da_count &&
+        (n == 0 || memcmp(das, s->tx_da, (size_t)n * sizeof(eth_addr_t)) == 0))
+      continue;
+    s->tx_da_seq++; /* odd: write in progress */
+    __sync_synchronize();
+    memcpy(s->tx_da, das, (size_t)n * sizeof(eth_addr_t));
+    s->tx_da_count = (uint8_t)n;
+    __sync_synchronize();
+    s->tx_da_seq++; /* even: stable */
+    if (n > 0) {
+      avbinfo("Stream out %d transport: unicast x%d "
+              "(%02x:%02x:%02x:%02x:%02x:%02x%s)",
+              i, n, das[0][0], das[0][1], das[0][2], das[0][3], das[0][4],
+              das[0][5], n > 1 ? ", ..." : "");
+    } else {
+      avbinfo("Stream out %d transport: multicast%s", i,
+              escalate ? " (unicast fan-out exceeded)" : "");
+    }
+  }
+}
+
 /* Initialize AVB state and create L2TAP FDs */
 static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // Copy config to state
@@ -792,6 +882,10 @@ static int avb_periodic_send(avb_state_s *state) {
   for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
     mrp_port_tick(state, p);
   }
+
+  /* Track listener churn into the per-stream unicast DA mailboxes
+   * (AVB Lite unicast transport; no-op outside Lite mode). */
+  avb_lite_update_stream_tx_addrs(state);
 
   // PTP snapshot for the stream out PLL is no longer needed here — the
   // stream out task now reads the PTP clock directly on Core 1 with a

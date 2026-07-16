@@ -258,6 +258,83 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   return ESP_OK;
 }
 
+/* Switch the audio hardware to a new sample rate. Codecs cannot
+ * retune live — they need a stop/start (or reset) around a rate
+ * change — so this must only run while NO stream is active in either
+ * direction (the AECP layer enforces that with STREAM_IS_RUNNING).
+ * Sequence: codec off → I2S channels disabled → I2S clock tree
+ * reconfigured (rate + per-rate MCLK multiple) → codec re-programmed
+ * at the new fs → everything back on → media-clock/PLL re-seeded. */
+esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
+  if (rate == state->config.default_sample_rate)
+    return ESP_OK;
+  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
+  if (!caps || !codec_caps_support_sample_rate(caps, rate)) {
+    ESP_LOGE(TAG, "Rate change to %lu Hz: not supported by codec",
+             (unsigned long)rate);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+  if (!state->codec_enabled || !state->codec_if || !state->i2s_tx_handle ||
+      !state->i2s_rx_handle) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  const audio_codec_if_t *cif = (const audio_codec_if_t *)state->codec_if;
+  if (cif->enable)
+    cif->enable(cif, false);
+  ESP_RETURN_ON_ERROR(i2s_channel_disable(state->i2s_tx_handle), TAG,
+                      "i2s tx disable");
+  ESP_RETURN_ON_ERROR(i2s_channel_disable(state->i2s_rx_handle), TAG,
+                      "i2s rx disable");
+
+  /* AVB_MCLK_MULTIPLE derives from default_sample_rate — set it first. */
+  state->config.default_sample_rate = rate;
+  i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+  clk_cfg.mclk_multiple = AVB_MCLK_MULTIPLE;
+#if SOC_CLK_APLL_SUPPORTED
+  clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+#else
+  clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
+#endif
+  ESP_RETURN_ON_ERROR(
+      i2s_channel_reconfig_std_clock(state->i2s_tx_handle, &clk_cfg), TAG,
+      "i2s tx reclock");
+  ESP_RETURN_ON_ERROR(
+      i2s_channel_reconfig_std_clock(state->i2s_rx_handle, &clk_cfg), TAG,
+      "i2s rx reclock");
+
+  esp_codec_dev_sample_info_t fs = {
+      .bits_per_sample = 32,
+      .channel = 2,
+      .sample_rate = rate,
+      .mclk_multiple = AVB_MCLK_MULTIPLE,
+  };
+  if (cif->set_fs && cif->set_fs(cif, &fs) != 0) {
+    ESP_LOGE(TAG, "Rate change: codec set_fs failed");
+    return ESP_FAIL;
+  }
+  if (cif->enable && cif->enable(cif, true) != 0) {
+    ESP_LOGE(TAG, "Rate change: codec re-enable failed");
+    return ESP_FAIL;
+  }
+
+  ESP_RETURN_ON_ERROR(i2s_channel_enable(state->i2s_tx_handle), TAG,
+                      "i2s tx enable");
+  ESP_RETURN_ON_ERROR(i2s_channel_enable(state->i2s_rx_handle), TAG,
+                      "i2s rx enable");
+
+  /* Mirror avb_config_i2s's media-clock bookkeeping and re-seed the
+   * PLL at the new nominal MCLK. */
+  state->media_clock.listener_sample_rate = rate;
+  state->media_clock.listener_byterate = rate * 2u * 4u; /* 24-in-32 slots */
+  if (avb_pll_init(rate * AVB_MCLK_MULTIPLE) != 0) {
+    avbwarn("Rate change: PLL re-init failed (sample clock will free-run)");
+  }
+
+  avbinfo("Audio hardware reconfigured to %lu Hz", (unsigned long)rate);
+  return ESP_OK;
+}
+
 /* Per-codec factory result: the chip-specific create step yields these. */
 typedef struct {
   const audio_codec_if_t *codec_if;

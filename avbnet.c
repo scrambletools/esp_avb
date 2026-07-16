@@ -42,6 +42,9 @@
 /* File-static state for unified EMAC RX dispatcher */
 static QueueHandle_t s_ctrl_rx_queue = NULL;
 static avb_stream_rx_handler_t s_stream_handler = NULL;
+/* Port 0 MAC, cached at init for the dispatcher's DA guard. All-zero
+ * until avb_net_init runs (guard passes everything until then). */
+static uint8_t s_own_mac[ETH_ADDR_LEN] = {0};
 static void *s_stream_ctx = NULL;
 static esp_netif_t *s_eth_netif = NULL;
 #if CONFIG_ESP_AVB_NUM_PORTS > 1
@@ -407,7 +410,53 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
 #endif /* CONFIG_ESP_AVB_ROLE_BRIDGE */
 
   switch (ethertype) {
-  case 0x8100: { /* VLAN — stream data */
+  case 0x8100: { /* VLAN — stream data, or VLAN-tagged AVTP control */
+    /* Destination-address guard (avb_lite.md §6 item 4: accept frames
+     * addressed to our MAC or to a multicast group). The EMAC runs
+     * promiscuous, and unicast transport makes this load-bearing:
+     * when a peer listener's link drops, the switch floods that
+     * peer's unicast stream copy as unknown-unicast, and matching by
+     * stream_id alone would ingest the same stream twice — duplicate
+     * sequence numbers and 2x ring input for the whole outage
+     * (observed: ~55k inflated seq_gap + pegged jitter ring per
+     * 6-second peer reboot). Multicast bit passes so MAAP-escalated
+     * streams and tagged control multicasts are unaffected. */
+    static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
+    if (!(buf[0] & 1) && memcmp(buf, s_own_mac, ETH_ADDR_LEN) != 0 &&
+        memcmp(s_own_mac, zero_mac, ETH_ADDR_LEN) != 0) {
+      free(buf);
+      return ESP_OK;
+    }
+    /* AVB Lite CVU SRP frames are VLAN-tagged in the media VLAN so
+     * VLAN-aware switches learn the sender's MAC in that VLAN's
+     * filtering database — otherwise unicast stream frames are
+     * flooded as unknown-unicast, defeating unicast transport
+     * (avb_lite.md §6). Peek the AVTP subtype behind the tag: AECP
+     * goes to the control queue; everything else stays on the
+     * stream hot path (one byte-compare per frame). */
+    if (len > 19 && buf[16] == 0x22 && buf[17] == 0xf0 &&
+        buf[18] == avtp_subtype_aecp) {
+      if (s_ctrl_rx_queue) {
+        ctrl_rx_pkt_t pkt;
+        int ingress = (eth_handle == NULL) ? s_wifi_port_idx : s_eth_port_idx;
+        if (ingress < 0) {
+          free(buf);
+          return ESP_OK;
+        }
+        pkt.protocol_idx = AVTP;
+        pkt.ingress_port = (uint8_t)ingress;
+        memcpy(pkt.src_addr, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
+        /* Strip ETH header (14) + VLAN tag (4) = 18 bytes */
+        uint32_t payload_len = len - 18;
+        if (payload_len > AVB_MAX_MSG_LEN)
+          payload_len = AVB_MAX_MSG_LEN;
+        pkt.length = payload_len;
+        memcpy(pkt.data, buf + 18, payload_len);
+        xQueueSend(s_ctrl_rx_queue, &pkt, 0);
+      }
+      free(buf);
+      return ESP_OK;
+    }
     /* Inline handler call — matches the original stable architecture.
      * The queue-based split we tried (emac_rx → queue → AVB-IN task)
      * added ~10 µs per frame of task-wake + context-switch overhead
@@ -733,6 +782,10 @@ int avb_net_init(avb_state_s *state) {
     }
   }
 #endif
+
+  /* Cache port 0's MAC for the dispatcher's destination-address
+   * guard (set before the RX callback below can fire). */
+  memcpy(s_own_mac, state->port[0].internal_mac_addr, ETH_ADDR_LEN);
 
   /* Create the control frame RX queue (shared across ports). */
   s_ctrl_rx_queue = xQueueCreate(CTRL_RX_QUEUE_DEPTH, sizeof(ctrl_rx_pkt_t));

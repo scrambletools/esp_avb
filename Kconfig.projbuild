@@ -126,6 +126,20 @@ menu "AVB Configuration"
             disabled, ESP-AVB will not switch its public AVB Lite status on even
             if PTP is running in standard profile.
 
+    config ESP_AVB_LITE_UNICAST_FANOUT
+        int "AVB Lite unicast stream fan-out limit"
+        default 2
+        range 1 8
+        depends on ESP_AVB_AVB_LITE_COMPLIANT
+        help
+            Maximum number of listeners served with per-listener unicast
+            copies of each stream in AVB Lite mode (avb_lite.md,
+            "Stream transport addressing"). Non-AVB switches flood
+            multicast streams to every port, so AVB Lite talkers default
+            to one unicast copy per listener. Beyond this many listeners
+            the talker escalates the stream to its MAAP multicast
+            address. Each copy costs egress bandwidth and TX CPU.
+
     config ESP_AVB_TALKER_TEST_TONE
         bool "Talker test tone (sine) instead of codec input"
         default n

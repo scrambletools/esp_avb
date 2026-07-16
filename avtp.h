@@ -193,6 +193,11 @@ typedef struct {
   uint8_t probe_count;      // remaining probes to send
   int64_t timer_expiry_us;  // next probe or announce time (esp_timer_get_time)
   bool acquired;            // true when address successfully acquired
+  /* Bumped each time a probe is defended/conflicted so the next
+   * generated address actually moves. The base address is a pure MAC
+   * hash, so without this a defended probe regenerates the identical
+   * address and re-collides forever. */
+  uint16_t reselect_count;
 } maap_stream_state_s;
 
 /* ===== AVTP stream formats ===== */

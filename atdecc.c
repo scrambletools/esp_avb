@@ -10,7 +10,8 @@
  */
 
 #include "avb.h"
-#include <stddef.h> /* offsetof */
+#include "esp_timer.h" /* connected-listener liveness stamps */
+#include <stddef.h>    /* offsetof */
 
 static uint16_t
 count_acmp_connected_talker_listeners(avb_talker_stream_s *stream);
@@ -1561,7 +1562,7 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
  * itself, just like native MSRP. The response reflects the command payload with
  * AECP status set. */
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
-                          const char *label) {
+                          const char *label, const eth_addr_t *dest) {
   msrp_attr_header_s *header = (msrp_attr_header_s *)attr;
   /* attr_list_len includes the 2-byte EndMark; copy only the real
    * attribute bytes and let the zeroed msg supply the EndMark (see
@@ -1591,10 +1592,23 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
   msg.cvu.command_type = header->attr_type;
   memcpy(((uint8_t *)&msg) + sizeof(aecp_cvu_common_s), attr, attr_size);
 
+  /* Unicast when the caller resolved a target (listener declarations
+   * to their talker, avb_lite.md §6 item 2); broadcast otherwise
+   * (talker declarations, or no talker registration yet). */
   eth_addr_t dest_addr;
-  memcpy(&dest_addr, &BCAST_MAC_ADDR, ETH_ADDR_LEN);
-  int ret =
-      avb_net_send_to(state, ethertype_avtp, &msg, msg_len, &ts, &dest_addr);
+  if (dest != NULL) {
+    memcpy(&dest_addr, dest, ETH_ADDR_LEN);
+  } else {
+    memcpy(&dest_addr, &BCAST_MAC_ADDR, ETH_ADDR_LEN);
+  }
+  /* VLAN-tagged in the media VLAN: CVU declarations are each Lite
+   * endpoint's only periodic tagged TX, and VLAN-aware switches with
+   * per-VLAN (independent) MAC learning need them to learn the
+   * endpoint in the stream VLAN's filtering database. Without this,
+   * unicast stream frames are flooded as unknown-unicast to every
+   * port — exactly what unicast transport exists to prevent. */
+  int ret = avb_net_send_to_vlan(state, ethertype_vlan, &msg, msg_len, &ts,
+                                 &dest_addr, state->msrp_mappings[0].vlan_id);
   if (ret < 0) {
     avberr("send CVU %s failed: %d", label, errno);
   }
@@ -2208,11 +2222,42 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
       }
     }
 
+    /* A format change cannot be applied to a running stream, and a
+     * RATE change cannot be applied while ANY stream runs in either
+     * direction — both directions share one I2S/codec clock, and the
+     * codec needs a stop/start around a rate change. Milan/1722.1
+     * answer for both cases: STREAM_IS_RUNNING. */
+    bool target_running =
+        is_output ? state->output_streams[index].streaming
+                  : state->input_streams[index].connected;
+    bool any_running = false;
+    for (int i = 0; i < state->num_output_streams; i++) {
+      if (state->output_streams[i].streaming)
+        any_running = true;
+    }
+    for (int i = 0; i < state->num_input_streams; i++) {
+      if (state->input_streams[i].connected)
+        any_running = true;
+    }
+    uint32_t new_rate = state->config.default_sample_rate;
+    if (format_supported && !is_crf_stream) {
+      new_rate = (requested->aaf_pcm.subtype == avtp_subtype_61883)
+                     ? cip_sfc_to_sample_rate(requested->am824.fdf_sfc)
+                     : aaf_code_to_sample_rate(requested->aaf_pcm.sample_rate);
+    }
+    bool rate_change = new_rate != state->config.default_sample_rate;
+
     if (!format_supported) {
       avberr("AECP Set Stream Format: unsupported format requested");
       status = aecp_status_not_supported;
+    } else if (target_running || (rate_change && any_running)) {
+      avbwarn("AECP Set Stream Format: refused, stream is running%s",
+              rate_change ? " (rate change needs all streams stopped)" : "");
+      status = aecp_status_stream_is_running;
     } else {
-      if (is_output) {
+      if (rate_change && avb_audio_set_rate(state, new_rate) != ESP_OK) {
+        status = aecp_status_entity_misbehaving;
+      } else if (is_output) {
         memcpy(&state->output_streams[index].stream_format, requested,
                sizeof(avtp_stream_format_s));
       } else {
@@ -3357,6 +3402,8 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     }
     stream->connected_listeners[listener_idx].acmp_connected = true;
     stream->connected_listeners[listener_idx].asking_failed = false;
+    stream->connected_listeners[listener_idx].last_seen_us =
+        esp_timer_get_time();
 
     /* First-connection edge stamps the class onto the stream.
      * Also re-derive vlan_id from msrp_mappings[mapping_index] —
