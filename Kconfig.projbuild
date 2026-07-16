@@ -128,7 +128,7 @@ menu "AVB Configuration"
 
     config ESP_AVB_SUPERFAST_CONNECT
         bool "Superfast connect: provisional playout from NVS binding"
-        default n
+        default y
         depends on ESP_AVB && !ESP_AVB_DISABLE_FAST_CONNECT
         help
             Start listener stream RX and playout immediately after NVS
@@ -137,8 +137,10 @@ menu "AVB Configuration"
             stream_id is derived from the persisted talker identity;
             playout opens on the prefill gate and moves onto
             presentation time once PTP locks. Works in AVB Lite and
-            plain AVB, but playing before the handshakes finish is not
-            Milan-conformant; the normal fast-connect and declaration
+            plain AVB. Default y: cuts boot-to-audio from ~9 s to
+            ~3.5 s. Playout before the handshakes finish is not
+            Milan-conformant, so disable this for strict Milan
+            certification; the normal fast-connect and declaration
             machinery still runs and takes over with authoritative
             parameters. If the talker is not currently transmitting to
             this listener, the early start idles harmlessly. Requires
