@@ -1728,10 +1728,26 @@ static void stream_in_drain_cb(void *arg) {
                                      1000U) -
                           STREAM_IN_OUTPUT_DELAY_NS;
         int32_t diff = (int32_t)(now32 - target);
-        if (diff >= 0) { /* target reached (or anchor already late) */
+        if (diff >= 0 && diff < 50000000) {
+          /* Target reached. A genuine pt lock fires with diff near
+           * zero — the drain polls every 1 ms — so a large positive
+           * diff means the anchor was stamped in a different
+           * timeline than the clock now agrees with (observed
+           * +1.74 s when a stream frame anchored just before the
+           * talker re-synced to a rebooted BTC, and the CRF
+           * validity check passed just after). */
           start = true;
           pt_mode = true;
           pt_err_ns = diff;
+        } else if (diff >= 0) {
+          /* Stale/mis-timeline anchor: discard it and hold for a
+           * fresh packet to re-arm on an empty ring (via the
+           * anchor-await flush loop above). */
+          atomic_store_explicit(&ctx->gate_armed, false,
+                                memory_order_release);
+          ctx->pt_await_anchor = true;
+          ctx->pt_await_start_us = esp_timer_get_time();
+          return;
         }
       } else if (fill >= JITTER_PREFILL && !ctx->pt_await_anchor) {
         start = true; /* no gPTP yet — arrival-relative fallback */

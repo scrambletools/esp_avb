@@ -1224,6 +1224,47 @@ int avb_send_aecp_rsp_read_descr_clock_domain(avb_state_s *state,
 int avb_process_adp(avb_state_s *state, adp_message_s *msg,
                     eth_addr_t *src_addr) {
 
+  /* ADP Entity Departing — Milan EVT_TK_DEPARTED fast path (DCC
+   * v1.1a §8.3): a bound sink whose talker announces departure
+   * returns to probing immediately instead of waiting out the 10 s
+   * staleness clock, and the entity is dropped from the discovery
+   * tables so fast-connect resumes on re-discovery (PRB_W_AVAIL
+   * semantics). */
+  if (msg->header.msg_type == adp_msg_type_entity_departing) {
+#ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
+    if (state->config.listener) {
+      for (uint16_t i = 0; i < state->num_input_streams; i++) {
+        avb_listener_stream_s *stream = &state->input_streams[i];
+        if (stream->connected && !stream->provisional &&
+            memcmp(stream->talker_id, msg->entity.entity_id,
+                   UNIQUE_ID_LEN) == 0) {
+          avbwarn("Stream in %u: bound talker departing — demoted to "
+                  "provisional, fast-connect re-probing", i);
+          stream->provisional = true;
+          stream->demote_ref_us = 0;
+        }
+      }
+    }
+#endif
+    int talker_idx =
+        avb_find_entity_by_addr(state, src_addr, avb_entity_type_talker);
+    if (talker_idx != NOT_FOUND) {
+      memmove(&state->talkers[talker_idx], &state->talkers[talker_idx + 1],
+              (state->num_talkers - 1 - talker_idx) * sizeof(avb_talker_s));
+      state->num_talkers--;
+    }
+    int listener_idx =
+        avb_find_entity_by_addr(state, src_addr, avb_entity_type_listener);
+    if (listener_idx != NOT_FOUND) {
+      memmove(&state->listeners[listener_idx],
+              &state->listeners[listener_idx + 1],
+              (state->num_listeners - 1 - listener_idx) *
+                  sizeof(avb_listener_s));
+      state->num_listeners--;
+    }
+    return OK;
+  }
+
   /* Process ADP Entity Available message */
   if (msg->header.msg_type == adp_msg_type_entity_available) {
 

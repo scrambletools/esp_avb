@@ -1073,33 +1073,35 @@ static int avb_periodic_send(avb_state_s *state) {
 
     /* Connected-demotion hardening: a stream that is `connected` but
      * has shown no life — no frames arriving AND no talker advertise
-     * registered — for 60 s is demoted back to provisional. That
+     * registered — for 10 s is demoted back to provisional. That
      * re-enables fast-connect probing (its gates pass provisional
      * streams), healing the case where the talker changed stream
      * identity during a link outage: we would otherwise declare
      * Ready for a dead stream_id forever with fast-connect
      * suppressed by connected=true. Frames or an advertise restamp
-     * the clock, so an intact-but-quiet path is never demoted. */
-#define AVB_LISTENER_DEMOTE_US (60 * 1000 * 1000)
+     * the clock, so an intact-but-quiet path is never demoted.
+     * 10 s matches Milan's TMR_NO_TK (DCC v1.1a §8.3.3): a settled
+     * sink with no registered Talker attribute re-probes after 10 s. */
+#define AVB_LISTENER_DEMOTE_US (10 * 1000 * 1000)
     int64_t demote_now = esp_timer_get_time();
     for (uint16_t i = 0; i < state->num_input_streams; i++) {
-      avb_listener_stream_s *s = &state->input_streams[i];
-      if (!s->connected || s->provisional) {
-        s->demote_ref_us = 0;
+      avb_listener_stream_s *stream = &state->input_streams[i];
+      if (!stream->connected || stream->provisional) {
+        stream->demote_ref_us = 0;
         continue;
       }
       int64_t last_rx = avb_stream_in_last_rx_us(state, i);
       bool alive = (last_rx != 0 && demote_now - last_rx < 1000000) ||
-                   mrp_talker_advertise_active(0, &s->stream_id);
-      if (alive || s->demote_ref_us == 0) {
-        s->demote_ref_us = demote_now;
+                   mrp_talker_advertise_active(0, &stream->stream_id);
+      if (alive || stream->demote_ref_us == 0) {
+        stream->demote_ref_us = demote_now;
         continue;
       }
-      if (demote_now - s->demote_ref_us > AVB_LISTENER_DEMOTE_US) {
-        avbwarn("Stream in %u: no frames or talker advertise for 60s "
+      if (demote_now - stream->demote_ref_us > AVB_LISTENER_DEMOTE_US) {
+        avbwarn("Stream in %u: no frames or talker advertise for 10s "
                 "— demoted to provisional, fast-connect re-probing", i);
-        s->provisional = true;
-        s->demote_ref_us = 0;
+        stream->provisional = true;
+        stream->demote_ref_us = 0;
       }
     }
   }

@@ -500,10 +500,11 @@ typedef struct {
   bool provisional;
   /* Staleness clock for the connected-demotion pass: stamped while
    * the stream shows life (frames arriving or talker advertise
-   * registered); when it runs 60 s without a restamp, `connected` is
-   * demoted back to provisional so fast-connect resumes probing —
-   * heals the case where the talker changed stream identity during
-   * a link outage. Runtime-only. */
+   * registered); when it runs 10 s without a restamp (Milan
+   * TMR_NO_TK), `connected` is demoted back to provisional so
+   * fast-connect resumes probing — heals the case where the talker
+   * changed stream identity during a link outage. ADP
+   * ENTITY_DEPARTING demotes immediately. Runtime-only. */
   int64_t demote_ref_us;
 } avb_listener_stream_s;
 
