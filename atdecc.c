@@ -3484,6 +3484,10 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
      * A repeated CONNECT_TX_RESPONSE (controller retry) must not try to
      * restart an already-running stream-in. */
     bool was_connected = state->input_streams[listener_uid].connected;
+    bool was_provisional = state->input_streams[listener_uid].provisional;
+    unique_id_t old_stream_id;
+    memcpy(old_stream_id, state->input_streams[listener_uid].stream_id,
+           UNIQUE_ID_LEN);
     // if succcessful connect tx response then connect the listener
     if (response->header.status_valtime == acmp_status_success) {
       status = avb_connect_listener(state, response);
@@ -3491,8 +3495,20 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
               status);
       start_stream_in = status == acmp_status_success && !was_connected;
       if (status == acmp_status_success && was_connected) {
-        avbinfo("ConnTX rsp: listener_uid=%d already connected; "
-                "keeping stream-in", listener_uid);
+        if (was_provisional &&
+            memcmp(old_stream_id,
+                   state->input_streams[listener_uid].stream_id,
+                   UNIQUE_ID_LEN) != 0) {
+          /* Provisional stream_id guess was wrong — restart RX on
+           * the authoritative one from the talker's response. */
+          avbwarn("ConnTX rsp: provisional stream_id mismatch; "
+                  "restarting stream-in %d", listener_uid);
+          avb_stop_stream_in(state, listener_uid);
+          start_stream_in = true;
+        } else {
+          avbinfo("ConnTX rsp: listener_uid=%d already connected; "
+                  "keeping stream-in", listener_uid);
+        }
       }
     } else {
       avbwarn("ConnTX rsp: talker returned status %d",
@@ -4069,6 +4085,7 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
 
   // Setting as connected will cause the stream-in handler to start
   stream->connected = true;
+  stream->provisional = false; /* authoritative parameters in place */
 
   /* SM-driven listener declaration. Initial decl_event is decided by
    * the current talker state — at the moment of CONNECT_TX_RESPONSE
@@ -4121,11 +4138,14 @@ acmp_status_t avb_disconnect_listener(avb_state_s *state,
 static bool avb_fast_connect_listener(avb_state_s *state, uint16_t index) {
   avb_listener_stream_s *stream = &state->input_streams[index];
 
-  /* Gate: must have a saved binding and not already be connected/probing. */
+  /* Gate: must have a saved binding and not already be connected/probing.
+   * Provisional (superfast) streams still probe — the early stream-in
+   * is a guess that only the ACMP response can confirm. */
   unique_id_t zero_id = {0};
   if (memcmp(stream->talker_id, zero_id, UNIQUE_ID_LEN) == 0)
     return false;
-  if (stream->connected || stream->pending_connection)
+  if ((stream->connected && !stream->provisional) ||
+      stream->pending_connection)
     return false;
 
   /* Milan requires the talker to be ADP-discovered before probing. */
@@ -4165,8 +4185,11 @@ void avb_periodic_fast_connect(avb_state_s *state) {
   for (uint16_t i = 0; i < state->num_input_streams; i++) {
     avb_listener_stream_s *stream = &state->input_streams[i];
 
-    /* Cheap early-out: no saved binding or already connected. */
-    if (stream->connected || stream->pending_connection)
+    /* Cheap early-out: no saved binding or already connected. A
+     * provisional (superfast) stream-in doesn't count as connected —
+     * keep probing until an authoritative ACMP response lands. */
+    if ((stream->connected && !stream->provisional) ||
+        stream->pending_connection)
       continue;
     unique_id_t zero_id = {0};
     if (memcmp(stream->talker_id, zero_id, UNIQUE_ID_LEN) == 0)

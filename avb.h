@@ -492,6 +492,19 @@ typedef struct {
    * not persisted. Used by avb_periodic_send to throttle retries when
    * a saved binding is waiting for its talker to come back. */
   struct timespec last_fast_connect_attempt;
+  /* Superfast connect (Kconfig): stream-in was started provisionally
+   * at boot from the NVS binding with a derived stream_id, before
+   * ACMP/MSRP completed. Fast-connect keeps probing while set (its
+   * gate ignores `connected`); cleared by the first authoritative
+   * ACMP connect response or a disconnect. */
+  bool provisional;
+  /* Staleness clock for the connected-demotion pass: stamped while
+   * the stream shows life (frames arriving or talker advertise
+   * registered); when it runs 60 s without a restamp, `connected` is
+   * demoted back to provisional so fast-connect resumes probing —
+   * heals the case where the talker changed stream identity during
+   * a link outage. Runtime-only. */
+  int64_t demote_ref_us;
 } avb_listener_stream_s;
 
 /* Talker stream */
@@ -990,6 +1003,16 @@ uint32_t aaf_code_to_sample_rate(uint8_t code);
 int avb_start_stream_out(avb_state_s *state, uint16_t index);
 int avb_stop_stream_out(avb_state_s *state, uint16_t index);
 void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream, int idx);
+
+#ifdef CONFIG_ESP_AVB_SUPERFAST_CONNECT
+/* Provisional stream-in start from restored NVS bindings — called
+ * once at boot after avb_persist_load (see avtp.c). */
+void avb_superfast_connect_start(avb_state_s *state);
+#endif
+
+/* Most recent stream-frame arrival for an input stream (µs,
+ * esp_timer domain); 0 when RX inactive. Defined in avtp.c. */
+int64_t avb_stream_in_last_rx_us(avb_state_s *state, uint16_t index);
 
 /* AVB Lite unicast transport — control-plane writer, called from the
  * AVB main loop. Publishes each output stream's active unicast

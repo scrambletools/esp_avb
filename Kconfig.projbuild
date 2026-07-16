@@ -126,6 +126,25 @@ menu "AVB Configuration"
             disabled, ESP-AVB will not switch its public AVB Lite status on even
             if PTP is running in standard profile.
 
+    config ESP_AVB_SUPERFAST_CONNECT
+        bool "Superfast connect: provisional playout from NVS binding"
+        default n
+        depends on ESP_AVB && !ESP_AVB_DISABLE_FAST_CONNECT
+        help
+            Start listener stream RX and playout immediately after NVS
+            restores a saved binding — before gPTP lock, MSRP/CVU
+            declarations, or ACMP fast-connect complete. The expected
+            stream_id is derived from the persisted talker identity;
+            playout opens on the prefill gate and moves onto
+            presentation time once PTP locks. Works in AVB Lite and
+            plain AVB, but playing before the handshakes finish is not
+            Milan-conformant; the normal fast-connect and declaration
+            machinery still runs and takes over with authoritative
+            parameters. If the talker is not currently transmitting to
+            this listener, the early start idles harmlessly. Requires
+            fast-connect: a provisional start is a guess that only the
+            ACMP handshake can confirm or correct.
+
     config ESP_AVB_LITE_UNICAST_FANOUT
         int "AVB Lite unicast stream fan-out limit"
         default 2

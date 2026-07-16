@@ -278,9 +278,18 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
       if (count == 0 && s->streaming) {
         avb_stop_stream_out(state, i);
       }
+      static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
       for (int j = 0; j < count; j++) {
         if (!s->connected_listeners[j].msrp_ready &&
             !s->connected_listeners[j].acmp_connected)
+          continue;
+        /* ACMP-created rows carry no MAC until the listener's CVU
+         * declaration merges it. They can't receive a unicast copy,
+         * so they must not consume fan-out (a transient zero-MAC
+         * duplicate otherwise escalates the stream to multicast);
+         * the liveness aging reaps them if the merge never comes. */
+        if (memcmp(s->connected_listeners[j].mac_addr, zero_mac,
+                   ETH_ADDR_LEN) == 0)
           continue;
         if (n == CONFIG_ESP_AVB_LITE_UNICAST_FANOUT) {
           escalate = true;
@@ -1061,6 +1070,38 @@ static int avb_periodic_send(avb_state_s *state) {
 #ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
   if (state->config.listener) {
     avb_periodic_fast_connect(state);
+
+    /* Connected-demotion hardening: a stream that is `connected` but
+     * has shown no life — no frames arriving AND no talker advertise
+     * registered — for 60 s is demoted back to provisional. That
+     * re-enables fast-connect probing (its gates pass provisional
+     * streams), healing the case where the talker changed stream
+     * identity during a link outage: we would otherwise declare
+     * Ready for a dead stream_id forever with fast-connect
+     * suppressed by connected=true. Frames or an advertise restamp
+     * the clock, so an intact-but-quiet path is never demoted. */
+#define AVB_LISTENER_DEMOTE_US (60 * 1000 * 1000)
+    int64_t demote_now = esp_timer_get_time();
+    for (uint16_t i = 0; i < state->num_input_streams; i++) {
+      avb_listener_stream_s *s = &state->input_streams[i];
+      if (!s->connected || s->provisional) {
+        s->demote_ref_us = 0;
+        continue;
+      }
+      int64_t last_rx = avb_stream_in_last_rx_us(state, i);
+      bool alive = (last_rx != 0 && demote_now - last_rx < 1000000) ||
+                   mrp_talker_advertise_active(0, &s->stream_id);
+      if (alive || s->demote_ref_us == 0) {
+        s->demote_ref_us = demote_now;
+        continue;
+      }
+      if (demote_now - s->demote_ref_us > AVB_LISTENER_DEMOTE_US) {
+        avbwarn("Stream in %u: no frames or talker advertise for 60s "
+                "— demoted to provisional, fast-connect re-probing", i);
+        s->provisional = true;
+        s->demote_ref_us = 0;
+      }
+    }
   }
 #endif
 #endif /* CONFIG_ESP_AVB_ATDECC */
@@ -1236,6 +1277,14 @@ static void avb_task(void *task_param) {
   // Load persistent data from NVS — must be after codec init so
   // persisted volume/gain override the codec defaults
   avb_persist_load(state);
+
+#ifdef CONFIG_ESP_AVB_SUPERFAST_CONNECT
+  /* Provisional playout from the restored bindings, before any
+   * handshake completes (see avb_superfast_connect_start). */
+  if (state->config.listener) {
+    avb_superfast_connect_start(state);
+  }
+#endif
 
   /* Centralized periodic diagnostic (CPU, stream-in, stream-out, MCLK).
    * Must set the state pointer before starting so the first tick has

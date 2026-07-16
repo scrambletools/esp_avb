@@ -1494,6 +1494,13 @@ typedef struct {
   jitter_ring_t ring;                        /* SPSC byte ring, handler→drain */
   esp_timer_handle_t drain_timer;            /* periodic 1 ms drain */
   uint8_t expected_stream_id[UNIQUE_ID_LEN]; /* filter: only accept this stream */
+  /* Superfast connect: until a frame's rate code matches the
+   * NVS-restored format, drop instead of ingesting — protects a
+   * provisional start against the wire rate having changed while we
+   * were down. One byte-compare per frame, only until first match. */
+  bool rate_check_pending;
+  uint8_t expected_rate_code; /* AAF nsr or 61883 SFC, by subtype */
+  volatile uint32_t rate_mismatch; /* frames dropped by the check */
   /* diagnostics — volatile, handler-writes-only, stats-reads-only */
   volatile uint32_t pkt_count;        /* total stream packets received */
   volatile uint32_t ring_write_fail;  /* ring full — packets (or partial) dropped */
@@ -1525,6 +1532,24 @@ typedef struct {
   volatile uint8_t diag_gate_mode;   /* 0=never locked, 1=presentation, 2=prefill */
   volatile int32_t diag_gate_err_ns; /* start lateness vs target (pt mode) */
   volatile uint32_t diag_gate_fill;  /* ring fill at playout start */
+  /* One-time re-gate: set after playout that locked on the prefill
+   * fallback (gPTP not yet synced — early/superfast start) has been
+   * re-armed onto presentation time. Prevents a re-gate loop for
+   * streams that can never pt-gate (tu=1). */
+  bool pt_regate_done;
+  /* Set at re-gate, cleared at the next lock: suppresses the prefill
+   * fallback so the (already full) ring can't instantly re-lock
+   * arrival-relative before a fresh packet re-arms the pt anchor.
+   * The ring-pressure escape still overrides it. */
+  bool pt_await_anchor;
+  int64_t pt_await_start_us; /* give-up bound for tu=1 streams */
+  volatile uint32_t pt_regates; /* diagnostic: re-gates performed */
+  /* Timeline-validity cache: the check reads the PTP clock, which
+   * contends with PTPD internals — at the drain's 1 kHz that matters
+   * (the drift sampler was moved off the RX path for the same
+   * reason). Re-evaluate at most every 100 ms. */
+  int64_t timeline_check_us;
+  bool timeline_valid_cached;
   volatile int64_t last_packet_us;    /* esp_timer at most recent packet RX */
   /* first-packet snapshot (written by handler, printed by main loop) */
   uint8_t diag_subtype;
@@ -1593,6 +1618,50 @@ bool avb_crf_stream_valid(void) {
  *
  * No log prints, no blocking — just ring_read + i2s_channel_write + the
  * PLL byte-counter update. */
+/* True when the local PTP clock demonstrably shares the talker's
+ * timeline: the last CRF timestamp received from the talker lies
+ * within a small window of local PTP now (CRF carries full 64-bit
+ * timestamps — no wrap ambiguity). Role-independent: works for
+ * clients, for the BTC itself (whose clock_source_valid is false by
+ * definition — it has no REMOTE source), and across a BTC reboot
+ * while the talker re-converges onto the new timebase. Falls back to
+ * clock_source_valid when no CRF is flowing. */
+static bool stream_in_timeline_valid(stream_rx_ctx_t *ctx) {
+  avb_state_s *state = ctx->state;
+  if (!state)
+    return false;
+  int64_t now_us = esp_timer_get_time();
+  if (ctx->timeline_check_us != 0 &&
+      now_us - ctx->timeline_check_us < 100000) {
+    return ctx->timeline_valid_cached;
+  }
+  ctx->timeline_check_us = now_us;
+  ctx->timeline_valid_cached = false;
+  uint32_t s1 = atomic_load_explicit(&state->media_clock.crf_anchor.seq,
+                                     memory_order_acquire);
+  uint64_t crf_ts = state->media_clock.crf_anchor.ts_ns;
+  uint32_t s2 = atomic_load_explicit(&state->media_clock.crf_anchor.seq,
+                                     memory_order_acquire);
+  if (s1 == s2 && !(s1 & 1) && crf_ts != 0) {
+    struct timespec now;
+    if (ptpd_now(&now) != 0)
+      return false;
+    int64_t d = ((int64_t)now.tv_sec * 1000000000LL + now.tv_nsec) -
+                (int64_t)crf_ts;
+    if (d < 0)
+      d = -d;
+    /* Tight window: this bounds the residual clock error at re-gate
+     * time, and the pt gate then WAITS out that error with the ring
+     * filling — beyond ~60 ms of fill the ring-pressure escape wins
+     * and playout falls back to prefill. 5 ms keeps the wait far
+     * inside that budget. */
+    ctx->timeline_valid_cached = d < 5000000LL;
+  } else {
+    ctx->timeline_valid_cached = state->ptp_status.clock_source_valid;
+  }
+  return ctx->timeline_valid_cached;
+}
+
 static void stream_in_drain_cb(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
   if (!ctx)
@@ -1610,6 +1679,26 @@ static void stream_in_drain_cb(void *arg) {
 #define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
 #define GATE_ANCHOR_STALE_US (2 * 1000 * 1000) /* 32-bit ns wrap guard */
   if (!ctx->drain_locked) {
+    /* Post-re-gate anchor wait: the anchor only arms on a packet
+     * arriving into an EMPTY ring (its timestamp must describe the
+     * ring tail). Keep the ring flushed until that happens so the
+     * next packet arms with correct alignment; give up after 100 ms
+     * (tu=1 streams never arm) and fall back to prefill. */
+    if (ctx->pt_await_anchor &&
+        !atomic_load_explicit(&ctx->gate_armed, memory_order_acquire)) {
+      if (esp_timer_get_time() - ctx->pt_await_start_us > 100000) {
+        /* No packet armed an anchor in 100 ms of empty-ring arrivals:
+         * tu=1 stream (or equivalent) — pt-gating is impossible, stop
+         * re-gate attempts for good. */
+        ctx->pt_await_anchor = false;
+        ctx->pt_regate_done = true;
+      } else {
+        uint32_t h =
+            atomic_load_explicit(&ctx->ring.head, memory_order_acquire);
+        atomic_store_explicit(&ctx->ring.tail, h, memory_order_release);
+        return;
+      }
+    }
     uint32_t fill = ring_readable(&ctx->ring);
     if (fill == 0)
       return;
@@ -1624,7 +1713,14 @@ static void stream_in_drain_cb(void *arg) {
          * ambiguous. Fall back to prefill. */
         if (fill >= JITTER_PREFILL)
           start = true;
-      } else if (ptpd_now(&now_ts) == 0) {
+      } else if (stream_in_timeline_valid(ctx) && ptpd_now(&now_ts) == 0) {
+        /* Timeline-validity gate: ptpd_now() succeeding does NOT
+         * mean the clock shares the talker's timeline — before sync
+         * it runs free, and comparing presentation times against it
+         * "starts" seconds late with an arbitrary offset (observed
+         * err=1.78 s on an early/superfast boot). Not yet valid →
+         * prefill fallback below; the re-gate after the gate block
+         * moves playout onto presentation time once it becomes so. */
         uint32_t now32 = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
                                     (uint64_t)now_ts.tv_nsec);
         uint32_t target = ctx->gate_avtp_ts +
@@ -1637,10 +1733,10 @@ static void stream_in_drain_cb(void *arg) {
           pt_mode = true;
           pt_err_ns = diff;
         }
-      } else if (fill >= JITTER_PREFILL) {
+      } else if (fill >= JITTER_PREFILL && !ctx->pt_await_anchor) {
         start = true; /* no gPTP yet — arrival-relative fallback */
       }
-    } else if (fill >= JITTER_PREFILL) {
+    } else if (fill >= JITTER_PREFILL && !ctx->pt_await_anchor) {
       start = true; /* no trustworthy anchor — arrival-relative fallback */
     }
     /* Ring-pressure escape: never let the gate hold so long that the
@@ -1649,6 +1745,7 @@ static void stream_in_drain_cb(void *arg) {
       start = true;
     if (!start)
       return;
+    ctx->pt_await_anchor = false;
     ctx->drain_locked = true;
     if (!ctx->ever_locked) {
       ctx->ever_locked = true;
@@ -1658,6 +1755,34 @@ static void stream_in_drain_cb(void *arg) {
     ctx->diag_gate_mode = pt_mode ? 1 : 2;
     ctx->diag_gate_err_ns = pt_err_ns;
     ctx->diag_gate_fill = fill;
+  }
+
+  /* Re-gate onto presentation time. Playout that locked on the
+   * prefill fallback (gPTP not yet sharing the talker's timeline —
+   * early/superfast start, or a BTC reboot) plays arrival-relative,
+   * out of the sample-accurate timeline the other listeners share.
+   * Once the timeline is valid, unlock and re-arm the anchor so the
+   * next packet re-gates at its true presentation time. Each attempt
+   * costs a ~fill-target pause; retries are paced 5 s apart in case
+   * an attempt loses to the ring-pressure escape (residual clock
+   * error at re-gate time makes the pt target sit in the future
+   * while the ring fills). pt_regate_done is set permanently by the
+   * anchor-await give-up below — streams that cannot arm an anchor
+   * (tu=1) must not pay a periodic pause forever. */
+  if (ctx->drain_locked && ctx->diag_gate_mode == 2 && !ctx->pt_regate_done &&
+      stream_in_timeline_valid(ctx) &&
+      (ctx->pt_await_start_us == 0 ||
+       esp_timer_get_time() - ctx->pt_await_start_us > 5000000)) {
+    ctx->pt_await_anchor = true;
+    ctx->pt_await_start_us = esp_timer_get_time();
+    ctx->pt_regates++;
+    ctx->drain_locked = false;
+    atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
+    if (ctx->ever_locked) {
+      ctx->media_unlocked_count++;
+      ctx->ever_locked = false;
+    }
+    return;
   }
 
   uint32_t avail = ring_readable(&ctx->ring);
@@ -1827,6 +1952,21 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->ts_uncertain_count++;
 
   uint8_t subtype = avtp_data[0] & 0x7F;
+
+  /* Provisional-start rate guard (see ctx field comment). AAF carries
+   * nsr in the top nibble of byte 17; 61883 carries the CIP SFC in
+   * the low 3 bits of byte 29 (CIP header byte 5). */
+  if (ctx->rate_check_pending) {
+    uint8_t rate_code = (subtype == avtp_subtype_aaf)
+                            ? (avtp_data[17] >> 4) & 0x0F
+                            : (len > 29 ? (avtp_data[29] & 0x07) : 0xFF);
+    if (rate_code != ctx->expected_rate_code) {
+      ctx->rate_mismatch++;
+      return;
+    }
+    ctx->rate_check_pending = false;
+  }
+
   uint8_t *pcm_data = NULL;
   int pcm_len = 0;
   int channels = 0;
@@ -2335,6 +2475,15 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   ctx->i2s_tx_handle = state->i2s_tx_handle;
   memcpy(ctx->expected_stream_id, state->input_streams[index].stream_id,
          UNIQUE_ID_LEN);
+  if (state->input_streams[index].provisional) {
+    /* Provisional (superfast) start: gate ingest on the wire rate
+     * matching the NVS-restored format. */
+    avtp_stream_format_s *fmt = &state->input_streams[index].stream_format;
+    ctx->expected_rate_code = (fmt->aaf_pcm.subtype == avtp_subtype_61883)
+                                  ? (fmt->am824.fdf_sfc & 0x07)
+                                  : fmt->aaf_pcm.sample_rate;
+    ctx->rate_check_pending = true;
+  }
 
   ctx->ring.buf = calloc(1, JITTER_RING_SIZE);
   if (!ctx->ring.buf) {
@@ -2381,6 +2530,62 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
           JITTER_RING_SIZE, JITTER_PREFILL);
   return OK;
 }
+
+/* Most recent stream-frame arrival for an input stream (µs in the
+ * esp_timer domain); 0 when RX is not active or has never seen a
+ * frame. Used by the connected-demotion pass in avb.c. */
+int64_t avb_stream_in_last_rx_us(avb_state_s *state, uint16_t index) {
+  if (index == avb_get_crf_input_index(state)) {
+    return (s_crf_rx_ctx && s_crf_rx_ctx->drift_latest_valid)
+               ? s_crf_rx_ctx->drift_latest_rx_ts_us
+               : 0;
+  }
+  return s_stream_rx_ctx ? s_stream_rx_ctx->last_packet_us : 0;
+}
+
+#ifdef CONFIG_ESP_AVB_SUPERFAST_CONNECT
+/* Superfast connect: start stream-in provisionally right after NVS
+ * restores a binding — before gPTP lock, MSRP/CVU declarations, or
+ * ACMP fast-connect complete. The expected stream_id is derived from
+ * the persisted talker identity by this stack's MAC+uid convention
+ * (a talker using a different convention just means zero matches
+ * until the ACMP response corrects it). Playout opens on the prefill
+ * gate and moves onto presentation time once PTP locks — the same
+ * gate handoff every normal start already exercises. If the talker
+ * is not currently transmitting to us (e.g. gone longer than the
+ * AVB Lite listener aging window), this idles harmlessly until the
+ * handshakes land; fast-connect keeps probing while `provisional`
+ * is set. */
+void avb_superfast_connect_start(avb_state_s *state) {
+  static const unique_id_t zero_id = {0};
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    avb_listener_stream_s *s = &state->input_streams[i];
+    if (memcmp(s->talker_id, zero_id, UNIQUE_ID_LEN) == 0)
+      continue;
+    stream_id_from_mac((eth_addr_t *)s->talker_id, s->stream_id,
+                       octets_to_uint(s->talker_uid, 2));
+    /* Expect our own MAC as DA (unicast transport) until the connect
+     * response provides the authoritative one. Keeps GET_RX_STATE
+     * honest: connected with non-zero stream_id, dest, and vlan. */
+    memcpy(s->stream_dest_addr, state->port[0].internal_mac_addr,
+           ETH_ADDR_LEN);
+    if (octets_to_uint(s->vlan_id, 2) == 0) {
+      memcpy(s->vlan_id, state->msrp_mappings[0].vlan_id, 2);
+    }
+    s->provisional = true;
+    if (avb_start_stream_in(state, i) == OK) {
+      avbinfo("Superfast: provisional stream-in %u started "
+              "(stream %02x%02x%02x%02x%02x%02x%02x%02x)",
+              i, s->stream_id[0], s->stream_id[1], s->stream_id[2],
+              s->stream_id[3], s->stream_id[4], s->stream_id[5],
+              s->stream_id[6], s->stream_id[7]);
+    } else {
+      s->provisional = false;
+      s->connected = false;
+    }
+  }
+}
+#endif /* CONFIG_ESP_AVB_SUPERFAST_CONNECT */
 
 /* Stop CRF media clock input. Symmetric with avb_start_stream_in_crf. */
 static void avb_stop_stream_in_crf(avb_state_s *state, uint16_t index) {
