@@ -201,6 +201,13 @@ static struct {
    * Cleared by the same reference-change events that re-seed. */
   bool internal_hold;
   int64_t internal_correcting_since_us; /* time-box anchor, 0 = unset */
+  /* True when this boot preloaded a persisted trim. The preload IS
+   * the calibration — the INTERNAL reference's cumulative bias
+   * otherwise re-opens the convergence window each boot and creeps
+   * the trim upward ~25 ppm per reboot until the clamp (observed:
+   * preload 25 → persisted 50 after one reboot). Only a first-ever
+   * boot (no stored trim) runs the calibration staircase. */
+  bool trim_preloaded;
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -379,7 +386,8 @@ static bool read_sample(avb_state_s *state, uint64_t *bytes_out,
   if (use_dac_sensor != s_pll.sensor_was_dac) {
     s_pll.sensor_was_dac = use_dac_sensor;
     s_pll.integrator_ppm_q16 = 0; /* bias history is per-sensor */
-    s_pll.internal_hold = false;
+    if (!s_pll.trim_preloaded)
+      s_pll.internal_hold = false;
     s_pll.valid = false;
     return false; /* re-seed on the new counter next tick */
   }
@@ -520,7 +528,9 @@ void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16) {
   }
   state->media_clock.pll_applied_ppm_q16 = trim_ppm_q16;
   state->media_clock.pll_target_ppm_q16 = trim_ppm_q16;
-  ESP_LOGI(TAG, "preloaded persisted trim %ld ppm",
+  s_pll.trim_preloaded = true;
+  s_pll.internal_hold = true; /* the preload IS the calibration */
+  ESP_LOGI(TAG, "preloaded persisted trim %ld ppm (holding)",
            (long)(trim_ppm_q16 / 65536));
 }
 
@@ -595,8 +605,10 @@ void avb_pll_tick(avb_state_s *state) {
     if (!s_pll.internal_ref_was_valid) {
       s_pll.internal_ref_was_valid = true;
       s_pll.integrator_ppm_q16 = 0;
-      s_pll.internal_hold = false;
-      s_pll.internal_correcting_since_us = now_us;
+      if (!s_pll.trim_preloaded) {
+        s_pll.internal_hold = false;
+        s_pll.internal_correcting_since_us = now_us;
+      }
       s_pll.valid = false;    /* re-seed baselines below on this tick */
     }
   }
