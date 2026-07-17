@@ -283,7 +283,7 @@ typedef struct {
       presentation_time_offset_ns; /* user-configured presentation offset. */
 } avb_persist_output_stream_s;     /* 12 bytes */
 
-#define AVB_PERSIST_VERSION 3
+#define AVB_PERSIST_VERSION 4
 typedef struct {
   uint8_t version;       /* struct version — bump on every append */
   uint8_t reserved_v[3]; /* pad to 4-byte boundary */
@@ -306,6 +306,13 @@ typedef struct {
   uint16_t active_clock_source_index; /* CLOCK_DOMAIN 0 active source */
   uint16_t reserved_cs;               /* pad to 4-byte boundary */
   uint32_t audio_unit_sample_rate_hz; /* placeholder — wiring TBD */
+  /* v4: last converged media-clock PLL correction (Q16 ppm). Preloaded
+   * into the APLL at boot (before streams start) so the servo begins
+   * within a few ppm of equilibrium instead of slewing tens of ppm
+   * from zero — the crystal offset is a per-board constant modulo
+   * temperature and grandmaster changes; the acquisition one-shot
+   * trims any residual. 0 = never converged / no preload. */
+  int32_t pll_trim_ppm_q16;
 } avb_persistent_data_s;
 
 /* Enforce that build-time sizes fit in the frozen persist layout.
@@ -715,6 +722,25 @@ typedef struct avb_state_s {
      * CRF-timestamp anchor to measure I2S rate error. */
     _Atomic uint64_t i2s_bytes_written;
 
+    /* ADC-side twin of i2s_bytes_written: bytes the I2S RX DMA has
+     * captured, counted in the on_recv callback (avbcodec.c). This is
+     * the media-clock rate sensor for a TALKER: a pure talker never
+     * writes I2S TX, so the DAC counter above is frozen and the PLL
+     * would measure zero error forever while the APLL free-runs
+     * (observed +31.5 ppm against the PreSonus grandmaster). ADC and
+     * DAC share the APLL/MCLK, so either counter senses the same
+     * clock; avb_pll's INTERNAL reference picks whichever is live. */
+    _Atomic uint64_t i2s_bytes_captured;
+
+    /* Last CONVERGED-STABLE PLL correction (Q16 ppm), 0 = none yet.
+     * This is the authoritative live source for the persisted trim:
+     * avb_persist_gather rebuilds the whole persist struct from live
+     * state on every save, so the PLL cannot write persist fields
+     * directly (observed: a direct write was wiped by the gather in
+     * the same request_save call and 0 hit flash). Written by the
+     * PLL's stability hook; seeded from the blob at load. */
+    int32_t pll_converged_trim_q16;
+
     /* CRF-driven PLL anchor — atomically-published pair of
      *   (crf_ts_ns, i2s_bytes_written at the moment the CRF PDU arrived)
      * Writer: avb_crf_rx_handler (EMAC RX task). Reader: avb_pll_tick.
@@ -989,6 +1015,9 @@ void avb_stream_in_sample_drift(avb_state_s *state);
  * CS2000) only touches avbpll.c. */
 int avb_pll_init(uint32_t nominal_mclk_hz);
 void avb_pll_deinit(void);
+/* Preload the persisted media-clock trim (persist v4) — call after
+ * avb_pll_init and before streams start. */
+void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16);
 /* Called ~once per second from the AVB main loop. Updates measurements,
  * logs stats (including the drift sums maintained by the RX handlers),
  * and applies any due MCLK correction. */

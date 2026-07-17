@@ -2105,6 +2105,7 @@ static void avb_persist_gather(avb_state_s *state) {
   p->active_clock_source_index = state->media_clock.active_clock_source_index;
   p->audio_unit_sample_rate_hz =
       0; /* TODO: wire when sample-rate policy lands */
+  p->pll_trim_ppm_q16 = state->media_clock.pll_converged_trim_q16;
 }
 
 /* Apply loaded persist data to current state */
@@ -2211,6 +2212,18 @@ static void avb_persist_apply(avb_state_s *state) {
    * compile-time default anyway, so unconditional restore is safe. */
   state->media_clock.active_clock_source_index = p->active_clock_source_index;
   /* p->audio_unit_sample_rate_hz ignored for now — placeholder */
+
+  /* v4: preload the persisted media-clock trim so the APLL starts
+   * near its converged operating point — streams have not started at
+   * this point, so the step disturbs nobody. Zero = never converged
+   * (also what an upgraded pre-v4 blob reads as). */
+  if (p->pll_trim_ppm_q16 != 0) {
+    /* Seed the live copy too — gather rebuilds persist from live
+     * state, so an unseeded live field would zero the stored trim on
+     * the next unrelated save. */
+    state->media_clock.pll_converged_trim_q16 = p->pll_trim_ppm_q16;
+    avb_pll_preload_trim(state, p->pll_trim_ppm_q16);
+  }
 }
 
 /* Load persistent data from NVS */

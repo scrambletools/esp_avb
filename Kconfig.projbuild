@@ -258,6 +258,21 @@ menu "AVB Configuration"
             liveness change overrides it; disable this option for
             strictly controller-managed clock domains.
 
+    config ESP_AVB_PLL_MAX_PPM
+        int "Media-clock PLL maximum applied correction (ppm)"
+        default 150
+        range 50 300
+        depends on ESP_AVB
+        help
+            Safety clamp on the total media-clock correction the PLL
+            may apply. Must exceed the worst LEGAL talker media-clock
+            tolerance (IEEE 1722 allows +/-100 ppm) PLUS this device's
+            own crystal offset: a listener tracks the sum of both, so
+            a 100 ppm clamp rails against a spec-legal talker at the
+            edge (observed: 6 h pinned at +100 ppm on the PreSonus
+            bench behind a free-running talker). Corrections beyond
+            the clamp are treated as measurement error.
+
     config ESP_AVB_PLL_CORRECTION_INTERVAL_S
         int "Listener media-clock correction interval (s, 0 = fixed clock)"
         default 30

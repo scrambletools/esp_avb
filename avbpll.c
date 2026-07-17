@@ -176,6 +176,31 @@ static struct {
   /* (gPTP, bytes) pair-sampling health — see read_sample */
   uint32_t sample_retries;
   uint32_t sample_spread_max_us;
+  /* Rail telemetry (see the clamp block in avb_pll_tick) */
+  int64_t rail_since_us;
+  bool rail_warned;
+  /* Which byte counter fed the INTERNAL reference last tick — DAC
+   * (TX on_sent) vs ADC (RX on_recv). A flip re-seeds baselines. */
+  bool sensor_was_dac;
+  /* INTERNAL-reference validity edge tracking — see the gate in
+   * avb_pll_tick. */
+  bool internal_ref_was_valid;
+  /* Mid-slew zero-crossing detector (consecutive ticks the instant
+   * error has been on the far side of equilibrium). */
+  uint8_t slew_crossed_ticks;
+  /* Trim-persist pacing + stability tracking — see the steady-state
+   * hook in avb_pll_tick. */
+  int64_t last_trim_check_us;
+  int32_t last_trim_check_value_q16;
+  /* INTERNAL-mode hold: set once the correction is stable (same
+   * predicate as the trim persist). A crystal offset is quasi-static
+   * — the talker converges once and then HOLDS, because continuous
+   * tracking corrections make it a moving reference that every
+   * listener servo has to chase (observed: listener targets churning
+   * 80-100 ppm with repeated slew aborts while the talker crept).
+   * Cleared by the same reference-change events that re-seed. */
+  bool internal_hold;
+  int64_t internal_correcting_since_us; /* time-box anchor, 0 = unset */
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -226,11 +251,16 @@ static struct {
  * media-clock source switch). */
 #define AVB_PLL_MAX_INTEGRATOR_PPM_Q16 ((int32_t)(50 * 65536))
 
-/* Safety clamp on the total applied correction. A healthy crystal is
- * ≤±100 ppm; anything larger is almost certainly a measurement error
- * (e.g. drain underruns at stream startup) and we'd rather leave MCLK
- * near nominal than drag it far off on bad data. */
-#define AVB_PLL_MAX_APPLIED_PPM_Q16 ((int32_t)(100 * 65536))
+/* Safety clamp on the total applied correction (Kconfig, default
+ * 150 ppm). The bound must cover the worst LEGAL talker media-clock
+ * tolerance (IEEE 1722: ±100 ppm) plus this device's own crystal —
+ * a listener tracks the SUM of both. The old 100 ppm value assumed
+ * only one healthy crystal and railed for 6 h behind a free-running
+ * talker on the PreSonus bench. Beyond the clamp is treated as
+ * measurement error (e.g. drain underruns at stream startup): better
+ * to hold MCLK near nominal than drag it far off on bad data. */
+#define AVB_PLL_MAX_APPLIED_PPM_Q16                                            \
+  ((int32_t)(CONFIG_ESP_AVB_PLL_MAX_PPM * 65536))
 
 /* Maximum change of the correction TARGET per correction cycle, in ppm
  * per second averaged over the correction interval. Milan §7.2 caps
@@ -337,7 +367,24 @@ static bool read_sample(avb_state_s *state, uint64_t *bytes_out,
 
   /* Default / AVB_CLOCK_SOURCE_INTERNAL.
    *
-   * The (gPTP, byte-counter) pair must be sampled back-to-back: any
+   * Sensor selection: while a listener stream is playing, use the
+   * DAC-consumed counter (TX on_sent) — the proven listener sensor.
+   * Otherwise use the ADC-captured counter (RX on_recv): a pure
+   * talker never writes I2S TX, so the DAC counter is frozen and the
+   * servo would measure zero error forever while the APLL free-runs
+   * against the grandmaster (observed +31.5 ppm on the PreSonus
+   * bench). Both counters pace off the same APLL/MCLK. A sensor flip
+   * re-seeds the measurement baselines in avb_pll_tick. */
+  bool use_dac_sensor = state->stream_in_active;
+  if (use_dac_sensor != s_pll.sensor_was_dac) {
+    s_pll.sensor_was_dac = use_dac_sensor;
+    s_pll.integrator_ppm_q16 = 0; /* bias history is per-sensor */
+    s_pll.internal_hold = false;
+    s_pll.valid = false;
+    return false; /* re-seed on the new counter next tick */
+  }
+
+  /* The (gPTP, byte-counter) pair must be sampled back-to-back: any
    * preemption between the two reads shifts bytes relative to the time
    * window and shows up as a positive rate spike (a ~550 µs preemption
    * over a 5 s window read as ~+110 ppm — observed periodically before
@@ -348,8 +395,11 @@ static bool read_sample(avb_state_s *state, uint64_t *bytes_out,
     int64_t t0 = esp_timer_get_time();
     if (ptpd_now(&gptp) != 0)
       return false;
-    bytes = atomic_load_explicit(&state->media_clock.i2s_bytes_written,
-                                 memory_order_relaxed);
+    bytes = use_dac_sensor
+                ? atomic_load_explicit(&state->media_clock.i2s_bytes_written,
+                                       memory_order_relaxed)
+                : atomic_load_explicit(&state->media_clock.i2s_bytes_captured,
+                                       memory_order_relaxed);
     int64_t spread_us = esp_timer_get_time() - t0;
     if (spread_us <= 50)
       break;
@@ -381,9 +431,13 @@ void avb_pll_print_stats(avb_state_s *state) {
     return;
   int32_t inst_ppm_q16 = state->media_clock.pll_last_ppm_error_q16;
   int32_t cumul_ppm_q16 = state->media_clock.pll_cumulative_ppm_error_q16;
-  /* Nothing to report if we haven't measured anything this window. */
+  /* Nothing to report if we haven't measured anything this window —
+   * unless the servo is actively correcting (a talker has no RX drift
+   * samples but its gPTP disciplining still needs visibility). */
   if (state->media_clock.crf_samples == 0 &&
-      state->media_clock.stream_samples == 0)
+      state->media_clock.stream_samples == 0 &&
+      state->media_clock.pll_applied_ppm_q16 == 0 &&
+      state->media_clock.pll_target_ppm_q16 == 0)
     return;
   uint32_t crf_n = state->media_clock.crf_samples;
   uint32_t stream_n = state->media_clock.stream_samples;
@@ -448,6 +502,28 @@ int avb_pll_init(uint32_t nominal_mclk_hz) {
   return mclk_hw_init(nominal_mclk_hz);
 }
 
+/* Preload a persisted trim into the APLL — called from the NVS apply
+ * path after avb_pll_init, before streams start, so no listener is
+ * disturbed by the step. The servo still runs its acquisition
+ * one-shot afterward to trim residual (temperature, a different
+ * grandmaster since the save). */
+void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16) {
+  if (!state)
+    return;
+  if (trim_ppm_q16 > AVB_PLL_MAX_APPLIED_PPM_Q16)
+    trim_ppm_q16 = AVB_PLL_MAX_APPLIED_PPM_Q16;
+  if (trim_ppm_q16 < -AVB_PLL_MAX_APPLIED_PPM_Q16)
+    trim_ppm_q16 = -AVB_PLL_MAX_APPLIED_PPM_Q16;
+  if (mclk_hw_tune_ppm_q16(trim_ppm_q16) != 0) {
+    ESP_LOGW(TAG, "trim preload rejected by hw tune");
+    return;
+  }
+  state->media_clock.pll_applied_ppm_q16 = trim_ppm_q16;
+  state->media_clock.pll_target_ppm_q16 = trim_ppm_q16;
+  ESP_LOGI(TAG, "preloaded persisted trim %ld ppm",
+           (long)(trim_ppm_q16 / 65536));
+}
+
 void avb_pll_deinit(void) {
   mclk_hw_deinit();
   s_pll.valid = false;
@@ -496,6 +572,56 @@ void avb_pll_tick(avb_state_s *state) {
   }
 #endif
 
+  /* INTERNAL-reference validity gate. Before the PTP servo locks to
+   * a remote source, gPTP time is stepping and converging — a window
+   * spanning a step reads as a large false rate error (observed
+   * -111 ppm around first BTCA lock, which wound the integrator to
+   * its clamp and pushed the correction toward the opposite rail for
+   * hours). Freeze the servo until the clock source is valid and
+   * re-seed (with a clean integrator) on the invalid→valid edge.
+   * When this node IS the grandmaster there is no remote source and
+   * clock_source_valid stays false — freezing is correct there too:
+   * the APLL and local PTPD share the crystal, so the correction
+   * would be ~0 anyway, and the node's own clock defines the
+   * timeline. CRF mode has its own freshness gating in read_sample. */
+  if (state->media_clock.active_clock_source_index ==
+      AVB_CLOCK_SOURCE_INTERNAL) {
+    bool internal_ref_valid = state->ptp_status.clock_source_valid;
+    if (!internal_ref_valid) {
+      s_pll.internal_ref_was_valid = false;
+      s_pll.valid = false;
+      return;
+    }
+    if (!s_pll.internal_ref_was_valid) {
+      s_pll.internal_ref_was_valid = true;
+      s_pll.integrator_ppm_q16 = 0;
+      s_pll.internal_hold = false;
+      s_pll.internal_correcting_since_us = now_us;
+      s_pll.valid = false;    /* re-seed baselines below on this tick */
+    }
+  }
+
+  /* Mode-dependent loop tuning. The INTERNAL (gPTP) reference carries
+   * the local PTP servo's phase noise — every adjtime step lands in
+   * the offset-based cumulative window as a phantom rate error (the
+   * documented ±100 ppm gPTP-path spikes that drove listeners to the
+   * CRF reference). A talker has no CRF to switch to, so its loop
+   * must out-average the noise instead: windows ≥120 s dilute a
+   * phase step to a few ppm, a 5 ppm step clamp bounds the damage of
+   * any single polluted window, and a 2 ppm deadband stops hunting.
+   * CRF mode keeps the proven faster constants. */
+  bool internal_mode = state->media_clock.active_clock_source_index ==
+                       AVB_CLOCK_SOURCE_INTERNAL;
+  int64_t correction_interval_us = AVB_PLL_CORRECTION_INTERVAL_US;
+  int32_t correction_deadband_q16 = AVB_PLL_CORRECTION_DEADBAND_Q16;
+  int32_t max_step_q16 = AVB_PLL_MAX_STEP_PPM_Q16;
+  if (internal_mode) {
+    if (correction_interval_us < 120LL * 1000000LL)
+      correction_interval_us = 120LL * 1000000LL;
+    correction_deadband_q16 = 2 * 65536;
+    max_step_q16 = 5 * 65536;
+  }
+
   uint64_t bytes_now, gptp_now_ns;
   if (!read_sample(state, &bytes_now, &gptp_now_ns)) {
     s_pll.valid = false;
@@ -510,7 +636,7 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.prev_gptp_ns = gptp_now_ns;
     s_pll.valid = true;
     s_pll.startup_skipped_ticks = 0;
-    s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+    s_pll.next_correction_us = now_us + correction_interval_us;
     return;
   }
 
@@ -534,7 +660,7 @@ void avb_pll_tick(avb_state_s *state) {
      * the hardware state); a fresh window decides the next target. */
     state->media_clock.pll_target_ppm_q16 =
         state->media_clock.pll_applied_ppm_q16;
-    s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+    s_pll.next_correction_us = now_us + correction_interval_us;
     return;
   }
 
@@ -548,7 +674,7 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.base_gptp_ns = gptp_now_ns;
     s_pll.prev_i2s_bytes = bytes_now;
     s_pll.prev_gptp_ns = gptp_now_ns;
-    s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+    s_pll.next_correction_us = now_us + correction_interval_us;
     return;
   }
 
@@ -565,6 +691,7 @@ void avb_pll_tick(avb_state_s *state) {
   /* Sliding window — next 'instant' is vs now */
   s_pll.prev_i2s_bytes = bytes_now;
   s_pll.prev_gptp_ns = gptp_now_ns;
+
 
   /* Periodically fold the measured cumulative error into the applied
    * correction. cumul_ppm is already integrated so a P-controller with
@@ -586,7 +713,7 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.integrator_ppm_q16 = 0; /* I-term: anomalous input invalidates it */
     state->media_clock.pll_target_ppm_q16 =
         state->media_clock.pll_applied_ppm_q16; /* cancel in-flight slew */
-    s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+    s_pll.next_correction_us = now_us + correction_interval_us;
     return;
   }
 
@@ -597,6 +724,38 @@ void avb_pll_tick(avb_state_s *state) {
   int32_t target_q16 = state->media_clock.pll_target_ppm_q16;
   int32_t applied_q16 = state->media_clock.pll_applied_ppm_q16;
   if (applied_q16 != target_q16) {
+    /* Zero-crossing abort. inst positive means the clock is already
+     * FAST — if we are still slewing UP (or the mirror case), the
+     * target overshoots the true equilibrium (a stale or polluted
+     * measurement) and every further step makes it worse. Two
+     * consecutive far-side ticks (10 s, ±2 ppm deadband) land the
+     * slew where it is; the next tracking correction refines. */
+    bool slewing_up = target_q16 > applied_q16;
+    bool crossed = (slewing_up && inst_ppm_q16 > 2 * 65536) ||
+                   (!slewing_up && inst_ppm_q16 < -2 * 65536);
+    /* Only guard slews with meaningful distance left: near
+     * equilibrium the tracking moves are a few ppm and the instant
+     * window's ordinary noise trips the crossing detector on every
+     * one (observed: all listeners abort-churning after settling).
+     * Short moves are bounded by their own smallness. */
+    int32_t remaining_q16 = slewing_up ? target_q16 - applied_q16
+                                       : applied_q16 - target_q16;
+    if (crossed && remaining_q16 > 5 * 65536) {
+      if (++s_pll.slew_crossed_ticks >= 2) {
+        state->media_clock.pll_target_ppm_q16 = applied_q16;
+        s_pll.slew_crossed_ticks = 0;
+        s_pll.base_i2s_bytes = bytes_now;
+        s_pll.base_gptp_ns = gptp_now_ns;
+        s_pll.next_correction_us = now_us + correction_interval_us;
+        ESP_LOGW(TAG,
+                 "slew aborted at %ld ppm — instant error crossed zero "
+                 "(stale target %ld ppm)",
+                 (long)(applied_q16 / 65536), (long)(target_q16 / 65536));
+        return;
+      }
+    } else {
+      s_pll.slew_crossed_ticks = 0;
+    }
     int32_t slew_q16 = target_q16 - applied_q16;
     if (slew_q16 > AVB_PLL_SLEW_MAX_PPM_Q16)
       slew_q16 = AVB_PLL_SLEW_MAX_PPM_Q16;
@@ -608,16 +767,36 @@ void avb_pll_tick(avb_state_s *state) {
       if (applied_q16 == target_q16) {
         s_pll.base_i2s_bytes = bytes_now;
         s_pll.base_gptp_ns = gptp_now_ns;
-        s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+        s_pll.next_correction_us = now_us + correction_interval_us;
       }
     }
     return;
   }
 
-  if (AVB_PLL_CORRECTION_INTERVAL_US > 0 &&
+  /* Time-boxed INTERNAL convergence: the gPTP reference's phase noise
+   * on this hardware makes the instant and cumulative windows disagree
+   * by tens of ppm, so a stability predicate may never latch and the
+   * staircase would creep indefinitely (toward the rail). A crystal
+   * trim is quasi-static: discipline for a bounded window after the
+   * reference becomes valid, then HOLD whatever was achieved — a
+   * frozen imperfect reference is strictly better for the listeners
+   * (who track continuously, with ample range) than a creeping one. */
+  if (internal_mode && !s_pll.internal_hold &&
+      s_pll.internal_correcting_since_us != 0 &&
+      now_us - s_pll.internal_correcting_since_us > 15LL * 60 * 1000000LL &&
+      state->media_clock.pll_applied_ppm_q16 ==
+          state->media_clock.pll_target_ppm_q16) {
+    s_pll.internal_hold = true;
+    ESP_LOGI(TAG,
+             "internal convergence window closed — holding trim at %ld ppm",
+             (long)(state->media_clock.pll_applied_ppm_q16 / 65536));
+  }
+
+  if (correction_interval_us > 0 && !(internal_mode && s_pll.internal_hold) &&
       now_us >= s_pll.next_correction_us &&
-      (cumul_ppm_q16 > AVB_PLL_CORRECTION_DEADBAND_Q16 ||
-       cumul_ppm_q16 < -AVB_PLL_CORRECTION_DEADBAND_Q16)) {
+      (cumul_ppm_q16 > correction_deadband_q16 ||
+       cumul_ppm_q16 < -correction_deadband_q16)) {
+    int32_t step_q16;
     /* Accumulate the per-cycle error into the integrator. Random
      * measurement noise averages toward zero over many cycles; any
      * persistent bias drives the integrator toward the value that will
@@ -629,29 +808,96 @@ void avb_pll_tick(avb_state_s *state) {
       s_pll.integrator_ppm_q16 = AVB_PLL_MAX_INTEGRATOR_PPM_Q16;
     if (s_pll.integrator_ppm_q16 < -AVB_PLL_MAX_INTEGRATOR_PPM_Q16)
       s_pll.integrator_ppm_q16 = -AVB_PLL_MAX_INTEGRATOR_PPM_Q16;
+    /* Anti-windup bleed. A wound integrator that OPPOSES the measured
+     * error only unwinds at the I gain (~hours from the clamp) while
+     * it actively drives the correction the wrong way — one polluted
+     * startup window can push the output to the far rail. When the
+     * integrator and the error disagree in sign, bleed a quarter per
+     * cycle (gone in ~5 cycles); a legitimate integrator agrees with
+     * the residual error it is canceling and is never bled. */
+    if (s_pll.integrator_ppm_q16 != 0 &&
+        ((s_pll.integrator_ppm_q16 > 0) != (cumul_ppm_q16 > 0))) {
+      s_pll.integrator_ppm_q16 -= s_pll.integrator_ppm_q16 / 4;
+    }
 
     /* PI step: P-term tracks transient errors quickly, I-term holds
      * the offset needed to cancel persistent bias in steady state. */
     int32_t p_step_q16 =
         (int32_t)(((int64_t)cumul_ppm_q16 * AVB_PLL_GAIN_Q16) >> 16);
-    int32_t step_q16 = p_step_q16 + s_pll.integrator_ppm_q16;
+    step_q16 = p_step_q16 + s_pll.integrator_ppm_q16;
     /* Clamp per-step — single-window noise can still be big. */
-    if (step_q16 > AVB_PLL_MAX_STEP_PPM_Q16)
-      step_q16 = AVB_PLL_MAX_STEP_PPM_Q16;
-    if (step_q16 < -AVB_PLL_MAX_STEP_PPM_Q16)
-      step_q16 = -AVB_PLL_MAX_STEP_PPM_Q16;
+    if (step_q16 > max_step_q16)
+      step_q16 = max_step_q16;
+    if (step_q16 < -max_step_q16)
+      step_q16 = -max_step_q16;
     int32_t new_target = applied_q16 - step_q16;
-    /* Clamp total — anything beyond ±100 ppm is a bad measurement,
-     * not a real crystal offset for any commercially sane oscillator. */
+    /* Clamp total (see AVB_PLL_MAX_APPLIED_PPM_Q16). */
     if (new_target > AVB_PLL_MAX_APPLIED_PPM_Q16)
       new_target = AVB_PLL_MAX_APPLIED_PPM_Q16;
     if (new_target < -AVB_PLL_MAX_APPLIED_PPM_Q16)
       new_target = -AVB_PLL_MAX_APPLIED_PPM_Q16;
+    /* Rail telemetry: a servo pinned at the clamp cannot track its
+     * reference, and the only downstream symptom is slow jitter-ring
+     * drift + re-gate churn (found by forensics after 6 h railed).
+     * Make a sustained rail announce itself. */
+    if (new_target == AVB_PLL_MAX_APPLIED_PPM_Q16 ||
+        new_target == -AVB_PLL_MAX_APPLIED_PPM_Q16) {
+      if (s_pll.rail_since_us == 0) {
+        s_pll.rail_since_us = now_us;
+      } else if (!s_pll.rail_warned &&
+                 now_us - s_pll.rail_since_us > 10 * 1000 * 1000) {
+        s_pll.rail_warned = true;
+        ESP_LOGW(TAG,
+                 "correction railed at %+d ppm for >10s — reference is "
+                 "outside tracking range (talker clock out of tolerance, "
+                 "or bad reference)",
+                 (new_target > 0 ? 1 : -1) * CONFIG_ESP_AVB_PLL_MAX_PPM);
+      }
+    } else {
+      if (s_pll.rail_warned) {
+        ESP_LOGI(TAG, "correction back off the rail (%ld ppm)",
+                 (long)(new_target / 65536));
+      }
+      s_pll.rail_since_us = 0;
+      s_pll.rail_warned = false;
+    }
     /* Set the slew destination only — the ticks above walk the applied
      * value there and re-baseline when it lands. The baseline is not
      * reset here: the window stays frozen while the slew runs. */
     state->media_clock.pll_target_ppm_q16 = new_target;
-    s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+    s_pll.next_correction_us = now_us + correction_interval_us;
+  }
+
+  /* Persist the converged trim (avb_persistent_data_s v4) so the next
+   * boot preloads the APLL near equilibrium. "Converged" means the
+   * applied value is at target AND has moved < 2 ppm since the
+   * previous check 10 minutes ago — applied==target alone is also
+   * true at every rest between convergence steps, and persisting a
+   * mid-climb value would poison the next boot's preload (observed:
+   * a 10-minute check landing during the staircase persisted ~0).
+   * Written only when > 2 ppm from the saved value; the write rides
+   * the deferred NVS writer. */
+  if (state->media_clock.pll_applied_ppm_q16 ==
+          state->media_clock.pll_target_ppm_q16 &&
+      now_us - s_pll.last_trim_check_us > 600LL * 1000000LL) {
+    s_pll.last_trim_check_us = now_us;
+    int32_t applied_now_q16 = state->media_clock.pll_applied_ppm_q16;
+    int32_t moved_q16 = applied_now_q16 - s_pll.last_trim_check_value_q16;
+    bool stable = moved_q16 < 2 * 65536 && moved_q16 > -2 * 65536;
+    s_pll.last_trim_check_value_q16 = applied_now_q16;
+    if (stable && internal_mode && !s_pll.internal_hold) {
+      s_pll.internal_hold = true;
+      ESP_LOGI(TAG, "internal reference converged — holding trim at %ld ppm",
+               (long)(applied_now_q16 / 65536));
+    }
+    int32_t trim_delta_q16 =
+        applied_now_q16 - state->media_clock.pll_converged_trim_q16;
+    if (stable && (trim_delta_q16 > 2 * 65536 || trim_delta_q16 < -2 * 65536)) {
+      state->media_clock.pll_converged_trim_q16 = applied_now_q16;
+      avb_persist_request_save(state);
+      ESP_LOGI(TAG, "persisting media-clock trim %ld ppm",
+               (long)(applied_now_q16 / 65536));
+    }
   }
 
   /* Print is handled by AVB-STATS (see avb_pll_print_stats) — keep the

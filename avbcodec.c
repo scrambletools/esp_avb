@@ -145,6 +145,17 @@ static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
   return false;
 }
 
+/* RX DMA completion callback — accumulates ADC-captured bytes: the
+ * talker-side media-clock sensor (see i2s_bytes_captured in avb.h).
+ * Same ISR discipline as the TX twin. */
+static IRAM_ATTR bool i2s_rx_on_recv_cb(i2s_chan_handle_t handle,
+                                        i2s_event_data_t *event, void *arg) {
+  avb_state_s *state = (avb_state_s *)arg;
+  atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_captured,
+                            (uint64_t)event->size, memory_order_relaxed);
+  return false;
+}
+
 /* Configure the I2S driver
  * Typically the I2S driver must be reconfigured when the stream params change
  *
@@ -234,6 +245,9 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   i2s_event_callbacks_t tx_cbs = {.on_sent = i2s_tx_on_sent_cb};
   ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_tx_handle,
                                                       &tx_cbs, state));
+  i2s_event_callbacks_t rx_cbs = {.on_recv = i2s_rx_on_recv_cb};
+  ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_rx_handle,
+                                                      &rx_cbs, state));
 
   // Enable the I2S TX and RX channels
   ESP_ERROR_CHECK(i2s_channel_enable(state->i2s_tx_handle));
