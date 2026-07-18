@@ -1511,6 +1511,8 @@ typedef struct {
   volatile uint32_t seq_num_mismatch; /* sequence number gaps */
   volatile uint32_t loss_fill_events; /* loss-concealment silence inserts */
   volatile uint32_t loss_fill_frames; /* wire-lost frames replaced by silence */
+  volatile uint32_t splice_aligned;   /* inserts sized from presentation time */
+  uint32_t ring_bytes_per_sec;        /* ring byte rate at nominal DAC rate */
   volatile uint32_t ts_uncertain_count; /* AVTPDU with tu=1 received */
   uint8_t last_seq_num;               /* last received sequence number */
   bool seq_num_valid;                 /* false until first packet received */
@@ -1811,9 +1813,14 @@ static void stream_in_drain_cb(void *arg) {
      * arrivals while the I2S DMA (2 ms) rides through. Only treat it
      * as a lost stream — unlock and re-arm the presentation anchor so
      * the next packet re-gates at its own presentation time — when
-     * packets have actually stopped arriving. */
+     * packets have stopped for longer than the loss-concealment
+     * splice can repair. The splice must fit outage + transit lead
+     * (~12 ms) into the 64 KB ring (≈85 ms at 96 kHz), so unlock at
+     * 65 ms. Shorter outages stay locked: the DAC free-runs
+     * auto_clear silence and the resume packet splices back in at
+     * its exact presentation time, with no flush or gate wait. */
     int64_t since_pkt_us = esp_timer_get_time() - ctx->last_packet_us;
-    if (since_pkt_us > 20000) {
+    if (since_pkt_us > 65000) {
       ctx->drain_underrun++;
       ctx->drain_locked = false;
       atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
@@ -2054,17 +2061,120 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
 
   /* Loss concealment: the switch drops multicast frames on egress in
    * clumps (measured: ~8-25 frames every 1-3 min, absent at the talker
-   * tap). The DAC keeps consuming, so every lost frame permanently
-   * shortens the buffered timeline — playout creeps early and ring
-   * depth erodes until the starvation re-gate churns. Insert the lost
-   * duration as silence so depth and presentation alignment survive.
-   * Only while playout is locked (during gating the anchor logic owns
-   * ring alignment), never across a media-clock restart (mr=1), and
-   * bounded well under the 8-bit seq wrap (a gap ≥ 200 frames is
-   * ambiguous — the 20 ms starvation re-gate handles real outages). */
-  if (lost_frames > 0 && lost_frames < 200 && ctx->drain_locked &&
-      !(avtp_data[1] & 0x08)) {
-    uint32_t fill_bytes = lost_frames * total;
+   * tap), plus occasional 50-70 ms outages. The DAC keeps consuming,
+   * so every lost frame permanently shortens the buffered timeline —
+   * playout creeps early and ring depth erodes until the starvation
+   * re-gate churns. Insert the lost duration as silence so depth and
+   * presentation alignment survive. Only while playout is locked
+   * (during gating the anchor logic owns ring alignment), never
+   * across a media-clock restart (mr=1).
+   *
+   * Sizing, by outage class:
+   * - No/short pause (pure drop clump): wire-true packet count. The
+   *   8-bit seq residue is disambiguated by the arrival gap (packet
+   *   cadence = total/byterate); no DAC free-run occurred, so
+   *   restoring exactly the lost duration is exactly right.
+   * - Pause ≥ 10 ms (ring + I2S DMA exhausted, DAC free-ran
+   *   auto_clear zeros): the free-run time must NOT be re-inserted
+   *   or playout lands late. Size from presentation time instead:
+   *   queue exactly enough silence that this packet's first byte
+   *   plays at avtp_ts + EXTRA_LATENCY − OUTPUT_DELAY — the same
+   *   equation the pt gate solves, done as a splice with no unlock,
+   *   no ring flush, no gate wait. Mid-outage the DMA holds no
+   *   scheduled audio, so ring fill alone is the queued depth.
+   * A distrusted estimate (reorder signature, absurd lead) falls
+   * back to the bounded residue fill; outages beyond what the ring
+   * can hold still take the starvation re-gate. */
+  /* Hot-path budget: read the clock only when a loss was seen or the
+   * ring is empty (any pause that matters drains the ring first) —
+   * routine packets skip both branches. */
+  int64_t pause_us = 0;
+  if (ctx->drain_locked && ctx->last_packet_us != 0 &&
+      (lost_frames > 0 || ring_readable(&ctx->ring) == 0))
+    pause_us = esp_timer_get_time() - ctx->last_packet_us;
+  if (ctx->drain_locked && !(avtp_data[1] & 0x08) && total > 0 &&
+      (lost_frames > 0 || pause_us > 10000)) {
+    uint32_t fill_bytes = 0;
+    bool aligned = false;
+    if (pause_us > 10000) {
+      /* 10 ms: above this the ring + I2S DMA (~9 ms standing) are
+       * drained, so ring fill alone is the queued depth and the
+       * presentation-time sizing is exact. Below it the residue path
+       * is exact instead (no DAC free-run yet). A 15 ms threshold
+       * left a band where the residue path re-inserted time the DAC
+       * had already free-run — measured +6 KB standing-depth ratchet.
+       * Residual error in the crossover band is ≤~2 ms and the
+       * absolute (want−have) sizing bleeds it off at the next long
+       * pause. */
+      /* Long pause: prefer presentation-time sizing — it is exact for
+       * every mix of lost, delayed, and free-run time, including the
+       * seq-blind exact-256 loss (residue 0). */
+      if (ctx->diag_gate_mode == 1 && (avtp_data[1] & 0x01)) {
+        struct timespec ts_now;
+        if (ptpd_now(&ts_now) == 0) {
+          uint32_t now32 = (uint32_t)((uint64_t)ts_now.tv_sec *
+                                          1000000000ULL +
+                                      (uint64_t)ts_now.tv_nsec);
+          uint32_t pkt_ts = ((uint32_t)avtp_data[12] << 24) |
+                            ((uint32_t)avtp_data[13] << 16) |
+                            ((uint32_t)avtp_data[14] << 8) |
+                            (uint32_t)avtp_data[15];
+          int32_t lead = (int32_t)(
+              pkt_ts +
+              (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US * 1000U) -
+              STREAM_IN_OUTPUT_DELAY_NS - now32);
+          if (lead > -400000000 && lead < 400000000) {
+            /* A sane clock read owns the decision either way. lead ≤ 0
+             * means the resume packet is already at/past its
+             * presentation time — the switch queued the stream and
+             * dumped part of it (frames lost with little wall-clock
+             * pause). Insert NOTHING: the DAC consumed real audio
+             * through that interval, and the cadence fallback would
+             * re-insert time that never left the buffer (measured
+             * +19 KB standing-depth ratchet). */
+            if (lead > 0) {
+              int64_t want = ((int64_t)lead * ctx->ring_bytes_per_sec) /
+                             1000000000LL;
+              int64_t b = want - (int64_t)ring_readable(&ctx->ring);
+              fill_bytes = b > 0 ? ((uint32_t)b & ~7u) : 0;
+            } else {
+              fill_bytes = 0;
+            }
+            aligned = true;
+          }
+        }
+      }
+      if (!aligned && lost_frames > 0 && ctx->ring_bytes_per_sec > 0) {
+        /* Fallback (prefill lock / tu=1 / clock unavailable): wire
+         * cadence disambiguates the 8-bit residue. Only a nonzero
+         * residue proves loss — a residue-0 pause may be pure delay,
+         * which must not be double-booked. last_packet_us is ≤1 ms
+         * stale (sparse stash), inside the ±128-packet decision
+         * distance. */
+        int64_t est = (pause_us * (int64_t)ctx->ring_bytes_per_sec) /
+                      ((int64_t)total * 1000000LL);
+        int64_t k = (est - (int64_t)lost_frames + 128) / 256;
+        int64_t n_pkts = (int64_t)lost_frames + (k > 0 ? k * 256 : 0);
+        if (n_pkts - est > 96 || est - n_pkts > 96)
+          n_pkts = 0; /* cadence disagrees with residue — distrust */
+        fill_bytes = (uint32_t)(n_pkts * total);
+      }
+    } else if (lost_frames > 0 && lost_frames < 200) {
+      /* Short/no pause: real-time drop clump — residue is the count,
+       * and the wall-clock pause bounds it (the DAC consumed only
+       * pause-worth of buffer; a big residue after a tiny pause is a
+       * switch queue-dump whose time must not be re-inserted). +16
+       * covers the ≤1 ms staleness of the sparse last_packet_us. */
+      uint32_t n_fill = lost_frames;
+      if (pause_us > 0 && ctx->ring_bytes_per_sec > 0) {
+        uint32_t pause_pkts = (uint32_t)(
+            (pause_us * (int64_t)ctx->ring_bytes_per_sec) /
+            ((int64_t)total * 1000000LL)) + 16;
+        if (n_fill > pause_pkts)
+          n_fill = pause_pkts;
+      }
+      fill_bytes = n_fill * total;
+    }
     if (fill_bytes > 0 && ring_writable(&ctx->ring) >= fill_bytes + total) {
       uint32_t fh = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
       uint32_t fmask = ctx->ring.capacity - 1;
@@ -2078,7 +2188,9 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
       atomic_store_explicit(&ctx->ring.head, fh + fill_bytes,
                             memory_order_release);
       ctx->loss_fill_events++;
-      ctx->loss_fill_frames += lost_frames;
+      ctx->loss_fill_frames += fill_bytes / total;
+      if (aligned)
+        ctx->splice_aligned++;
     }
   }
 
@@ -2197,8 +2309,8 @@ void avb_stream_in_print_diag(void) {
   uint32_t rx_drops = avb_net_stream_rx_drops();
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
-          "qfill=%lu id_skip=%lu seq_gap=%lu conceal=%lu/%lu rx_drops=%lu "
-          "locked=%lu/%lu gate=%s(err=%ldns fill=%lu)",
+          "qfill=%lu id_skip=%lu seq_gap=%lu conceal=%lu/%lu spl=%lu "
+          "rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu)",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -2209,6 +2321,7 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)ctx->seq_num_mismatch,
           (unsigned long)ctx->loss_fill_events,
           (unsigned long)ctx->loss_fill_frames,
+          (unsigned long)ctx->splice_aligned,
           (unsigned long)rx_drops,
           (unsigned long)ctx->media_locked_count,
           (unsigned long)ctx->media_unlocked_count,
@@ -2528,6 +2641,10 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   }
   ctx->state = state;
   ctx->i2s_tx_handle = state->i2s_tx_handle;
+  /* Ring carries stereo 24-in-32 slots: 8 B per sample frame. Used by
+   * loss concealment to convert arrival gaps and presentation leads
+   * into ring bytes. */
+  ctx->ring_bytes_per_sec = state->media_clock.listener_sample_rate * 8;
   memcpy(ctx->expected_stream_id, state->input_streams[index].stream_id,
          UNIQUE_ID_LEN);
   if (state->input_streams[index].provisional) {
