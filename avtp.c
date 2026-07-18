@@ -1509,6 +1509,8 @@ typedef struct {
   volatile uint32_t drain_underrun;   /* drain ticks that found ring empty */
   volatile uint32_t stream_id_mismatch; /* packets dropped: wrong stream_id */
   volatile uint32_t seq_num_mismatch; /* sequence number gaps */
+  volatile uint32_t loss_fill_events; /* loss-concealment silence inserts */
+  volatile uint32_t loss_fill_frames; /* wire-lost frames replaced by silence */
   volatile uint32_t ts_uncertain_count; /* AVTPDU with tu=1 received */
   uint8_t last_seq_num;               /* last received sequence number */
   bool seq_num_valid;                 /* false until first packet received */
@@ -1958,10 +1960,14 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   }
 
   /* seq_num gap tracking (avtp_data[2]) and tu-bit (avtp_data[3] bit 0).
-   * Both are just volatile counter increments — cheap. */
+   * Both are just volatile counter increments — cheap. lost_frames feeds
+   * the loss-concealment insert below. */
   uint8_t seq_num = avtp_data[2];
-  if (ctx->seq_num_valid && seq_num != (uint8_t)(ctx->last_seq_num + 1))
+  uint32_t lost_frames = 0;
+  if (ctx->seq_num_valid && seq_num != (uint8_t)(ctx->last_seq_num + 1)) {
     ctx->seq_num_mismatch++;
+    lost_frames = (uint8_t)(seq_num - (uint8_t)(ctx->last_seq_num + 1));
+  }
   ctx->last_seq_num = seq_num;
   ctx->seq_num_valid = true;
   if (avtp_data[3] & 0x01)
@@ -2045,6 +2051,37 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * across. AM824 prefixes a label byte; skip it. Extra channels are
    * ignored. */
   uint32_t total = (uint32_t)samples * 8; /* stereo 24-in-32 slots */
+
+  /* Loss concealment: the switch drops multicast frames on egress in
+   * clumps (measured: ~8-25 frames every 1-3 min, absent at the talker
+   * tap). The DAC keeps consuming, so every lost frame permanently
+   * shortens the buffered timeline — playout creeps early and ring
+   * depth erodes until the starvation re-gate churns. Insert the lost
+   * duration as silence so depth and presentation alignment survive.
+   * Only while playout is locked (during gating the anchor logic owns
+   * ring alignment), never across a media-clock restart (mr=1), and
+   * bounded well under the 8-bit seq wrap (a gap ≥ 200 frames is
+   * ambiguous — the 20 ms starvation re-gate handles real outages). */
+  if (lost_frames > 0 && lost_frames < 200 && ctx->drain_locked &&
+      !(avtp_data[1] & 0x08)) {
+    uint32_t fill_bytes = lost_frames * total;
+    if (fill_bytes > 0 && ring_writable(&ctx->ring) >= fill_bytes + total) {
+      uint32_t fh = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
+      uint32_t fmask = ctx->ring.capacity - 1;
+      uint32_t fstart = fh & fmask;
+      uint32_t ffirst = ctx->ring.capacity - fstart;
+      if (ffirst > fill_bytes)
+        ffirst = fill_bytes;
+      memset(ctx->ring.buf + fstart, 0, ffirst);
+      if (fill_bytes > ffirst)
+        memset(ctx->ring.buf, 0, fill_bytes - ffirst);
+      atomic_store_explicit(&ctx->ring.head, fh + fill_bytes,
+                            memory_order_release);
+      ctx->loss_fill_events++;
+      ctx->loss_fill_frames += lost_frames;
+    }
+  }
+
   uint32_t pre_fill = ring_readable(&ctx->ring);
   if (total > 0 && ring_writable(&ctx->ring) >= total) {
     uint32_t h = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
@@ -2160,8 +2197,8 @@ void avb_stream_in_print_diag(void) {
   uint32_t rx_drops = avb_net_stream_rx_drops();
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
-          "qfill=%lu id_skip=%lu seq_gap=%lu rx_drops=%lu locked=%lu/%lu "
-          "gate=%s(err=%ldns fill=%lu)",
+          "qfill=%lu id_skip=%lu seq_gap=%lu conceal=%lu/%lu rx_drops=%lu "
+          "locked=%lu/%lu gate=%s(err=%ldns fill=%lu)",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -2170,6 +2207,8 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)ring_readable(&ctx->ring),
           (unsigned long)ctx->stream_id_mismatch,
           (unsigned long)ctx->seq_num_mismatch,
+          (unsigned long)ctx->loss_fill_events,
+          (unsigned long)ctx->loss_fill_frames,
           (unsigned long)rx_drops,
           (unsigned long)ctx->media_locked_count,
           (unsigned long)ctx->media_unlocked_count,
