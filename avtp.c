@@ -2144,21 +2144,14 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
           }
         }
       }
-      if (!aligned && lost_frames > 0 && ctx->ring_bytes_per_sec > 0) {
-        /* Fallback (prefill lock / tu=1 / clock unavailable): wire
-         * cadence disambiguates the 8-bit residue. Only a nonzero
-         * residue proves loss — a residue-0 pause may be pure delay,
-         * which must not be double-booked. last_packet_us is ≤1 ms
-         * stale (sparse stash), inside the ±128-packet decision
-         * distance. */
-        int64_t est = (pause_us * (int64_t)ctx->ring_bytes_per_sec) /
-                      ((int64_t)total * 1000000LL);
-        int64_t k = (est - (int64_t)lost_frames + 128) / 256;
-        int64_t n_pkts = (int64_t)lost_frames + (k > 0 ? k * 256 : 0);
-        if (n_pkts - est > 96 || est - n_pkts > 96)
-          n_pkts = 0; /* cadence disagrees with residue — distrust */
-        fill_bytes = (uint32_t)(n_pkts * total);
-      }
+      /* No fallback when the aligned sizing is unavailable (prefill
+       * lock / tu=1 / clock unavailable): a long pause means the DAC
+       * consumed buffer and then free-ran an unknowable amount, and
+       * cadence sizing re-inserts that free-run time — measured
+       * +20 KB standing-depth ratchet from a 37 ms queue-dump that
+       * landed while a post-outage lock was still in prefill mode.
+       * Aligned-or-nothing is provably ratchet-free; the eventual pt
+       * re-gate realigns anything a skipped insert left behind. */
     } else if (lost_frames > 0 && lost_frames < 200) {
       /* Short/no pause: real-time drop clump — residue is the count,
        * and the wall-clock pause bounds it (the DAC consumed only
