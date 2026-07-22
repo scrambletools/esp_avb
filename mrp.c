@@ -1308,6 +1308,7 @@ static void mrp_on_listener_registrar_change(
       bool was_ready = stream->connected_listeners[lidx].msrp_ready;
       stream->connected_listeners[lidx].msrp_ready = true;
       stream->connected_listeners[lidx].msrp_ready_live = true;
+      stream->connected_listeners[lidx].asking_failed_since_us = 0;
       if (!was_ready) {
         avbinfo("MSRP: listener ready for stream %d (count=%d, acmp=%d)", i,
                 octets_to_uint(stream->connection_count, 2),
@@ -1342,18 +1343,34 @@ static void mrp_on_listener_registrar_change(
         avberr("MSRP: connected_listeners full for stream %d", i);
         break;
       }
-      stream->connected_listeners[lidx].last_seen_us = esp_timer_get_time();
+      int64_t now_us = esp_timer_get_time();
+      stream->connected_listeners[lidx].last_seen_us = now_us;
       stream->connected_listeners[lidx].asking_failed = true;
       if (decl == msrp_listener_event_asking_failed &&
           stream->connected_listeners[lidx].msrp_ready_live) {
-        stream->connected_listeners[lidx].msrp_ready = false;
-        stream->connected_listeners[lidx].msrp_ready_live = false;
-        bool should_stop = !any_listener_ready(stream) ||
-                           (!state->config.milan_compliant &&
-                            !any_listener_acmp_connected(stream));
-        if (should_stop && stream->streaming) {
-          avbinfo("MSRP: no listener can receive stream %d — stopping", i);
-          avb_stop_stream_out(state, i);
+        /* Hold-down: a listener rebooting behind a bridge collapses
+         * the merged declaration to AskingFailed for the few seconds
+         * before its Ready returns; stopping then would leave the
+         * returning listener's fast-connect with no stream to catch.
+         * Clear readiness only when AskingFailed sustains past the
+         * transitional window (declarations re-arrive ~1/s, so this
+         * re-evaluates continuously). */
+#define MSRP_ASKING_FAILED_HOLDDOWN_US (10 * 1000 * 1000)
+        if (stream->connected_listeners[lidx].asking_failed_since_us == 0) {
+          stream->connected_listeners[lidx].asking_failed_since_us = now_us;
+        } else if (now_us -
+                       stream->connected_listeners[lidx].asking_failed_since_us >
+                   MSRP_ASKING_FAILED_HOLDDOWN_US) {
+          stream->connected_listeners[lidx].msrp_ready = false;
+          stream->connected_listeners[lidx].msrp_ready_live = false;
+          stream->connected_listeners[lidx].asking_failed_since_us = 0;
+          bool should_stop = !any_listener_ready(stream) ||
+                             (!state->config.milan_compliant &&
+                              !any_listener_acmp_connected(stream));
+          if (should_stop && stream->streaming) {
+            avbinfo("MSRP: no listener can receive stream %d — stopping", i);
+            avb_stop_stream_out(state, i);
+          }
         }
       }
       avbinfo("MSRP: listener %s for stream %d",

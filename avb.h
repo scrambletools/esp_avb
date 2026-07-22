@@ -552,6 +552,13 @@ typedef struct {
      * transiently declare AskingFailed during their own boot) and is
      * torn down only by the leave/age-out paths. */
     bool msrp_ready_live;
+    /* First time the current uninterrupted run of AskingFailed
+     * declarations was seen for this row (0 = none). Readiness is
+     * only cleared once AskingFailed has been SUSTAINED past the
+     * hold-down: a rebooting listener transits AskingFailed for a
+     * few seconds before its Ready returns, and stopping the stream
+     * for that window would defeat its superfast reconnect. */
+    int64_t asking_failed_since_us;
     bool acmp_connected;      // ACMP connect_tx received
     /* True when this listener currently has an MSRP Listener Asking
      * Failed declaration registered against this talker stream. Used
