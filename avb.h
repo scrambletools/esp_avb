@@ -544,6 +544,14 @@ typedef struct {
     eth_addr_t mac_addr;      // from MSRP source
     identity_pair_t identity; // from ACMP connect_tx
     bool msrp_ready;          // MSRP listener declared ready
+    /* True when msrp_ready was set by a live wire Ready this boot (vs
+     * restored from the NVS journal). An AskingFailed declaration —
+     * "no downstream listener can receive" per the §35.2.4.4.3 merge
+     * rules — clears only live readiness: journal-restored readiness
+     * is provisional (superfast connect streams on it while listeners
+     * transiently declare AskingFailed during their own boot) and is
+     * torn down only by the leave/age-out paths. */
+    bool msrp_ready_live;
     bool acmp_connected;      // ACMP connect_tx received
     /* True when this listener currently has an MSRP Listener Asking
      * Failed declaration registered against this talker stream. Used

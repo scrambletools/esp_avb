@@ -1307,6 +1307,7 @@ static void mrp_on_listener_registrar_change(
       stream->connected_listeners[lidx].last_seen_us = esp_timer_get_time();
       bool was_ready = stream->connected_listeners[lidx].msrp_ready;
       stream->connected_listeners[lidx].msrp_ready = true;
+      stream->connected_listeners[lidx].msrp_ready_live = true;
       if (!was_ready) {
         avbinfo("MSRP: listener ready for stream %d (count=%d, acmp=%d)", i,
                 octets_to_uint(stream->connection_count, 2),
@@ -1325,8 +1326,15 @@ static void mrp_on_listener_registrar_change(
 
     /* AskingFailed / ReadyFailed — track per-listener so ACMP
      * GET_TX_STATE_RESPONSE can set REGISTERING_FAILED per Milan
-     * v1.3 Table 5.23. ready_failed is a transient MRP event with
-     * the same talker-side meaning; treat identically. */
+     * v1.3 Table 5.23. Under the §35.2.4.4.3 merge rules the two
+     * differ materially at the talker: ReadyFailed means at least one
+     * downstream listener still receives (keep streaming, flag the
+     * failure); AskingFailed means NO downstream listener can receive
+     * — clear readiness and stop when nothing else is ready, for both
+     * Milan and plain AVB. Only live (wire-Ready-earned) readiness is
+     * cleared: journal-restored readiness stays provisional through
+     * the transient AskingFailed that listeners declare while booting
+     * (superfast connect), and is torn down only by leave/age-out. */
     if (decl == msrp_listener_event_asking_failed ||
         decl == msrp_listener_event_ready_failed) {
       int lidx = find_or_add_msrp_listener(state, stream, src_addr);
@@ -1335,10 +1343,19 @@ static void mrp_on_listener_registrar_change(
         break;
       }
       stream->connected_listeners[lidx].last_seen_us = esp_timer_get_time();
-      if (!stream->connected_listeners[lidx].msrp_ready) {
-        stream->connected_listeners[lidx].msrp_ready = false;
-      }
       stream->connected_listeners[lidx].asking_failed = true;
+      if (decl == msrp_listener_event_asking_failed &&
+          stream->connected_listeners[lidx].msrp_ready_live) {
+        stream->connected_listeners[lidx].msrp_ready = false;
+        stream->connected_listeners[lidx].msrp_ready_live = false;
+        bool should_stop = !any_listener_ready(stream) ||
+                           (!state->config.milan_compliant &&
+                            !any_listener_acmp_connected(stream));
+        if (should_stop && stream->streaming) {
+          avbinfo("MSRP: no listener can receive stream %d — stopping", i);
+          avb_stop_stream_out(state, i);
+        }
+      }
       avbinfo("MSRP: listener %s for stream %d",
               decl == msrp_listener_event_asking_failed ? "asking_failed"
                                                         : "ready_failed",
