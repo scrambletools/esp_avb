@@ -1662,15 +1662,29 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
       int n3 = (num_vals + 2) / 3;
       int n4 = (attr_type == msrp_attr_type_listener) ? (num_vals + 3) / 4 : 0;
       size_t vec_len = 2 + (size_t)fv_len + (size_t)n3 + (size_t)n4;
-      if (num_vals == 0 || voff + vec_len > list_end)
+      if (voff + vec_len > list_end)
         break; /* malformed vector */
 
       /* LeaveAll fires once per attribute type per PDU and applies
-       * only to that type's SMs (see msrp_dispatch_leaveall). */
+       * only to that type's SMs (see msrp_dispatch_leaveall). Must be
+       * processed BEFORE the empty-vector skip: a pure-LeaveAll
+       * vector (LeaveAll bit + NumberOfValues=0, no events) is legal
+       * §10.8.1.2 encoding — the MOTU AVB switch emits exactly that,
+       * and dropping it as malformed meant we never saw its LeaveAll,
+       * so our 1 s periodic re-join raced its ~600 ms LeaveTimer and
+       * our registrations flapped every LeaveAll cycle. Arm the
+       * JoinTimer so anxious applicants re-declare within JoinTime
+       * (200 ms), inside any spec-legal LeaveTimer. */
       if (leaveall && !state->avb_lite && attr_type < 8 &&
           !(leaveall_types & (1u << attr_type))) {
         msrp_dispatch_leaveall(port, attr_type);
         leaveall_types |= (1u << attr_type);
+        mrp_port_arm_join_timer(state, port);
+      }
+
+      if (num_vals == 0) {
+        voff += vec_len; /* pure-LeaveAll vector — no values to decode */
+        continue;
       }
 
       const uint8_t *fv = &raw[voff + 2];
