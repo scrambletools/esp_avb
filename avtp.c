@@ -1494,11 +1494,16 @@ typedef struct {
   jitter_ring_t ring;                        /* SPSC byte ring, handler→drain */
   esp_timer_handle_t drain_timer;            /* periodic 1 ms drain */
   uint8_t expected_stream_id[UNIQUE_ID_LEN]; /* filter: only accept this stream */
-  /* Superfast connect: until a frame's rate code matches the
-   * NVS-restored format, drop instead of ingesting — protects a
-   * provisional start against the wire rate having changed while we
-   * were down. One byte-compare per frame, only until first match. */
+  /* Wire-format guard: until a frame's subtype and rate code match the
+   * configured input format, drop instead of ingesting. Protects a
+   * provisional (superfast) start against the wire rate having changed
+   * while we were down, and an explicit connect against a talker whose
+   * stream doesn't match our configured format (e.g. a 44.1 kHz 61883
+   * talker into a 96 kHz AAF pipeline would otherwise play
+   * pitch-shifted). Two byte-compares per frame, only until first
+   * match. */
   bool rate_check_pending;
+  uint8_t expected_subtype;   /* AVTP subtype of the configured format */
   uint8_t expected_rate_code; /* AAF nsr or 61883 SFC, by subtype */
   volatile uint32_t rate_mismatch; /* frames dropped by the check */
   /* diagnostics — volatile, handler-writes-only, stats-reads-only */
@@ -1982,14 +1987,15 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
 
   uint8_t subtype = avtp_data[0] & 0x7F;
 
-  /* Provisional-start rate guard (see ctx field comment). AAF carries
-   * nsr in the top nibble of byte 17; 61883 carries the CIP SFC in
-   * the low 3 bits of byte 29 (CIP header byte 5). */
+  /* Wire-format guard (see ctx field comment). AAF carries nsr in the
+   * top nibble of byte 17; 61883 carries the CIP SFC in the low 3 bits
+   * of byte 29 (CIP header byte 5). */
   if (ctx->rate_check_pending) {
     uint8_t rate_code = (subtype == avtp_subtype_aaf)
                             ? (avtp_data[17] >> 4) & 0x0F
                             : (len > 29 ? (avtp_data[29] & 0x07) : 0xFF);
-    if (rate_code != ctx->expected_rate_code) {
+    if (subtype != ctx->expected_subtype ||
+        rate_code != ctx->expected_rate_code) {
       ctx->rate_mismatch++;
       return;
     }
@@ -2302,8 +2308,8 @@ void avb_stream_in_print_diag(void) {
   uint32_t rx_drops = avb_net_stream_rx_drops();
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
-          "qfill=%lu id_skip=%lu seq_gap=%lu conceal=%lu/%lu spl=%lu "
-          "rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu)",
+          "qfill=%lu id_skip=%lu rate_mm=%lu seq_gap=%lu conceal=%lu/%lu "
+          "spl=%lu rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu)",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -2311,6 +2317,7 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)(under - last_under),
           (unsigned long)ring_readable(&ctx->ring),
           (unsigned long)ctx->stream_id_mismatch,
+          (unsigned long)ctx->rate_mismatch,
           (unsigned long)ctx->seq_num_mismatch,
           (unsigned long)ctx->loss_fill_events,
           (unsigned long)ctx->loss_fill_frames,
@@ -2640,10 +2647,13 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   ctx->ring_bytes_per_sec = state->media_clock.listener_sample_rate * 8;
   memcpy(ctx->expected_stream_id, state->input_streams[index].stream_id,
          UNIQUE_ID_LEN);
-  if (state->input_streams[index].provisional) {
-    /* Provisional (superfast) start: gate ingest on the wire rate
-     * matching the NVS-restored format. */
+  {
+    /* Gate ingest on the wire subtype and rate matching the configured
+     * input format — on every start, not just provisional (superfast)
+     * ones: an explicitly connected talker can equally stream a
+     * different rate or subtype than this listener is configured for. */
     avtp_stream_format_s *fmt = &state->input_streams[index].stream_format;
+    ctx->expected_subtype = fmt->aaf_pcm.subtype;
     ctx->expected_rate_code = (fmt->aaf_pcm.subtype == avtp_subtype_61883)
                                   ? (fmt->am824.fdf_sfc & 0x07)
                                   : fmt->aaf_pcm.sample_rate;

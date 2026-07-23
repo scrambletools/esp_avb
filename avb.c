@@ -165,13 +165,19 @@ static void avb_update_avb_lite_from_ptp(avb_state_s *state) {
   state->avb_lite = avb_lite;
 }
 
+/* Emits exactly AVB_FORMATS_PER_RATE formats per supported rate, in a
+ * fixed family order (am824, aaf32, aaf24), rates in sample_rates[]
+ * order — avb_persist_normalize_stream_format indexes on this layout. */
+#define AVB_FORMATS_PER_RATE 3
 static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
                                       size_t max_formats,
                                       const uint32_t *sample_rates,
                                       size_t sample_rate_count,
                                       uint8_t channels_per_stream) {
   size_t n = 0;
-  for (size_t i = 0; i < sample_rate_count && n + 3 <= max_formats; i++) {
+  for (size_t i = 0;
+       i < sample_rate_count && n + AVB_FORMATS_PER_RATE <= max_formats;
+       i++) {
     uint32_t hz = sample_rates[i];
     avtp_stream_format_am824_s am824 =
         AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
@@ -1760,6 +1766,72 @@ static bool avb_persist_stream_format_supported(avb_state_s *state,
   return false;
 }
 
+/* Milan requires SET_STREAM_FORMAT to persist across power cycles, but a
+ * stream format must also stay coherent with the entity's operating
+ * sampling rate — which at boot comes from config, not from the persisted
+ * format. A persisted format at another rate (e.g. a 192 kHz word left
+ * over from an experiment on a board now running 96 kHz) drives the idle
+ * talker's MSRP TSpec, advertising tens of Mbps of phantom Class A per
+ * port — enough to break admission control on 100 Mbps ports (observed
+ * as a bridge TALKER_FAILED code=1 flap). Preserve the persisted format
+ * FAMILY (subtype/bit depth) but coerce its rate to the operating rate.
+ * Relies on avb_build_audio_formats emitting a fixed family order per
+ * rate, in supported_sample_rates order. Returns false if the format is
+ * unusable; on success `format` holds the (possibly rewritten) word. */
+static bool avb_persist_normalize_stream_format(avb_state_s *state,
+                                                bool is_output, uint16_t index,
+                                                uint8_t format[8]) {
+  if (!avb_persist_stream_format_supported(state, is_output, index, format))
+    return false;
+
+  bool is_crf_stream =
+      (!is_output && index == avb_get_crf_input_index(state)) ||
+      (is_output && index == avb_get_crf_output_index(state));
+  if (is_crf_stream)
+    return true; /* already exact-matched against the operating rate */
+
+  const avtp_stream_format_s *supported = is_output
+                                              ? state->supported_formats_out
+                                              : state->supported_formats_in;
+  size_t num_supported = is_output ? state->num_supported_formats_out
+                                   : state->num_supported_formats_in;
+  size_t format_idx = num_supported;
+  for (size_t i = 0; i < num_supported; i++) {
+    if (memcmp(format, &supported[i], 8) == 0) {
+      format_idx = i;
+      break;
+    }
+  }
+  if (format_idx == num_supported)
+    return false; /* unreachable: _supported() above already matched */
+
+  int op_rate_slot = -1;
+  for (uint8_t i = 0; i < state->supported_sample_rates.num_rates; i++) {
+    if (state->supported_sample_rates.sample_rates[i] ==
+        state->config.default_sample_rate) {
+      op_rate_slot = i;
+      break;
+    }
+  }
+  if (op_rate_slot < 0)
+    return true; /* operating rate not enumerable; leave format as-is */
+
+  size_t family = format_idx % AVB_FORMATS_PER_RATE;
+  size_t rate_slot = format_idx / AVB_FORMATS_PER_RATE;
+  if ((int)rate_slot == op_rate_slot)
+    return true;
+
+  size_t replacement = (size_t)op_rate_slot * AVB_FORMATS_PER_RATE + family;
+  if (replacement >= num_supported)
+    return false;
+  avbwarn("NVS: stream_%s %d persisted format rate slot %u != operating "
+          "%lu Hz; coercing rate, keeping format family",
+          is_output ? "output" : "input", index, (unsigned)rate_slot,
+          (unsigned long)state->config.default_sample_rate);
+  memcpy(format, &supported[replacement], 8);
+  return true;
+}
+
 /* Populate the persist struct from current state */
 static uint32_t s_persist_journal_seq = 0;
 
@@ -2136,10 +2208,12 @@ static void avb_persist_apply(avb_state_s *state) {
   for (int i = 0; i < n_in; i++) {
     const avb_persist_input_stream_s *src = &p->input_streams[i];
     avb_listener_stream_s *dst = &state->input_streams[i];
-    bool format_ok = avb_persist_stream_format_supported(state, false, i,
-                                                         src->stream_format);
+    uint8_t norm_format[8];
+    memcpy(norm_format, src->stream_format, 8);
+    bool format_ok =
+        avb_persist_normalize_stream_format(state, false, i, norm_format);
     if (format_ok) {
-      memcpy(&dst->stream_format, src->stream_format, 8);
+      memcpy(&dst->stream_format, norm_format, 8);
     } else if (any_nonzero8(src->stream_format) ||
                any_nonzero8(src->talker_id)) {
       avbwarn("NVS: ignoring stream_input %d persist data; saved format is not "
@@ -2178,9 +2252,11 @@ static void avb_persist_apply(avb_state_s *state) {
   for (int i = 0; i < n_out; i++) {
     const avb_persist_output_stream_s *src = &p->output_streams[i];
     avb_talker_stream_s *dst = &state->output_streams[i];
-    if (avb_persist_stream_format_supported(state, true, i,
-                                            src->stream_format)) {
-      memcpy(&dst->stream_format, src->stream_format, 8);
+    uint8_t norm_out_format[8];
+    memcpy(norm_out_format, src->stream_format, 8);
+    if (avb_persist_normalize_stream_format(state, true, i,
+                                            norm_out_format)) {
+      memcpy(&dst->stream_format, norm_out_format, 8);
     } else if (any_nonzero8(src->stream_format)) {
       avbwarn("NVS: ignoring stream_output %d persist data; saved format is "
               "not supported by current descriptor",
