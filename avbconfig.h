@@ -55,7 +55,8 @@
  * I2C_SCL: GPIO 8
  * PA: GPIO 53 (active high)
  *
- * for ESP32-P4-ETH board using a Scramble Hat the following pins are used:
+ * for ESP32-P4-ETH board using a Scramble Hat v3 (original pinout,
+ * boards produced 2026-07) the following pins are used:
  * MCLK: GPIO 16
  * BCLK: GPIO 17
  * WS: GPIO 19
@@ -64,6 +65,21 @@
  * I2C_SDA: GPIO 21
  * I2C_SCL: GPIO 20
  * PA: GPIO -1
+ *
+ * for ESP32-P4-ETH board using a Scramble Hat v4 (2026-08 dual-host
+ * pinout revision: I2C moved to the J3 signal row, BCLK/LRCK adjacent,
+ * MCLK/DET on J4.6/J4.7 so the same board also drops onto a Raspberry
+ * Pi Pico) the following pins are used:
+ * MCLK: GPIO 20
+ * BCLK: GPIO 17
+ * WS: GPIO 16
+ * DOUT: GPIO 18
+ * DIN: GPIO 15
+ * I2C_SDA: GPIO 54
+ * I2C_SCL: GPIO 19
+ * PA: GPIO -1
+ * (DET readback moved to GPIO 21; identical map when the hat is mounted
+ * via the Synthia eurorack interposer — its crossover preserves it.)
  *
  * for ESP32-C6 test board using onboard es8311 the following pins are used:
  * MCLK: GPIO 19
