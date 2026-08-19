@@ -570,6 +570,15 @@ typedef struct {
    * CVU listener declarations to this address (avb_lite.md §6
    * item 2) instead of broadcasting. */
   eth_addr_t src_mac;
+  /* True once a local declare path has owned this entry's value.
+   * Guards the RX path from overwriting the declared value with a
+   * peer's declaration of the same stream_id (MOTU 8D observed
+   * reflecting our own Talker Advertise back with rewritten latency
+   * and DA). Deliberately NOT derived from the applicant state: the
+   * mid-life quarantine parks the applicant in an observer state,
+   * and a reflection landing in that window would re-clobber the
+   * value and self-sustain the withdraw loop. */
+  bool locally_originated;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -1522,7 +1531,18 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
       port, (const unique_id_t *)&wire->talker.info.stream_id, attr_type);
   if (e == NULL)
     return mrp_reg_transition_none; /* table full */
-  memcpy(&e->wire, wire, sizeof(*wire));
+  /* Never let a peer's declaration overwrite the value of an attribute
+   * WE originate (see locally_originated). Some devices with an
+   * internal bridge (MOTU 8D observed) reflect our own Talker
+   * Advertise back on the ingress port with rewritten
+   * accumulated_latency and stream DA; copying that value here made
+   * the periodic declare see a mid-life value change and enter a
+   * ~500 ms withdraw/re-declare loop, so SRP never settled. The
+   * Registrar below still steps on the peer's events — only the
+   * declared value is protected. */
+  if (!e->locally_originated) {
+    memcpy(&e->wire, wire, sizeof(*wire));
+  }
   e->last_refresh_us = esp_timer_get_time();
   if (src_addr != NULL)
     memcpy(e->src_mac, src_addr, ETH_ADDR_LEN);
@@ -1898,6 +1918,7 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
       port, stream_id, msrp_attr_type_talker_advertise);
   if (e == NULL)
     return;
+  e->locally_originated = true;
   /* Build the candidate value first so a mid-life change can be
    * detected against the currently declared one. */
   msrp_talker_message_u fresh;
@@ -1940,6 +1961,7 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
       msrp_talker_find_or_insert(port, stream_id, msrp_attr_type_talker_failed);
   if (e == NULL)
     return;
+  e->locally_originated = true;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker_failed.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
