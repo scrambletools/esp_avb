@@ -707,6 +707,14 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
       state->supported_sample_rates.sample_rates,
       state->supported_sample_rates.num_rates,
       state->config.channels_per_stream);
+#ifdef CONFIG_ESP_AVB_DEFAULT_FORMAT_AM824
+  /* AM824 (IEC 61883-6) default — see the Kconfig help: some listeners
+   * (MOTU 8D observed) default their stream inputs to AM824 and decode
+   * whatever arrives as such. */
+  avtp_stream_format_am824_s format = AVB_DEFAULT_FORMAT_AM824(
+      avb_cip_sfc_from_hz(state->config.default_sample_rate),
+      state->config.channels_per_stream);
+#else
   avtp_stream_format_aaf_pcm_s format = AVB_DEFAULT_FORMAT_AAF(
       24, avb_aaf_rate_from_hz(state->config.default_sample_rate),
       state->config.channels_per_stream, false);
@@ -716,6 +724,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
       avb_samples_per_frame_from_hz(state->config.default_sample_rate);
   format.samples_per_frame_h = (default_spf >> 4) & 0x3F;
   format.samples_per_frame = default_spf & 0x0F;
+#endif
 
   // setup listener stream flags, and stream info flags, default vlan id and
   // stream format

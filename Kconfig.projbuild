@@ -180,6 +180,20 @@ menu "AVB Configuration"
         help
             Frequency of the generated test tone.
 
+    config ESP_AVB_DEFAULT_FORMAT_AM824
+        bool "Default stream format AM824 (IEC 61883-6) instead of AAF"
+        default n
+        depends on ESP_AVB
+        help
+            Build the default audio stream format as AM824 (IEC
+            61883-6, label + 24-bit MBLA samples) instead of AAF PCM.
+            For interop with listeners whose stream inputs default to
+            AM824 and that apply no format check on connect (MOTU 8D
+            observed: an AAF payload decoded as AM824 discards the top
+            sample byte and plays sample<<8 with wraparound — a harsh
+            odd-harmonic staircase). A controller that sets formats
+            explicitly on both ends makes this option irrelevant.
+
     config ESP_AVB_TALKER_MIC_DIGITAL_GAIN_DB
         int "Talker mic digital gain (dB)"
         default 0
