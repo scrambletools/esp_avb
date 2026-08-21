@@ -1384,9 +1384,6 @@ static void avb_task(void *task_param) {
     // periodic diagnostic logging is centralized in AVB-STATS).
     avb_pll_tick(state);
 
-    // EMAC RX un-wedge guard: recover a receive DMA stuck in Suspended
-    // after a lost poll-demand race (descriptor-exhaustion bursts).
-    avb_emac_rx_unwedge_tick();
 
     // Process status requests
     avb_process_statusreq(state);
