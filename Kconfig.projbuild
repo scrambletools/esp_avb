@@ -161,6 +161,22 @@ menu "AVB Configuration"
             the talker escalates the stream to its MAAP multicast
             address. Each copy costs egress bandwidth and TX CPU.
 
+    config ESP_AVB_AM824_CIP_SYT
+        bool "Stamp CIP SYT field in AM824 packets"
+        default n
+        depends on ESP_AVB
+        help
+            Populate the IEC 61883 CIP SYT field with the FireWire-style
+            cycle timestamp (4-bit cycle count, 12-bit cycle offset in
+            1/3072-cycle ticks) of the same instant the avtp_timestamp
+            refers to, instead of SYT=0xFFFF (NO_INFO). IEEE 1722-2016
+            carries presentation time in avtp_timestamp and expects SYT
+            unused, but some FireWire-heritage listeners (MOTU observed)
+            recover their media clock only from SYT when clocked from an
+            input stream. Note the SYT cycle window is 16 x 125 us = 2 ms,
+            so listeners relying on it typically need a presentation
+            offset under ~2 ms to disambiguate. Off by default.
+
     config ESP_AVB_TALKER_TEST_TONE
         bool "Talker test tone (sine) instead of codec input"
         default n

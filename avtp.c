@@ -1232,6 +1232,20 @@ static void avb_stream_out_task(void *task_param) {
       } else {
         presentation_ts += k * ns_per_sample;
       }
+#ifdef CONFIG_ESP_AVB_AM824_CIP_SYT
+      /* MOTU convention, captured from an 8D talker on the wire: the
+       * SYT field carries the constant SYT_INTERVAL value (0x0008 at
+       * 48 k) in every PDU rather than 0xFFFF or a 1394 cycle
+       * timestamp; presentation timing rides only in avtp_timestamp.
+       * MOTU listeners appear to gate stream clockability on
+       * SYT != 0xFFFF. Match it exactly, including a zeroed
+       * avtp_timestamp on tv=0 PDUs. */
+      cip[6] = (uint8_t)(syt_interval >> 8);
+      cip[7] = (uint8_t)(syt_interval & 0xFF);
+      if (!ts_valid) {
+        presentation_ts = 0;
+      }
+#endif
       dbc += params->samples_per_packet;
     }
 
