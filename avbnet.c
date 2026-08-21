@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
+#include <esp_idf_version.h>
 #include <esp_wifi.h>
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
 #include "avbbridge.h"
@@ -540,7 +541,18 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
       return ESP_OK;
     }
     size_t frame_len = len;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+    /* v6.2 changed the filter contract: info is now a typed struct.
+     * The rx-cb info memory layout still matches eth_mac_time_t, so
+     * wrap it the same way the upstream netif glue does. */
+    l2tap_eth_filter_info_t l2tap_info = {
+        .l2_buffer = NULL,
+        .hw_ts = (l2tap_timestamp_t *)info,
+    };
+    esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, &l2tap_info);
+#else
     esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, info);
+#endif
     if (frame_len > 0) {
       /* No L2TAP fd matched (gPTP daemon not yet up, or socket closed) —
        * free the unconsumed buffer ourselves. */
@@ -571,7 +583,15 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
       return ESP_OK;
     }
     size_t frame_len = len;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+    l2tap_eth_filter_info_t l2tap_info = {
+        .l2_buffer = NULL,
+        .hw_ts = (l2tap_timestamp_t *)info,
+    };
+    esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, &l2tap_info);
+#else
     esp_vfs_l2tap_eth_filter_frame(eth_handle, buf, &frame_len, info);
+#endif
     if (frame_len > 0) {
       return esp_netif_receive(s_eth_netif, buf, frame_len, NULL);
     }
