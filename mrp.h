@@ -359,6 +359,24 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port);
 /* SM-driven MSRP RX entry point (§6a). Walks an inbound MSRP
  * buffer, decodes 3pe events, dispatches into per-attribute SMs,
  * and runs application bookkeeping for each. */
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+/* Wi-Fi unicast stream re-addressing (ESP_AVB_WIFI_UNICAST_STREAMS).
+ * The join of Talker Advertise (stream_id -> MAAP dest) and Listener
+ * Ready (stream_id -> declaring STA) is precomputed on declaration
+ * change; the data plane only reads it.
+ *
+ * lookup_da:     group DA -> individual address of the wireless Listener,
+ *                for rewriting on Ethernet -> Wi-Fi egress. NULL = no
+ *                mapping, leave the frame alone.
+ * lookup_stream: AVTPDU stream_id -> the MAAP group DA, for restoring
+ *                on Wi-Fi -> Ethernet, where SRP and Milan require the
+ *                group address. NULL = unknown stream.
+ * refresh:       recompute; call whenever a declaration changes. */
+const uint8_t *msrp_wifi_ucast_lookup_da(const uint8_t *da);
+const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id);
+void msrp_wifi_ucast_refresh(int wifi_port);
+#endif
+
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
                  size_t length, eth_addr_t *src_addr);
 

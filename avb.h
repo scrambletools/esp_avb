@@ -981,6 +981,20 @@ void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
 void avb_bridge_forward_stats_wifi_split(uint32_t *wifi_ok_ucast,
                                          uint32_t *wifi_ok_mcast);
 
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+/* Stream frames re-addressed for the Wi-Fi hop, and group addressed
+ * frames left alone because no Listener declaration resolved to a STA.
+ * A healthy wireless listener shows readdressed climbing with the
+ * stream rate and no_mapping flat. */
+void avb_bridge_forward_stats_readdress(uint32_t *readdressed,
+                                        uint32_t *no_mapping);
+/* Frames dropped at the bounded Wi-Fi in-flight cap. A steadily
+ * climbing value means ingress exceeds the Wi-Fi drain rate (e.g. a
+ * Class A stream over the ~4-8k pps unicast ceiling) - the stream
+ * loses frames but the bridge stays healthy. */
+uint32_t avb_bridge_forward_stats_bp_drop(void);
+#endif
+
 /* AVB send functions */
 
 /* MVRP and MSRP send functions live in mrp.h. */

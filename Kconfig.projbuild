@@ -116,6 +116,46 @@ menu "AVB Configuration"
             Default off for bridge builds (transparent L2 forwarder has no
             ATDECC entity); default on for endpoints.
 
+    config ESP_AVB_WIFI_UNICAST_STREAMS
+        bool "Deliver AVTP streams over Wi-Fi as unicast"
+        default y
+        help
+            Re-address AVTP stream frames to an individual MAC for the
+            Wi-Fi hop, restoring the original MAAP group address on the
+            wired side. Affects both roles: a bridge rewrites the
+            destination on Ethernet->Wi-Fi egress, and a Wi-Fi talker
+            sends to the AP rather than to the group address.
+
+            802.11 penalises group addressed frames heavily in BOTH
+            directions. Downlink they are DTIM-buffered and, per
+            IEEE 802.11 10.3.6, neither acknowledged nor retried.
+            Uplink the penalty is an ESP-IDF driver limit rather than a
+            standards one. Measured on this hardware with 234 B frames:
+
+              downlink  multicast   397 pps  |  unicast  8342 pps
+              uplink    multicast   322 pps  |  unicast  4777 pps
+
+            A Milan AAF Class B stream needs 4000 pps, so group
+            addressing cannot carry even one stream; unicast can.
+
+            This is the same remedy every Wi-Fi vendor ships -- hostapd
+            multicast_to_unicast, Aruba DMO, Cisco Multicast Direct --
+            and the problem is documented as inherent to 802.11 in
+            RFC 9119. It is NOT IEEE 802.11 DMS: real DMS carries the
+            group addressed MSDU inside an individually addressed
+            A-MSDU and is negotiated with Action frames, neither of
+            which ESP-IDF exposes. Call it DMS-equivalent behaviour.
+
+            Stream identity and reservations are untouched: the AVTPDU
+            stream_id is authoritative for the Listener (IEEE 1722
+            4.4.4.8), and SRP/Milan keep seeing the MAAP address, which
+            802.1Q 35.2.2.8.3 requires to be multicast or locally
+            administered -- a STA's globally administered factory MAC
+            would not be a legal destination_address.
+
+            Turn off to send streams over Wi-Fi exactly as received,
+            which is standards-plain but ~20x slower.
+
     config ESP_AVB_AVB_LITE_COMPLIANT
         bool "Advertise AVB Lite compliance"
         default y

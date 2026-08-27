@@ -19,6 +19,7 @@
  */
 
 #include "avb.h"
+#include "mrp.h"
 #include "esp_ptp.h"
 #include "esp_cpu.h"
 #include "esp_timer.h"
@@ -64,6 +65,13 @@ static volatile uint32_t s_fwd_wifi_ok, s_fwd_wifi_fail, s_fwd_wifi_oom;
  * can be in very different states for the first minute or so after a cold
  * boot. Hot path adds 1 branch + 1 store. */
 static volatile uint32_t s_fwd_wifi_ok_ucast, s_fwd_wifi_ok_mcast;
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+/* Stream frames whose destination was re-addressed for the Wi-Fi hop,
+ * and those left alone because no Listener declaration resolved. */
+static volatile uint32_t s_fwd_wifi_readdressed, s_fwd_wifi_no_mapping;
+/* Frames dropped at the Wi-Fi in-flight cap (backpressure). */
+static volatile uint32_t s_fwd_wifi_bp_drop;
+#endif
 
 void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
                               uint32_t *wifi_ok, uint32_t *wifi_fail,
@@ -80,6 +88,16 @@ void avb_bridge_forward_stats_wifi_split(uint32_t *wifi_ok_ucast,
   if (wifi_ok_ucast) *wifi_ok_ucast = s_fwd_wifi_ok_ucast;
   if (wifi_ok_mcast) *wifi_ok_mcast = s_fwd_wifi_ok_mcast;
 }
+
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+void avb_bridge_forward_stats_readdress(uint32_t *readdressed,
+                                        uint32_t *no_mapping) {
+  if (readdressed) *readdressed = s_fwd_wifi_readdressed;
+  if (no_mapping)  *no_mapping  = s_fwd_wifi_no_mapping;
+}
+
+uint32_t avb_bridge_forward_stats_bp_drop(void) { return s_fwd_wifi_bp_drop; }
+#endif
 
 /* Ingress-port lookup by medium. Populated once at avb_net_init from
  * the per-port topology (state->port[].medium) so the RX callback
@@ -358,10 +376,59 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
      * counter, then forwards", meaning the registered free callback
      * has already been promised the buffer. Errors are rare; the
      * counter tracks them. */
-    void *nb = (void *)((uintptr_t)buf | BRIDGE_BUF_TAG);
-    esp_err_t r = esp_wifi_internal_tx_by_ref(1 /* WIFI_IF_AP */,
-                                              (void *)buf, len, nb);
-    if (r == ESP_OK) s_fwd_wifi_ok++; else s_fwd_wifi_fail++;
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+    /* Re-address the stream for the Wi-Fi hop. 802.11 buffers group
+     * addressed frames to the DTIM cycle and neither acknowledges nor
+     * retries them (IEEE 802.11 10.3.6), which measures here as ~397
+     * pps against the ~8342 pps the same frames reach when individually
+     * addressed -- far below the 4000 pps a Class B stream needs.
+     *
+     * This is DMS-equivalent behaviour, NOT IEEE 802.11 DMS: real DMS
+     * carries the group addressed MSDU inside an individually addressed
+     * A-MSDU and is negotiated with Action frames, neither of which
+     * ESP-IDF exposes. The observable difference is that the Listener
+     * sees an individual destination address; that is harmless because
+     * IEEE 1722 4.4.4.8 makes stream_id -- carried in every AVTPDU --
+     * the stream's identity, and SRP/Milan keep seeing the MAAP address
+     * because nothing upstream of this point is modified.
+     *
+     * Cost is one indexed load plus a 6-octet compare, and on a hit a
+     * 6-octet store into a cache line this path has already touched.
+     * buf is ours until the Wi-Fi free callback runs, so the write is
+     * in place -- no copy, matching the zero-copy intent below. */
+    const uint8_t *ucast_da = msrp_wifi_ucast_lookup_da(buf);
+    if (ucast_da != NULL) {
+      memcpy(buf, ucast_da, ETH_ADDR_LEN);
+      s_fwd_wifi_readdressed++;
+    } else if ((buf[0] & 0x01) != 0) {
+      /* Group addressed with no Listener declaration to resolve against:
+       * forward as-is and let the counter show it. */
+      s_fwd_wifi_no_mapping++;
+    }
+#endif
+    /* NOT tx_by_ref: on esp_wifi_remote that entry point is a WEAK stub
+     * that forwards to the copying esp_wifi_internal_tx and silently
+     * discards the netstack_buf — the ref/free callbacks registered by
+     * avb_bridge_install_zero_copy_tx are likewise dropped by a stub
+     * (esp_wifi_remote_net.c). By-ref hand-off therefore leaked every
+     * forwarded frame (~1.6 MB/s at stream rate) until the internal/DMA
+     * pool starved. The hosted transport copies into its own SDIO
+     * buffers no matter what, so zero-copy is not achievable on this
+     * medium; copy-and-free is both correct and no slower.
+     *
+     * ESP_ERR_NO_MEM is the driver's own backpressure (hosted TX queue
+     * full): the frame is dropped and counted, which is the right
+     * behaviour for an over-admitted stream — bounded queue, bounded
+     * latency, loss visible in the bpdrop counter. */
+    esp_err_t r = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, (void *)buf, len);
+    if (r == ESP_OK) {
+      s_fwd_wifi_ok++;
+    } else if (r == ESP_ERR_NO_MEM) {
+      s_fwd_wifi_bp_drop++;
+    } else {
+      s_fwd_wifi_fail++;
+    }
+    free(buf);
     return ESP_OK;
   }
 #endif

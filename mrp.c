@@ -591,6 +591,12 @@ typedef struct {
    * peer-side decl independently when computing the §35.2.4.4.3
    * merged value for the talker-facing port. */
   msrp_listener_event_t peer_decl;
+  /* Source MAC of the most recent declaration on this port. The MSRP
+   * Listener attribute itself carries only a StreamID (8 octets on the
+   * wire), so the declarer's identity has to come from the MRPDU's
+   * source address. Needed to resolve which Wi-Fi STA wants a stream
+   * when re-addressing group streams for the Wi-Fi hop. */
+  eth_addr_t peer_mac;
   mrp_sm_state_t sm;
   int64_t last_refresh_us; /* see msrp_talker_entry_t */
 } msrp_listener_entry_t;
@@ -1124,6 +1130,7 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
      * the data plane end-to-end. */
     if (state->port[y].medium == avb_port_medium_wifi_ftm &&
         new_cls == AVB_SR_CLASS_A && !state->config.allow_class_a_over_wifi) {
+      avbwarn("MAP: Class A blocked on Wi-Fi egress port %d (opt-in off)", y);
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
@@ -1139,6 +1146,8 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
       mrp_patch_egress_accumulated_latency(
           y, stream_id, msrp_attr_type_talker_advertise, egress_lat_ns);
     } else {
+      avbwarn("MAP: admission reject port=%d cls=%d req=%u bps (rc=%d)", y,
+              (int)new_cls, (unsigned)new_bps, adm);
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
@@ -1592,10 +1601,124 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
   return trans;
 }
 
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+/* ---- Wi-Fi unicast stream re-addressing: resolved lookup table -------
+ *
+ * 802.11 penalises group addressed frames in both directions, so AVTP
+ * streams crossing the Wi-Fi hop are re-addressed to an individual MAC
+ * and restored on the wired side. See ESP_AVB_WIFI_UNICAST_STREAMS.
+ *
+ * The mapping is a join of two MSRP tables that the stack already
+ * maintains, so nothing new goes on the wire:
+ *   Talker Advertise  -> stream_id -> stream_dest_addr (the MAAP group DA)
+ *   Listener Ready    -> stream_id -> peer_mac         (the declaring STA)
+ * Resolving that join per frame would mean two table scans at up to
+ * 8000 fps, so it is precomputed here on declaration change and the
+ * data plane only reads the result.
+ *
+ * The lookup is keyed on the destination MAC rather than the AVTPDU
+ * stream_id: IEEE 802.1Q 35.2.2.8.3 states "Only one Stream is allowed
+ * per destination_address", so the DA is already a unique stream key,
+ * and it sits at frame offset 0 -- in the cache line the RX callback
+ * has touched anyway -- whereas stream_id is at offset 22 on a
+ * VLAN-tagged frame. s_ucast_idx direct-maps the last DA octet (MAAP
+ * hands out contiguous ranges, so it discriminates well) to a slot,
+ * and the full 6 octets are verified on hit. A miss leaves the frame
+ * untouched, which is always safe. */
+#define AVB_WIFI_UCAST_TABLE_SIZE MSRP_LISTENER_TABLE_SIZE
+
+typedef struct {
+  bool valid;
+  eth_addr_t da;            /* MAAP group address carried on the wire */
+  eth_addr_t sta;           /* individual address of the wireless Listener */
+  unique_id_t stream_id;
+} avb_wifi_ucast_entry_t;
+
+static avb_wifi_ucast_entry_t s_ucast[AVB_WIFI_UCAST_TABLE_SIZE];
+static uint8_t s_ucast_idx[256];   /* da[5] -> slot+1, 0 = empty */
+
+const uint8_t *msrp_wifi_ucast_lookup_da(const uint8_t *da) {
+  uint8_t i = s_ucast_idx[da[ETH_ADDR_LEN - 1]];
+  if (i == 0) return NULL;
+  const avb_wifi_ucast_entry_t *e = &s_ucast[i - 1];
+  if (!e->valid || memcmp(e->da, da, ETH_ADDR_LEN) != 0) return NULL;
+  return e->sta;
+}
+
+const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id) {
+  for (int i = 0; i < AVB_WIFI_UCAST_TABLE_SIZE; i++) {
+    if (s_ucast[i].valid &&
+        memcmp(s_ucast[i].stream_id, stream_id, UNIQUE_ID_LEN) == 0) {
+      return s_ucast[i].da;
+    }
+  }
+  return NULL;
+}
+
+/* Recompute the join. Cheap and called only on declaration change. */
+void msrp_wifi_ucast_refresh(int wifi_port) {
+  memset(s_ucast, 0, sizeof(s_ucast));
+  memset(s_ucast_idx, 0, sizeof(s_ucast_idx));
+  if (wifi_port < 0 || wifi_port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+
+  int n = 0;
+  for (int li = 0; li < MSRP_LISTENER_TABLE_SIZE && n < AVB_WIFI_UCAST_TABLE_SIZE;
+       li++) {
+    const msrp_listener_entry_t *le = &s_msrp_listeners[wifi_port][li];
+    if (!le->valid) continue;
+    /* Only Ready / Ready Failed mean the peer actually wants the stream. */
+    if (le->peer_decl != msrp_listener_event_ready &&
+        le->peer_decl != msrp_listener_event_ready_failed) continue;
+    /* A declarer with no recorded source MAC cannot be targeted. */
+    static const eth_addr_t zero_mac = {0};
+    if (memcmp(le->peer_mac, zero_mac, ETH_ADDR_LEN) == 0) continue;
+
+    /* Find the Talker Advertise for this stream on any port to learn the
+     * MAAP destination address the frames actually carry. */
+    const eth_addr_t *da = NULL;
+    for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS && da == NULL; p++) {
+      for (int ti = 0; ti < MSRP_TALKER_TABLE_SIZE; ti++) {
+        const msrp_talker_entry_t *te = &s_msrp_talkers[p][ti];
+        if (!te->valid) continue;
+        if (memcmp(&te->wire.talker.info.stream_id, &le->wire.stream_id,
+                   UNIQUE_ID_LEN) != 0) continue;
+        da = &te->wire.talker.info.stream_dest_addr;
+        break;
+      }
+    }
+    if (da == NULL) continue;
+    /* Only group addressed streams need re-addressing. */
+    if (((*da)[0] & 0x01) == 0) continue;
+
+    memcpy(s_ucast[n].da, *da, ETH_ADDR_LEN);
+    memcpy(s_ucast[n].sta, le->peer_mac, ETH_ADDR_LEN);
+    memcpy(s_ucast[n].stream_id, &le->wire.stream_id, UNIQUE_ID_LEN);
+    s_ucast[n].valid = true;
+    /* Last writer wins on an index collision; the full-DA verify in the
+     * lookup turns a collision into a miss, not a misdelivery. */
+    s_ucast_idx[s_ucast[n].da[ETH_ADDR_LEN - 1]] = (uint8_t)(n + 1);
+    n++;
+  }
+}
+#endif /* CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS */
+
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+/* Port index of the Wi-Fi port, or -1. The re-addressing tables only
+ * concern that port. */
+static int msrp_wifi_port_of(const avb_state_s *state) {
+  if (state == NULL) return -1;
+  for (int i = 0; i < CONFIG_ESP_AVB_NUM_PORTS; i++) {
+    if (state->port[i].medium == avb_port_medium_wifi_ftm) return i;
+  }
+  return -1;
+}
+#endif
+
 /* Process one LISTENER attribute. */
 static mrp_reg_transition_e
 msrp_rx_listener_attr(int port, const msrp_listener_message_s *wire,
-                      bool *peer_decl_changed_out) {
+                      bool *peer_decl_changed_out,
+                      const eth_addr_t *src_addr) {
   msrp_listener_entry_t *e =
       msrp_listener_find_or_insert(port, (const unique_id_t *)&wire->stream_id);
   if (e == NULL) {
@@ -1604,6 +1727,9 @@ msrp_rx_listener_attr(int port, const msrp_listener_message_s *wire,
     return mrp_reg_transition_none;
   }
   memcpy(&e->wire, wire, sizeof(*wire));
+  if (src_addr != NULL) {
+    memcpy(e->peer_mac, *src_addr, ETH_ADDR_LEN);
+  }
   e->last_refresh_us = esp_timer_get_time();
   /* event_decl_data[0] carries both the 3pe attribute event and the
    * 4pe listener-declaration nibble. Decode the attribute event. */
@@ -1786,6 +1912,11 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
               msrp_rx_talker_attr(port, attr_type, &wire, src_addr);
           mrp_on_talker_registrar_change(state, port, attr_type, &wire, tr,
                                          src_addr);
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+          /* A Talker Advertise supplies the stream's MAAP destination,
+           * one half of the re-addressing join. */
+          msrp_wifi_ucast_refresh(msrp_wifi_port_of(state));
+#endif
           break;
         }
         case msrp_attr_type_listener: {
@@ -1802,9 +1933,15 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
           wire.event_decl_data[1].declaration.event1 = decl;
           bool peer_decl_changed = false;
           mrp_reg_transition_e tr =
-              msrp_rx_listener_attr(port, &wire, &peer_decl_changed);
+              msrp_rx_listener_attr(port, &wire, &peer_decl_changed,
+                                    src_addr);
           mrp_on_listener_registrar_change(state, port, &wire, tr,
                                            peer_decl_changed, src_addr);
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+          /* A Listener declaration supplies the other half: which STA
+           * wants the stream. */
+          msrp_wifi_ucast_refresh(msrp_wifi_port_of(state));
+#endif
           break;
         }
         default:
@@ -2930,6 +3067,10 @@ int avb_srp_admission_init(avb_state_s *state) {
       s_admission[p][c].admitted_bps = 0;
       s_admission[p][c].cap_bps = link_rate * 3u / 4u;
     }
+    ESP_LOGI("avb_srp", "admission port%d: link=%u Mbps cap=%u bps%s", p,
+             (unsigned)state->port[p].link_speed_mbps,
+             (unsigned)(link_rate * 3u / 4u),
+             link_rate == 0 ? "  (0 = reject-all)" : "");
   }
   ESP_LOGI("avb_srp", "MSRP admission init; 75%% cap per SR class per port");
   return 0;
