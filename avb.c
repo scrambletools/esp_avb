@@ -16,6 +16,7 @@
 #include "esp_timer.h"
 #include <driver/gpio.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>
 #include <math.h>
 #include <nvs_flash.h>
 #include <stdio.h>
@@ -255,6 +256,46 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
     int n = 0;
     bool escalate = false;
     bool wifi_capped = false;
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+    if (state->port[0].medium == avb_port_medium_wifi_ftm) {
+      /* AVB Wireless profile 3.3: a wireless talker advertises its
+       * MAAP destination in SRP/ATDECC but transmits stream frames
+       * individually addressed to the BSSID, the AVB Wireless bridge
+       * restores the advertised destination on wired egress keyed by
+       * stream_id. Group addressed uplink is driver-throttled to a few
+       * hundred pps, an order of magnitude under one Class B stream.
+       * Not associated yet: n stays 0 and the TX paths fall back to
+       * the template DA, nothing reaches the air until association
+       * anyway. */
+      /* Cache the last-known BSSID rather than trusting each poll:
+       * esp_wifi_sta_get_ap_info fails transiently under RX load and a
+       * per-tick fail would flap the published DA between BSSID and
+       * multicast. A stale BSSID is harmless, when truly disassociated
+       * nothing reaches the air anyway. */
+      static eth_addr_t s_bssid;
+      static bool s_bssid_known;
+      wifi_ap_record_t ap;
+      if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        memcpy(s_bssid, ap.bssid, ETH_ADDR_LEN);
+        s_bssid_known = true;
+      }
+      if (s_bssid_known) {
+        memcpy(&das[0], s_bssid, ETH_ADDR_LEN);
+        /* Carrier DA: BSSID with the locally-administered bit set.
+         * Any individual DA gets the unicast air treatment (RA is the
+         * BSSID for every uplink frame per 802.11 addressing, the
+         * driver's group-frame throttle keys on the MSDU DA), but a
+         * frame whose MSDU DA equals the AP's own MAC is consumed
+         * inside the esp_hosted radio processor and never crosses to
+         * the bridge host. Flipping the U/L bit yields a deterministic
+         * locally administered unicast address the radio forwards as
+         * unknown DA, the bridge restores the advertised destination
+         * by stream_id regardless of the carrier value. */
+        das[0][0] |= 0x02;
+        n = 1;
+      }
+    } else
+#endif
     if (state->avb_lite) {
       uint16_t count = octets_to_uint(s->connection_count, 2);
       if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)

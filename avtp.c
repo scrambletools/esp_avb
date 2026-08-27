@@ -937,6 +937,17 @@ static void avb_stream_out_task(void *task_param) {
      * wake latency rose to 400+ µs under AVB-IN load — audible
      * distortion. */
     while (esp_timer_get_time() < next_send_time) {
+#if portNUM_PROCESSORS == 1
+      /* Single-core target: a pure spin at high priority starves the
+       * Wi-Fi task, the console, and the idle task, the board wedges
+       * the moment the stream starts. Yield each spin iteration so
+       * equal-priority work runs; the task is also created at a low
+       * priority on single-core (see task creation), so higher
+       * priority Wi-Fi and protocol work preempts the spin. Cadence
+       * precision degrades versus the dedicated-core design, which is
+       * acceptable for a Class B wireless talker, listeners conceal. */
+      taskYIELD();
+#endif
     }
 
     /* Productive-work clock: counts only the time from end of busy-wait
@@ -3137,8 +3148,21 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   // Clear stop flag and start the stream output task
   state->output_streams[index].stop_streaming = false;
   state->output_streams[index].streaming = true;
+  /* Pin to the last core: core 1 on the dual-core P4 (keeps AVB-OUT off
+   * core 0 with the network stack), core 0 on single-core targets, a
+   * hardcoded 1 asserts inside xTaskCreatePinnedToCore on the C6 the
+   * moment a wireless talker's listener goes Ready. */
+#if portNUM_PROCESSORS == 1
+  /* Single core: the spin-paced TX loop must sit BELOW the Wi-Fi and
+   * protocol tasks or it starves them (see the yield in the pacing
+   * loop). */
   xTaskCreatePinnedToCore(avb_stream_out_task, "AVB-OUT", 8192, (void *)params,
-                          configMAX_PRIORITIES - 1, NULL, 1);
+                          tskIDLE_PRIORITY + 2, NULL, 0);
+#else
+  xTaskCreatePinnedToCore(avb_stream_out_task, "AVB-OUT", 8192, (void *)params,
+                          configMAX_PRIORITIES - 1, NULL,
+                          portNUM_PROCESSORS - 1);
+#endif
 
   avbinfo("Stream out %d started: %s -> AVTP %s", index,
           params->use_sine_wave ? "sine wave" : "mic input",
