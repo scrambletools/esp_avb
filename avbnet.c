@@ -71,6 +71,9 @@ static volatile uint32_t s_fwd_wifi_ok_ucast, s_fwd_wifi_ok_mcast;
 static volatile uint32_t s_fwd_wifi_readdressed, s_fwd_wifi_no_mapping;
 /* Frames dropped at the Wi-Fi in-flight cap (backpressure). */
 static volatile uint32_t s_fwd_wifi_bp_drop;
+/* Uplink stream frames whose BSSID-addressed destination was restored
+ * to the talker's advertised MAAP address on wired egress. */
+static volatile uint32_t s_fwd_eth_restored;
 #endif
 
 void avb_bridge_forward_stats(uint32_t *eth_ok, uint32_t *eth_fail,
@@ -97,6 +100,8 @@ void avb_bridge_forward_stats_readdress(uint32_t *readdressed,
 }
 
 uint32_t avb_bridge_forward_stats_bp_drop(void) { return s_fwd_wifi_bp_drop; }
+
+uint32_t avb_bridge_forward_stats_restored(void) { return s_fwd_eth_restored; }
 #endif
 
 /* Ingress-port lookup by medium. Populated once at avb_net_init from
@@ -462,6 +467,32 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
     int ingress_port = (eth_handle == NULL) ? 1 : 0;
     avb_bridge_disposition_t d =
         avb_bridge_classify(ingress_port, ethertype, pcp);
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+    /* AVB Wireless profile 3.3 restore: a wireless talker transmits
+     * stream frames individually addressed to the BSSID, restore the
+     * destination it advertised in its Talker Advertise before wired
+     * egress so wired listeners and SRP filtering see the MAAP
+     * address. Applies only to Wi-Fi-ingress VLAN-tagged AVTP frames
+     * addressed to this bridge's own wireless MAC, anything else
+     * (already multicast, or unicast straight to a wired listener per
+     * AVB Lite) passes untouched. */
+    if (d.verdict == AVB_BRIDGE_BRIDGE && ingress_port == 1 &&
+        ethertype == 0x8100 && len >= 30 && buf[16] == 0x22 &&
+        buf[17] == 0xf0 && (buf[0] & 0x01) == 0) {
+      /* Any individually addressed carrier DA qualifies, the talker
+       * uses the BSSID with the U/L bit set (frames addressed to the
+       * AP's own MAC never cross the esp_hosted transport), and the
+       * stream_id lookup is what authorizes the rewrite. A frame whose
+       * stream_id is not a wireless talker's advertised stream passes
+       * untouched, which also keeps AVB Lite unicast-to-listener
+       * frames intact. */
+      const uint8_t *adv_da = msrp_wifi_ucast_lookup_stream(buf + 22);
+      if (adv_da != NULL) {
+        memcpy(buf, adv_da, ETH_ADDR_LEN);
+        s_fwd_eth_restored++;
+      }
+    }
+#endif
     switch (d.verdict) {
     case AVB_BRIDGE_DROP:
       free(buf);

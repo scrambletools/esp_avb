@@ -1536,6 +1536,21 @@ static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
 static mrp_reg_transition_e
 msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
                     const msrp_talker_message_u *wire, eth_addr_t *src_addr) {
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  {
+    /* Bridge diagnostic: which talker attrs register per port. Cheap
+     * (per declaration change cadence, not per frame). */
+    const uint8_t *sid = (const uint8_t *)&wire->talker.info.stream_id;
+    const uint8_t *da = (const uint8_t *)&wire->talker.info.stream_dest_addr;
+    avbdebug("MSRP RX talker %s port=%d "
+             "stream=%02x%02x%02x%02x%02x%02x%02x%02x "
+             "da=%02x:%02x:%02x:%02x:%02x:%02x pri=%d",
+             attr_type == msrp_attr_type_talker_failed ? "FAILED" : "ADV",
+             port, sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6],
+             sid[7], da[0], da[1], da[2], da[3], da[4], da[5],
+             (int)wire->talker.info.priority);
+  }
+#endif
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, (const unique_id_t *)&wire->talker.info.stream_id, attr_type);
   if (e == NULL)
@@ -1645,11 +1660,24 @@ const uint8_t *msrp_wifi_ucast_lookup_da(const uint8_t *da) {
   return e->sta;
 }
 
+/* Uplink restore table (AVB Wireless profile 3.3): a wireless talker
+ * transmits to the BSSID on the air but advertises a MAAP destination
+ * in SRP; the bridge restores that advertised DA on wired egress. The
+ * mapping comes from Talker Advertise entries registered on the Wi-Fi
+ * port, stream_id -> stream_dest_addr, group addressed only. */
+typedef struct {
+  bool valid;
+  unique_id_t stream_id;
+  eth_addr_t da; /* advertised MAAP destination */
+} avb_wifi_restore_entry_t;
+
+static avb_wifi_restore_entry_t s_restore_tbl[MSRP_TALKER_TABLE_SIZE];
+
 const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id) {
-  for (int i = 0; i < AVB_WIFI_UCAST_TABLE_SIZE; i++) {
-    if (s_ucast[i].valid &&
-        memcmp(s_ucast[i].stream_id, stream_id, UNIQUE_ID_LEN) == 0) {
-      return s_ucast[i].da;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    if (s_restore_tbl[i].valid &&
+        memcmp(s_restore_tbl[i].stream_id, stream_id, UNIQUE_ID_LEN) == 0) {
+      return s_restore_tbl[i].da;
     }
   }
   return NULL;
@@ -1659,7 +1687,22 @@ const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id) {
 void msrp_wifi_ucast_refresh(int wifi_port) {
   memset(s_ucast, 0, sizeof(s_ucast));
   memset(s_ucast_idx, 0, sizeof(s_ucast_idx));
+  memset(s_restore_tbl, 0, sizeof(s_restore_tbl));
   if (wifi_port < 0 || wifi_port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+
+  /* Restore table: Talker Advertise entries registered on the Wi-Fi
+   * port are wireless talkers, record their advertised (group)
+   * destination so wired egress can restore it. */
+  for (int ti = 0; ti < MSRP_TALKER_TABLE_SIZE; ti++) {
+    const msrp_talker_entry_t *te = &s_msrp_talkers[wifi_port][ti];
+    if (!te->valid) continue;
+    const uint8_t *da = (const uint8_t *)&te->wire.talker.info.stream_dest_addr;
+    if ((da[0] & 0x01) == 0) continue; /* already individual, nothing to restore */
+    memcpy(s_restore_tbl[ti].stream_id, &te->wire.talker.info.stream_id,
+           UNIQUE_ID_LEN);
+    memcpy(s_restore_tbl[ti].da, da, ETH_ADDR_LEN);
+    s_restore_tbl[ti].valid = true;
+  }
 
   int n = 0;
   for (int li = 0; li < MSRP_LISTENER_TABLE_SIZE && n < AVB_WIFI_UCAST_TABLE_SIZE;
@@ -2051,6 +2094,14 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
                                   uint16_t max_frame_size, bool class_b) {
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  {
+    const uint8_t *sid = (const uint8_t *)stream_id;
+    avbdebug("MAP declare ADV port=%d stream=%02x%02x%02x%02x%02x%02x%02x%02x",
+             port, sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6],
+             sid[7]);
+  }
+#endif
   msrp_talker_entry_t *e = msrp_talker_find_or_insert(
       port, stream_id, msrp_attr_type_talker_advertise);
   if (e == NULL)
@@ -2062,10 +2113,28 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
   memset(&fresh, 0, sizeof(fresh));
   mrp_build_talker_info(state, &fresh.talker.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
+  /* accumulated_latency is owned by mrp_patch_egress_accumulated_latency,
+   * which edits the stored entry after every MAP declare. Carrying the
+   * stored value into the candidate keeps a latency-only difference from
+   * reading as a mid-life value change, without it, every re-registration
+   * of a bridged stream withdrew and re-quarantined its own declaration
+   * forever, so Wi-Fi-ingress talker advertises never reached the wire. */
+  memcpy(fresh.talker.info.accumulated_latency,
+         e->wire.talker.info.accumulated_latency,
+         sizeof(fresh.talker.info.accumulated_latency));
   if (memcmp(&e->wire.talker.info, &fresh.talker.info,
              sizeof(fresh.talker.info)) != 0) {
-    static const uint8_t zero_id[UNIQUE_ID_LEN] = {0};
-    if (memcmp(e->wire.talker.info.stream_id, zero_id, UNIQUE_ID_LEN) != 0) {
+    /* Freshness must be judged by the destination address, not the
+     * stream_id: find_or_insert pre-copies the stream_id into a new
+     * slot, so a stream_id test mistakes the very first declaration
+     * for a mid-life change, emits a withdraw for a half-zeroed value
+     * (visible on the wire as garbage attributes) and quarantines the
+     * real declaration, which the once-per-transition MAP caller never
+     * retries. A registered or declared talker always carries a
+     * nonzero DA, a fresh slot never does. */
+    static const eth_addr_t zero_da = {0};
+    if (memcmp(&e->wire.talker.info.stream_dest_addr, zero_da,
+               ETH_ADDR_LEN) != 0) {
       /* Value changed mid-life: deregister the old value (twice, for
        * loss robustness) and quarantine the re-declare until the
        * peer's LeaveTimer (600-1000 ms) has fully torn the old

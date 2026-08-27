@@ -368,9 +368,11 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port);
  * lookup_da:     group DA -> individual address of the wireless Listener,
  *                for rewriting on Ethernet -> Wi-Fi egress. NULL = no
  *                mapping, leave the frame alone.
- * lookup_stream: AVTPDU stream_id -> the MAAP group DA, for restoring
- *                on Wi-Fi -> Ethernet, where SRP and Milan require the
- *                group address. NULL = unknown stream.
+ * lookup_stream: AVTPDU stream_id -> the destination address a
+ *                wireless talker advertised in its Talker Advertise on
+ *                the Wi-Fi port, for restoring on Wi-Fi -> Ethernet
+ *                egress (the talker transmits to the BSSID on the air,
+ *                AVB Wireless profile 3.3). NULL = unknown stream.
  * refresh:       recompute; call whenever a declaration changes. */
 const uint8_t *msrp_wifi_ucast_lookup_da(const uint8_t *da);
 const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id);

@@ -993,6 +993,9 @@ void avb_bridge_forward_stats_readdress(uint32_t *readdressed,
  * Class A stream over the ~4-8k pps unicast ceiling) - the stream
  * loses frames but the bridge stays healthy. */
 uint32_t avb_bridge_forward_stats_bp_drop(void);
+/* Uplink stream frames restored from BSSID addressing to the talker's
+ * advertised MAAP destination on wired egress (AVB Wireless 3.3). */
+uint32_t avb_bridge_forward_stats_restored(void);
 #endif
 
 /* AVB send functions */
