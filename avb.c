@@ -234,8 +234,8 @@ void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream,
  * active once either half of its connection state is present (MSRP
  * Ready or ACMP connected); stale entries age out via the CVU idle
  * timeout. On a wired egress port, more active listeners than the
- * fan-out limit escalates the stream to its multicast (MAAP) address
- * — published as count 0, which the TX paths resolve to their
+ * fan-out limit escalates the stream to its multicast (MAAP) address,
+ * published as count 0, which the TX paths resolve to their
  * template DA. On a Wi-Fi egress port there is no such escalation:
  * group addressing there is roughly 20x slower than unicast and
  * cannot carry even one Class B stream, so the fan-out is capped and

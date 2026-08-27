@@ -1619,8 +1619,8 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
  * The lookup is keyed on the destination MAC rather than the AVTPDU
  * stream_id: IEEE 802.1Q 35.2.2.8.3 states "Only one Stream is allowed
  * per destination_address", so the DA is already a unique stream key,
- * and it sits at frame offset 0 -- in the cache line the RX callback
- * has touched anyway -- whereas stream_id is at offset 22 on a
+ * and it sits at frame offset 0, in the cache line the RX callback
+ * has touched anyway, whereas stream_id is at offset 22 on a
  * VLAN-tagged frame. s_ucast_idx direct-maps the last DA octet (MAAP
  * hands out contiguous ranges, so it discriminates well) to a slot,
  * and the full 6 octets are verified on hit. A miss leaves the frame

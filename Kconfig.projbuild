@@ -138,7 +138,7 @@ menu "AVB Configuration"
             A Milan AAF Class B stream needs 4000 pps, so group
             addressing cannot carry even one stream; unicast can.
 
-            This is the same remedy every Wi-Fi vendor ships -- hostapd
+            This is the same remedy every Wi-Fi vendor ships: hostapd
             multicast_to_unicast, Aruba DMO, Cisco Multicast Direct --
             and the problem is documented as inherent to 802.11 in
             RFC 9119. It is NOT IEEE 802.11 DMS: real DMS carries the
@@ -150,7 +150,7 @@ menu "AVB Configuration"
             stream_id is authoritative for the Listener (IEEE 1722
             4.4.4.8), and SRP/Milan keep seeing the MAAP address, which
             802.1Q 35.2.2.8.3 requires to be multicast or locally
-            administered -- a STA's globally administered factory MAC
+            administered, a STA's globally administered factory MAC
             would not be a legal destination_address.
 
             Turn off to send streams over Wi-Fi exactly as received,

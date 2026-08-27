@@ -381,21 +381,21 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
      * addressed frames to the DTIM cycle and neither acknowledges nor
      * retries them (IEEE 802.11 10.3.6), which measures here as ~397
      * pps against the ~8342 pps the same frames reach when individually
-     * addressed -- far below the 4000 pps a Class B stream needs.
+     * addressed, far below the 4000 pps a Class B stream needs.
      *
      * This is DMS-equivalent behaviour, NOT IEEE 802.11 DMS: real DMS
      * carries the group addressed MSDU inside an individually addressed
      * A-MSDU and is negotiated with Action frames, neither of which
      * ESP-IDF exposes. The observable difference is that the Listener
      * sees an individual destination address; that is harmless because
-     * IEEE 1722 4.4.4.8 makes stream_id -- carried in every AVTPDU --
+     * IEEE 1722 4.4.4.8 makes stream_id, carried in every AVTPDU,
      * the stream's identity, and SRP/Milan keep seeing the MAAP address
      * because nothing upstream of this point is modified.
      *
      * Cost is one indexed load plus a 6-octet compare, and on a hit a
      * 6-octet store into a cache line this path has already touched.
      * buf is ours until the Wi-Fi free callback runs, so the write is
-     * in place -- no copy, matching the zero-copy intent below. */
+     * in place, no copy, matching the zero-copy intent below. */
     const uint8_t *ucast_da = msrp_wifi_ucast_lookup_da(buf);
     if (ucast_da != NULL) {
       memcpy(buf, ucast_da, ETH_ADDR_LEN);
@@ -408,7 +408,7 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
 #endif
     /* NOT tx_by_ref: on esp_wifi_remote that entry point is a WEAK stub
      * that forwards to the copying esp_wifi_internal_tx and silently
-     * discards the netstack_buf — the ref/free callbacks registered by
+     * discards the netstack_buf, the ref/free callbacks registered by
      * avb_bridge_install_zero_copy_tx are likewise dropped by a stub
      * (esp_wifi_remote_net.c). By-ref hand-off therefore leaked every
      * forwarded frame (~1.6 MB/s at stream rate) until the internal/DMA
@@ -418,7 +418,7 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
      *
      * ESP_ERR_NO_MEM is the driver's own backpressure (hosted TX queue
      * full): the frame is dropped and counted, which is the right
-     * behaviour for an over-admitted stream — bounded queue, bounded
+     * behaviour for an over-admitted stream: bounded queue, bounded
      * latency, loss visible in the bpdrop counter. */
     esp_err_t r = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, (void *)buf, len);
     if (r == ESP_OK) {
