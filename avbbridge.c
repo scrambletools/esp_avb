@@ -211,5 +211,12 @@ void avb_codec_set_mic_gain(avb_state_s *state, float db) {
 /* avbpll.c stubs — bridge has no media-clock PLL. */
 void avb_pll_tick(avb_state_s *state) { (void)state; }
 void avb_pll_print_stats(avb_state_s *state) { (void)state; }
+/* avb.c's NVS apply path calls this unconditionally; the bridge has no
+ * media-clock PLL to preload. Without the stub the bridge links only
+ * while --gc-sections happens to drop avb_persist_apply. */
+void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16) {
+  (void)state;
+  (void)trim_ppm_q16;
+}
 
 #endif /* CONFIG_ESP_AVB_ROLE_BRIDGE */
