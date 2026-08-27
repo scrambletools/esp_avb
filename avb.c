@@ -1950,6 +1950,7 @@ static void avb_persist_fill_input_stream_record(
   memcpy(dst->stream_format, &src->stream_format, 8);
   dst->connected = src->connected ? 1 : 0;
   dst->streaming_wait = src->stream_flags.streaming_wait ? 1 : 0;
+  dst->class_b = src->stream_info_flags.class_b ? 1 : 0;
 }
 
 static void avb_persist_fill_output_stream_record(
@@ -2225,6 +2226,7 @@ static void avb_persist_gather(avb_state_s *state) {
     memcpy(dst->stream_format, &src->stream_format, 8);
     dst->connected = src->connected ? 1 : 0;
     dst->streaming_wait = src->stream_flags.streaming_wait ? 1 : 0;
+    dst->class_b = src->stream_info_flags.class_b ? 1 : 0;
   }
 
   /* Per-output-stream state (format + presentation offset) */
@@ -2310,6 +2312,7 @@ static void avb_persist_apply(avb_state_s *state) {
     memcpy(dst->talker_uid, src->talker_uid, 2);
     memcpy(dst->controller_id, src->controller_id, 8);
     dst->stream_flags.streaming_wait = src->streaming_wait ? 1 : 0;
+    dst->stream_info_flags.class_b = src->class_b ? 1 : 0;
   }
 
   /* Per-output-stream state */

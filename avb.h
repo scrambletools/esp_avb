@@ -273,7 +273,9 @@ typedef struct {
   uint8_t stream_format[8]; /* AVTP stream format */
   uint8_t connected;        /* 1 = was connected at last save */
   uint8_t streaming_wait;   /* 1 = STREAMING_WAIT mode, per Milan §5.5.3.6.17 */
-  uint8_t reserved[2];      /* pad to 4-byte boundary */
+  uint8_t class_b;          /* 1 = connection is Class B (was reserved, old
+                             * records read 0 = Class A, the correct default) */
+  uint8_t reserved[1];      /* pad to 4-byte boundary */
 } avb_persist_input_stream_s; /* 32 bytes */
 
 /* Per-output-stream (talker) persistence. APPEND-ONLY (see above). */

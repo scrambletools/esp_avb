@@ -1859,8 +1859,11 @@ int avb_process_aecp_cmd_mvu_bind_stream(avb_state_s *state,
 
   avb_listener_stream_s *stream = &state->input_streams[desc_index];
   uint16_t flags = octets_to_uint(cmd->flags, 2);
-  /* Milan v1.3 §5.4.4.6: STREAMING_WAIT is bit 15 (MSB) of the flags field */
-  stream->stream_flags.streaming_wait = (flags & 0x8000) ? 1 : 0;
+  /* Milan v1.3 Table 5.19: the bit column labels STREAMING_WAIT as
+   * "bit 15" (MSB-first labeling) but the value column gives the wire
+   * value 0x0001, and the value column is authoritative. The earlier
+   * 0x8000 read here was a misreading of that labeling convention. */
+  stream->stream_flags.streaming_wait = (flags & 0x0001) ? 1 : 0;
 
   acmp_message_s synth = {0};
   memcpy(synth.talker_entity_id, cmd->talker_entity_id, UNIQUE_ID_LEN);
@@ -3404,8 +3407,10 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
       avb_stop_stream_out(state, talker_uid);
     }
   } else {
-    /* IEEE 1722.1-2021 §8.2.1.16 Table 8-4: CLASS_B is flags bit 15
-     * (flags[0] & 0x80, big-endian). The class is selected per
+    /* IEEE 1722.1-2021 §8.2.1.16 Table 8-4: CLASS_B is the 0x0001
+     * flag (the table's bit numbering is MSB-first labeling, every
+     * mainstream implementation carries CLASS_B as the least
+     * significant bit). The class is selected per
      * connection at CONNECT_RX time; one stream can be set up as
      * either Class A or Class B but cannot be transmitted as both
      * simultaneously. Gate: lock class only when at least one
@@ -3414,7 +3419,7 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
      * Listener but never completed ACMP CONNECT_TX) do not lock
      * the class — they're "interested but not committed". */
     uint16_t cmd_flags = octets_to_uint(msg->flags, 2);
-    bool req_class_b = (cmd_flags & 0x8000) != 0;
+    bool req_class_b = (cmd_flags & 0x0001) != 0;
     uint16_t conn_count = octets_to_uint(stream->connection_count, 2);
     int acmp_locked = 0;
     for (int i = 0; i < conn_count && i < AVB_MAX_NUM_CONNECTED_LISTENERS;
@@ -3486,9 +3491,9 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
          state->output_streams[talker_uid].connection_count, 2);
   uint16_t rsp_flags = octets_to_uint(msg->flags, 2);
   if (stream->stream_info_flags.class_b)
-    rsp_flags |= 0x8000u;
+    rsp_flags |= 0x0001u;
   else
-    rsp_flags &= ~0x8000u;
+    rsp_flags &= ~0x0001u;
   int_to_octets(&rsp_flags, msg->flags, 2);
   avb_send_acmp_response(state, tx_response_type, msg, acmp_status_success);
   return ret;
@@ -4106,11 +4111,12 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   memcpy(stream->stream_dest_addr, response->stream_dest_addr, ETH_ADDR_LEN);
 
   // Class from ACMP flags per IEEE 1722.1-2021 §8.2.1.16 Table 8-4:
-  // bit 15 = CLASS_B. Milan talkers always set this to 0 (class is
-  // derived from stream_format instead), which is correct since Milan
-  // uses Class A by default — so reading the bit works for both.
+  // CLASS_B is the 0x0001 flag. Milan talkers always set this to 0
+  // (class is derived from stream_format instead), which is correct
+  // since Milan uses Class A by default, so reading the bit works for
+  // both.
   uint16_t flags = octets_to_uint(response->flags, 2);
-  stream->stream_info_flags.class_b = (flags & 0x8000) ? 1 : 0;
+  stream->stream_info_flags.class_b = (flags & 0x0001) ? 1 : 0;
 
   /* Some talkers send stream_vlan_id=0 meaning "use configured default".
    * Milan §5.5.3.6.16 requires a non-zero vlan_id whenever the listener
@@ -4205,6 +4211,12 @@ static bool avb_fast_connect_listener(avb_state_s *state, uint16_t index) {
          UNIQUE_ID_LEN);
   int_to_octets(&index, cmd.listener_uid, 2);
   memcpy(cmd.controller_entity_id, stream->controller_id, UNIQUE_ID_LEN);
+  /* Carry the persisted stream class: without it every journaled
+   * rebind after a reboot silently reverted a Class B connection to
+   * Class A (the talker stamps the class from these flags on first
+   * connection). CLASS_B is the 0x0001 ACMP flag. */
+  uint16_t rebind_flags = stream->stream_info_flags.class_b ? 0x0001u : 0u;
+  int_to_octets(&rebind_flags, cmd.flags, 2);
 
   if (avb_send_acmp_command(state, acmp_msg_type_connect_tx_command, &cmd,
                             false, true) < 0) {
