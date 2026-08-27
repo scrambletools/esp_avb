@@ -233,10 +233,14 @@ void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream,
  * its tx_da[] seqlock mailbox for the TX paths. A listener counts as
  * active once either half of its connection state is present (MSRP
  * Ready or ACMP connected); stale entries age out via the CVU idle
- * timeout. More active listeners than the fan-out limit escalates
- * the stream to its multicast (MAAP) address — published as count 0,
- * which the TX paths resolve to their template DA. Called every main
- * loop tick; publishes (and logs) only on change. */
+ * timeout. On a wired egress port, more active listeners than the
+ * fan-out limit escalates the stream to its multicast (MAAP) address
+ * — published as count 0, which the TX paths resolve to their
+ * template DA. On a Wi-Fi egress port there is no such escalation:
+ * group addressing there is roughly 20x slower than unicast and
+ * cannot carry even one Class B stream, so the fan-out is capped and
+ * the stream stays unicast. Called every main loop tick; publishes
+ * (and logs) only on change. */
 /* Per-listener idle limit for AVB Lite. Live listeners refresh their
  * row at ~1 Hz via CVU declarations; 30 s matches the CVU attribute
  * idle timeout in mrp.c. */
@@ -250,6 +254,7 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
     eth_addr_t das[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
     int n = 0;
     bool escalate = false;
+    bool wifi_capped = false;
     if (state->avb_lite) {
       uint16_t count = octets_to_uint(s->connection_count, 2);
       if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
@@ -303,6 +308,19 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
         }
         memcpy(&das[n++], s->connected_listeners[j].mac_addr, ETH_ADDR_LEN);
       }
+      if (escalate &&
+          state->port[0].medium == avb_port_medium_wifi_ftm) {
+        /* Wi-Fi egress: never escalate to the MAAP group address.
+         * 802.11 buffers group addressed frames to the DTIM cycle and
+         * neither acknowledges nor retries them (IEEE 802.11 10.3.6);
+         * measured on this hardware at ~397 pps against ~8342 pps for
+         * the same frames individually addressed. That is below even
+         * one Class B stream's 4000 pps, so escalating would serve
+         * every listener badly instead of serving the first N well.
+         * Cap the fan-out and keep unicasting. */
+        escalate = false;
+        wifi_capped = true;
+      }
       if (escalate)
         n = 0;
     }
@@ -317,9 +335,11 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
     s->tx_da_seq++; /* even: stable */
     if (n > 0) {
       avbinfo("Stream out %d transport: unicast x%d "
-              "(%02x:%02x:%02x:%02x:%02x:%02x%s)",
+              "(%02x:%02x:%02x:%02x:%02x:%02x%s)%s",
               i, n, das[0][0], das[0][1], das[0][2], das[0][3], das[0][4],
-              das[0][5], n > 1 ? ", ..." : "");
+              das[0][5], n > 1 ? ", ..." : "",
+              wifi_capped ? " [Wi-Fi: fan-out capped, "
+                            "further listeners not served]" : "");
     } else {
       avbinfo("Stream out %d transport: multicast%s", i,
               escalate ? " (unicast fan-out exceeded)" : "");
