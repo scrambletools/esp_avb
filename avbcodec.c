@@ -301,11 +301,24 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
   ESP_RETURN_ON_ERROR(i2s_channel_disable(state->i2s_rx_handle), TAG,
                       "i2s rx disable");
 
-  /* AVB_MCLK_MULTIPLE derives from default_sample_rate — set it first. */
-  state->config.default_sample_rate = rate;
+  uint32_t mclk_multiple = AVB_MCLK_MULTIPLE_FOR_RATE(rate);
   i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
-  clk_cfg.mclk_multiple = AVB_MCLK_MULTIPLE;
+  clk_cfg.mclk_multiple = mclk_multiple;
 #if SOC_CLK_APLL_SUPPORTED
+  /* Both channels hold the APLL, and the driver's refcount gate refuses
+   * to retune it while more than one owner remains — reconfiguring one
+   * channel at a time can never move the APLL to the new rate. Park
+   * both channels on XTAL at a low, always-derivable MCLK first so the
+   * APLL is fully released, then re-acquire it at the new rate. */
+  i2s_std_clk_config_t park_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000);
+  park_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+  park_cfg.clk_src = I2S_CLK_SRC_XTAL;
+  ESP_RETURN_ON_ERROR(
+      i2s_channel_reconfig_std_clock(state->i2s_tx_handle, &park_cfg), TAG,
+      "i2s tx park");
+  ESP_RETURN_ON_ERROR(
+      i2s_channel_reconfig_std_clock(state->i2s_rx_handle, &park_cfg), TAG,
+      "i2s rx park");
   clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 #else
   clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
@@ -321,7 +334,7 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
       .bits_per_sample = 32,
       .channel = 2,
       .sample_rate = rate,
-      .mclk_multiple = AVB_MCLK_MULTIPLE,
+      .mclk_multiple = mclk_multiple,
   };
   if (cif->set_fs && cif->set_fs(cif, &fs) != 0) {
     ESP_LOGE(TAG, "Rate change: codec set_fs failed");
@@ -337,11 +350,17 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
   ESP_RETURN_ON_ERROR(i2s_channel_enable(state->i2s_rx_handle), TAG,
                       "i2s rx enable");
 
+  /* Commit the new rate only now that every hardware step has succeeded.
+   * A failure above leaves default_sample_rate untouched, so a retry
+   * re-runs the full path instead of short-circuiting on the rate
+   * compare at the top and reporting success with stale hardware. */
+  state->config.default_sample_rate = rate;
+
   /* Mirror avb_config_i2s's media-clock bookkeeping and re-seed the
    * PLL at the new nominal MCLK. */
   state->media_clock.listener_sample_rate = rate;
   state->media_clock.listener_byterate = rate * 2u * 4u; /* 24-in-32 slots */
-  if (avb_pll_init(rate * AVB_MCLK_MULTIPLE) != 0) {
+  if (avb_pll_init(rate * mclk_multiple) != 0) {
     avbwarn("Rate change: PLL re-init failed (sample clock will free-run)");
   }
 
