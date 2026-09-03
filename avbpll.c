@@ -49,6 +49,7 @@
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
 #include <inttypes.h>
 #include <stdatomic.h>
+#include <string.h>
 
 static const char *TAG = "avb_pll";
 
@@ -208,6 +209,14 @@ static struct {
    * preload 25 → persisted 50 after one reboot). Only a first-ever
    * boot (no stored trim) runs the calibration staircase. */
   bool trim_preloaded;
+  /* Hold breaker: consecutive ticks the held INTERNAL trim has
+   * measured beyond AVB_PLL_HOLD_BREAK_PPM_Q16 (see avb_pll_tick). */
+  uint32_t hold_break_ticks;
+  /* BTC the current hold/acquisition is referenced to. A change while
+   * running releases the hold, the old trim is meaningless against a
+   * new reference. */
+  uint8_t hold_btc_id[8];
+  bool hold_btc_known;
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -295,6 +304,34 @@ static struct {
  * briefly explodes to tens of thousands of ppm when gPTP resyncs after
  * a system event. Reset the baseline instead of applying. */
 #define AVB_PLL_CUMUL_SANITY_LIMIT_PPM_Q16 ((int32_t)(500 * 65536))
+
+/* INTERNAL-mode hold breaker. A held trim assumes the crystal offset
+ * against the reference is quasi-static, but a BTC change that slips
+ * past the identity check, or thermal drift over a long uptime, leave
+ * a wrong trim with no feedback path (observed: listener ring
+ * draining and re-anchoring every minute). Sustained cumulative error
+ * far beyond the gPTP reference's documented ~25 ppm measurement
+ * bias releases the hold for a fresh acquisition. 36 ticks = 3 min. */
+#define AVB_PLL_HOLD_BREAK_PPM_Q16 ((int32_t)(30 * 65536))
+#define AVB_PLL_HOLD_BREAK_TICKS 36
+
+/* An INTERNAL acquisition counts as converged only while its last
+ * cumulative residual is inside this band (the gPTP reference's
+ * window-to-window disagreement is a few ppm over 120 s windows). A
+ * hold latched or a trim persisted with a larger residual would pin a
+ * wrong trim, then be honored on every boot against this BTC
+ * (observed: 15 min time-box closing 17 ppm short after an 80 ppm
+ * stale seed). The time-box stretches to the hard cap while the
+ * residual is outside the band. */
+#define AVB_PLL_CONVERGED_PPM_Q16 ((int32_t)(8 * 65536))
+#define AVB_PLL_INTERNAL_ACQUIRE_CAP_US (45LL * 60 * 1000000LL)
+
+/* Slew faster while far from target: 0.5 ppm per tick sizes for
+ * inaudible drift near equilibrium, but walking a stale seed 80 ppm
+ * at that rate takes 13 min per acquisition. Beyond 10 ppm remaining
+ * the move is 0.8 ppm/s, still under the pitch JND. */
+#define AVB_PLL_SLEW_FAR_PPM_Q16 (4 * 65536)
+#define AVB_PLL_SLEW_FAR_THRESHOLD_PPM_Q16 (10 * 65536)
 
 /* Skip the first couple of tick windows after a stream connects. The
  * very first seconds include the pre-fill burst and any drain-underrun
@@ -529,8 +566,11 @@ void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16) {
   state->media_clock.pll_applied_ppm_q16 = trim_ppm_q16;
   state->media_clock.pll_target_ppm_q16 = trim_ppm_q16;
   s_pll.trim_preloaded = true;
-  s_pll.internal_hold = true; /* the preload IS the calibration */
-  ESP_LOGI(TAG, "preloaded persisted trim %ld ppm (holding)",
+  /* Held provisionally: once the INTERNAL reference validates, the
+   * tick keeps the hold only if the live BTC is the one this trim was
+   * converged against, otherwise it re-acquires from this seed. */
+  s_pll.internal_hold = true;
+  ESP_LOGI(TAG, "preloaded persisted trim %ld ppm (holding pending BTC check)",
            (long)(trim_ppm_q16 / 65536));
 }
 
@@ -602,14 +642,43 @@ void avb_pll_tick(avb_state_s *state) {
       s_pll.valid = false;
       return;
     }
+    const uint8_t *btc_now = state->ptp_status.clock_source_info.btc_id;
+    static const uint8_t no_btc[8] = {0};
     if (!s_pll.internal_ref_was_valid) {
       s_pll.internal_ref_was_valid = true;
       s_pll.integrator_ppm_q16 = 0;
-      if (!s_pll.trim_preloaded) {
+      /* A preloaded trim is only trusted against the BTC it was
+       * converged with. Unknown (pre-v5 blob) or different BTC means
+       * the seed may be tens of ppm off, so acquire from it instead. */
+      bool trim_btc_known =
+          memcmp(state->media_clock.pll_trim_btc_id, no_btc, 8) != 0;
+      bool same_btc = trim_btc_known &&
+                      memcmp(state->media_clock.pll_trim_btc_id, btc_now, 8) == 0;
+      if (s_pll.trim_preloaded && same_btc) {
+        ESP_LOGI(TAG, "persisted trim was converged against this BTC, holding");
+      } else {
+        if (s_pll.trim_preloaded) {
+          ESP_LOGW(TAG, "persisted trim %s, re-acquiring from the seed",
+                   trim_btc_known ? "was converged against a different BTC"
+                                  : "has no BTC identity");
+        }
         s_pll.internal_hold = false;
         s_pll.internal_correcting_since_us = now_us;
       }
+      memcpy(s_pll.hold_btc_id, btc_now, 8);
+      s_pll.hold_btc_known = true;
+      s_pll.hold_break_ticks = 0;
       s_pll.valid = false;    /* re-seed baselines below on this tick */
+    } else if (s_pll.hold_btc_known && memcmp(s_pll.hold_btc_id, btc_now, 8) != 0) {
+      /* Runtime BTC change: the trim was relative to the old reference. */
+      ESP_LOGW(TAG, "BTC changed, releasing trim hold and re-acquiring");
+      memcpy(s_pll.hold_btc_id, btc_now, 8);
+      s_pll.internal_hold = false;
+      s_pll.internal_correcting_since_us = now_us;
+      s_pll.integrator_ppm_q16 = 0;
+      s_pll.hold_break_ticks = 0;
+      s_pll.valid = false;
+      return;
     }
   }
 
@@ -704,6 +773,26 @@ void avb_pll_tick(avb_state_s *state) {
   s_pll.prev_i2s_bytes = bytes_now;
   s_pll.prev_gptp_ns = gptp_now_ns;
 
+  /* Hold breaker, see AVB_PLL_HOLD_BREAK_PPM_Q16. */
+  if (internal_mode && s_pll.internal_hold) {
+    bool beyond = cumul_ppm_q16 > AVB_PLL_HOLD_BREAK_PPM_Q16 ||
+                  cumul_ppm_q16 < -AVB_PLL_HOLD_BREAK_PPM_Q16;
+    if (!beyond) {
+      s_pll.hold_break_ticks = 0;
+    } else if (++s_pll.hold_break_ticks >= AVB_PLL_HOLD_BREAK_TICKS) {
+      s_pll.hold_break_ticks = 0;
+      s_pll.internal_hold = false;
+      s_pll.internal_correcting_since_us = now_us;
+      s_pll.integrator_ppm_q16 = 0;
+      s_pll.next_correction_us = now_us; /* correct on this tick */
+      ESP_LOGW(TAG,
+               "held trim measures %ld ppm off for %d s, releasing hold and "
+               "re-acquiring",
+               (long)(cumul_ppm_q16 / 65536),
+               AVB_PLL_HOLD_BREAK_TICKS * 5);
+    }
+  }
+
 
   /* Periodically fold the measured cumulative error into the applied
    * correction. cumul_ppm is already integrated so a P-controller with
@@ -743,8 +832,14 @@ void avb_pll_tick(avb_state_s *state) {
      * consecutive far-side ticks (10 s, ±2 ppm deadband) land the
      * slew where it is; the next tracking correction refines. */
     bool slewing_up = target_q16 > applied_q16;
-    bool crossed = (slewing_up && inst_ppm_q16 > 2 * 65536) ||
-                   (!slewing_up && inst_ppm_q16 < -2 * 65536);
+    /* The INTERNAL reference's 5 s window swings tens of ppm, so judge
+     * the crossing on the integrated error there (observed: a stale
+     * 80 ppm seed aborted 20 ppm short on two noisy +6/+18 ppm
+     * windows while cumul still read -50). CRF keeps the instant
+     * window, its reference is clean. */
+    int32_t crossing_q16 = internal_mode ? cumul_ppm_q16 : inst_ppm_q16;
+    bool crossed = (slewing_up && crossing_q16 > 2 * 65536) ||
+                   (!slewing_up && crossing_q16 < -2 * 65536);
     /* Only guard slews with meaningful distance left: near
      * equilibrium the tracking moves are a few ppm and the instant
      * window's ordinary noise trips the crossing detector on every
@@ -769,10 +864,13 @@ void avb_pll_tick(avb_state_s *state) {
       s_pll.slew_crossed_ticks = 0;
     }
     int32_t slew_q16 = target_q16 - applied_q16;
-    if (slew_q16 > AVB_PLL_SLEW_MAX_PPM_Q16)
-      slew_q16 = AVB_PLL_SLEW_MAX_PPM_Q16;
-    if (slew_q16 < -AVB_PLL_SLEW_MAX_PPM_Q16)
-      slew_q16 = -AVB_PLL_SLEW_MAX_PPM_Q16;
+    int32_t slew_limit_q16 = remaining_q16 > AVB_PLL_SLEW_FAR_THRESHOLD_PPM_Q16
+                                 ? AVB_PLL_SLEW_FAR_PPM_Q16
+                                 : AVB_PLL_SLEW_MAX_PPM_Q16;
+    if (slew_q16 > slew_limit_q16)
+      slew_q16 = slew_limit_q16;
+    if (slew_q16 < -slew_limit_q16)
+      slew_q16 = -slew_limit_q16;
     if (mclk_hw_tune_ppm_q16(applied_q16 + slew_q16) == 0) {
       applied_q16 += slew_q16;
       state->media_clock.pll_applied_ppm_q16 = applied_q16;
@@ -793,15 +891,23 @@ void avb_pll_tick(avb_state_s *state) {
    * reference becomes valid, then HOLD whatever was achieved — a
    * frozen imperfect reference is strictly better for the listeners
    * (who track continuously, with ample range) than a creeping one. */
+  int32_t residual_q16 = cumul_ppm_q16 < 0 ? -cumul_ppm_q16 : cumul_ppm_q16;
+  bool residual_converged = residual_q16 < AVB_PLL_CONVERGED_PPM_Q16;
   if (internal_mode && !s_pll.internal_hold &&
       s_pll.internal_correcting_since_us != 0 &&
-      now_us - s_pll.internal_correcting_since_us > 15LL * 60 * 1000000LL &&
       state->media_clock.pll_applied_ppm_q16 ==
           state->media_clock.pll_target_ppm_q16) {
-    s_pll.internal_hold = true;
-    ESP_LOGI(TAG,
-             "internal convergence window closed — holding trim at %ld ppm",
-             (long)(state->media_clock.pll_applied_ppm_q16 / 65536));
+    int64_t acquiring_us = now_us - s_pll.internal_correcting_since_us;
+    bool window_elapsed = acquiring_us > 15LL * 60 * 1000000LL;
+    bool capped = acquiring_us > AVB_PLL_INTERNAL_ACQUIRE_CAP_US;
+    if ((window_elapsed && residual_converged) || capped) {
+      s_pll.internal_hold = true;
+      ESP_LOGI(TAG,
+               "internal convergence window closed — holding trim at %ld ppm "
+               "(residual %ld ppm%s)",
+               (long)(state->media_clock.pll_applied_ppm_q16 / 65536),
+               (long)(cumul_ppm_q16 / 65536), capped ? ", hard cap" : "");
+    }
   }
 
   if (correction_interval_us > 0 && !(internal_mode && s_pll.internal_hold) &&
@@ -837,11 +943,25 @@ void avb_pll_tick(avb_state_s *state) {
     int32_t p_step_q16 =
         (int32_t)(((int64_t)cumul_ppm_q16 * AVB_PLL_GAIN_Q16) >> 16);
     step_q16 = p_step_q16 + s_pll.integrator_ppm_q16;
-    /* Clamp per-step — single-window noise can still be big. */
-    if (step_q16 > max_step_q16)
-      step_q16 = max_step_q16;
-    if (step_q16 < -max_step_q16)
-      step_q16 = -max_step_q16;
+    /* Clamp per-step — single-window noise can still be big. The
+     * clamp sizes for noise, not for a stale seed: an error several
+     * times the clamp sustained over a full window is real, so let it
+     * close half the distance per cycle (bounded by the total clamp
+     * below) instead of creeping at the noise rate for tens of
+     * minutes. */
+    int32_t abs_cumul_q16 = cumul_ppm_q16 < 0 ? -cumul_ppm_q16 : cumul_ppm_q16;
+    int32_t step_limit_q16 = max_step_q16;
+    if (abs_cumul_q16 > 4 * max_step_q16) {
+      /* Large error: take the whole measured error in one move (gain
+       * 1.0, the window is already integrated), the next window
+       * refines the few-ppm residual. */
+      step_limit_q16 = abs_cumul_q16;
+      step_q16 = cumul_ppm_q16 + s_pll.integrator_ppm_q16;
+    }
+    if (step_q16 > step_limit_q16)
+      step_q16 = step_limit_q16;
+    if (step_q16 < -step_limit_q16)
+      step_q16 = -step_limit_q16;
     int32_t new_target = applied_q16 - step_q16;
     /* Clamp total (see AVB_PLL_MAX_APPLIED_PPM_Q16). */
     if (new_target > AVB_PLL_MAX_APPLIED_PPM_Q16)
@@ -895,7 +1015,9 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.last_trim_check_us = now_us;
     int32_t applied_now_q16 = state->media_clock.pll_applied_ppm_q16;
     int32_t moved_q16 = applied_now_q16 - s_pll.last_trim_check_value_q16;
-    bool stable = moved_q16 < 2 * 65536 && moved_q16 > -2 * 65536;
+    /* Stable AND converged: a held-but-wrong trim is stable too. */
+    bool stable = moved_q16 < 2 * 65536 && moved_q16 > -2 * 65536 &&
+                  residual_converged;
     s_pll.last_trim_check_value_q16 = applied_now_q16;
     if (stable && internal_mode && !s_pll.internal_hold) {
       s_pll.internal_hold = true;
@@ -906,6 +1028,9 @@ void avb_pll_tick(avb_state_s *state) {
         applied_now_q16 - state->media_clock.pll_converged_trim_q16;
     if (stable && (trim_delta_q16 > 2 * 65536 || trim_delta_q16 < -2 * 65536)) {
       state->media_clock.pll_converged_trim_q16 = applied_now_q16;
+      memcpy(state->media_clock.pll_trim_btc_id,
+             state->ptp_status.clock_source_info.btc_id,
+             sizeof(state->media_clock.pll_trim_btc_id));
       avb_persist_request_save(state);
       ESP_LOGI(TAG, "persisting media-clock trim %ld ppm",
                (long)(applied_now_q16 / 65536));

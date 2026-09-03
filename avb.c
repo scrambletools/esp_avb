@@ -2251,6 +2251,8 @@ static void avb_persist_gather(avb_state_s *state) {
   p->audio_unit_sample_rate_hz =
       0; /* TODO: wire when sample-rate policy lands */
   p->pll_trim_ppm_q16 = state->media_clock.pll_converged_trim_q16;
+  memcpy(p->pll_trim_btc_id, state->media_clock.pll_trim_btc_id,
+         sizeof(p->pll_trim_btc_id));
 }
 
 /* Apply loaded persist data to current state */
@@ -2372,6 +2374,8 @@ static void avb_persist_apply(avb_state_s *state) {
      * state, so an unseeded live field would zero the stored trim on
      * the next unrelated save. */
     state->media_clock.pll_converged_trim_q16 = p->pll_trim_ppm_q16;
+    memcpy(state->media_clock.pll_trim_btc_id, p->pll_trim_btc_id,
+           sizeof(state->media_clock.pll_trim_btc_id));
     avb_pll_preload_trim(state, p->pll_trim_ppm_q16);
   }
 }

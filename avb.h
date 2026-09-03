@@ -285,7 +285,7 @@ typedef struct {
       presentation_time_offset_ns; /* user-configured presentation offset. */
 } avb_persist_output_stream_s;     /* 12 bytes */
 
-#define AVB_PERSIST_VERSION 4
+#define AVB_PERSIST_VERSION 5
 typedef struct {
   uint8_t version;       /* struct version — bump on every append */
   uint8_t reserved_v[3]; /* pad to 4-byte boundary */
@@ -315,6 +315,12 @@ typedef struct {
    * temperature and grandmaster changes; the acquisition one-shot
    * trims any residual. 0 = never converged / no preload. */
   int32_t pll_trim_ppm_q16;
+  /* v5: BTC clock identity the trim above was converged against. A
+   * trim is only valid relative to its reference, so a boot that
+   * locks to a different BTC re-acquires instead of holding a stale
+   * value (observed: talker held at +25 ppm, measured -90 ppm, after
+   * moving benches). All-zero = unknown (pre-v5 blob). */
+  uint8_t pll_trim_btc_id[8];
 } avb_persistent_data_s;
 
 /* Enforce that build-time sizes fit in the frozen persist layout.
@@ -757,6 +763,9 @@ typedef struct avb_state_s {
      * the same request_save call and 0 hit flash). Written by the
      * PLL's stability hook; seeded from the blob at load. */
     int32_t pll_converged_trim_q16;
+    /* BTC identity pll_converged_trim_q16 was converged against,
+     * persisted with it (see avb_persistent_data_s). */
+    uint8_t pll_trim_btc_id[8];
 
     /* CRF-driven PLL anchor — atomically-published pair of
      *   (crf_ts_ns, i2s_bytes_written at the moment the CRF PDU arrived)
