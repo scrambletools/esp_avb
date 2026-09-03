@@ -157,6 +157,7 @@ typedef struct {
   bool avb_lite;           // operating in AVB Lite mode (standard PTP)
   bool streaming_in;       // one or more input streams are active
   bool streaming_out;      // one or more output streams are active
+  uint32_t sample_rate;    // current media sample rate in Hz
   struct {
     uint8_t id[8]; // Entity ID
   } entity;

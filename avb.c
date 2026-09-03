@@ -1268,6 +1268,10 @@ static void avb_process_statusreq(avb_state_s *state) {
 
   status->clock_source_valid = state->ptp_status.clock_source_valid;
   status->avb_lite = state->avb_lite;
+  /* Runtime rate changes write back to config.default_sample_rate,
+   * so it is the current media rate, same source the AUDIO_UNIT
+   * descriptor reports as current_sampling_rate. */
+  status->sample_rate = state->config.default_sample_rate;
   memcpy(status->entity.id, state->own_entity.summary.entity_id,
          sizeof(status->entity.id));
 
