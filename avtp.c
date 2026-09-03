@@ -995,7 +995,17 @@ static void avb_stream_out_task(void *task_param) {
             int64_t diff_ns = gptp_delta - esp_delta_ns;
             /* Per-packet correction = accumulated diff over the actual
              * packet count in this window. Q16 so sub-ns survives. */
-            int64_t sample_q16 = (diff_ns << 16) / sched_pkts_since_sample;
+            /* gPTP counted diff_ns MORE than esp_timer over the window,
+             * so each esp_timer ns is worth (1 + diff/esp) gPTP ns and
+             * the esp_timer wait per packet must SHRINK by diff/pkts to
+             * span one nominal gPTP interval. Adding it (the earlier
+             * sign) doubled the crystal error instead of cancelling it,
+             * and because the lock is open-loop (an absolute
+             * measurement applied as trim) the wrong sign was perfectly
+             * stable, showing only as a 2x packet-rate error at every
+             * listener (observed: ~60 ppm ring drain, re-anchor splices
+             * every few minutes on all listener boards). */
+            int64_t sample_q16 = -((diff_ns << 16) / sched_pkts_since_sample);
             /* Large jump (gPTP step): re-baseline and drop back to
              * acquire so the trim recovers in one warmup window instead
              * of creeping at the tracking clamp rate. */
@@ -1149,11 +1159,23 @@ static void avb_stream_out_task(void *task_param) {
              * interval_ns × drift_ppm_q8 / (256 × 1e6). On windows
              * with no qualifying drift measurement, hold the current
              * rate rather than dragging it toward zero. */
-            int64_t target_q16 =
-                drift_fresh
-                    ? (((int64_t)params->interval * 1000LL * drift_ppm_q8)
-                       << 16) / (256LL * 1000000LL)
-                    : ts_rate_corr_q16;
+            int64_t target_q16 = ts_rate_corr_q16;
+            if (drift_fresh) {
+              /* Packets are spaced (interval + sched adj) esp_timer ns
+               * and each esp_timer ns is (1 + drift) gPTP ns, so the
+               * stamp must advance by that same real span:
+               *   extra = adj + (interval + adj) * drift
+               * With the cadence lock off (adj 0) this is the old
+               * interval * drift; with it on, the terms cancel to ~0.
+               * Stamping interval * drift on top of an already
+               * gPTP-corrected cadence double-counted the crystal
+               * offset (observed: -22 ppm timestamp slide at every
+               * listener). */
+              int64_t spacing_q16 =
+                  (((int64_t)params->interval * 1000LL) << 16) + sched_ns_adj_q16;
+              target_q16 = sched_ns_adj_q16 +
+                           (spacing_q16 * drift_ppm_q8) / (256LL * 1000000LL);
+            }
             /* Offset pull: drain ts_err at ≤4 ppm. */
             int64_t off_q16 = -(((int64_t)ts_err) << 16) / (8192 * 4);
             if (off_q16 > 32768)
