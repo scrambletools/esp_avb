@@ -55,6 +55,7 @@ typedef struct {
   volatile int64_t overrun_max_us;   /* worst overrun this session */
   volatile uint32_t i2s_zero_reads;  /* mic ring read returned 0 bytes */
   volatile uint32_t i2s_nonzero_reads; /* healthy mic reads */
+  volatile uint32_t ring_underruns;    /* mic ring empty: zero-filled packet */
   /* TX PLL offset range, cumulative; AVB-STATS resets via print_diag
    * after reading so the reported range is always per-window. */
   volatile int32_t pll_offset_min_ns;
@@ -809,6 +810,7 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t send_fail_count = 0;
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
+  uint32_t ring_underruns = 0;    /* packets sent zero-filled, ring empty */
 
   /* gPTP discontinuity detection — mr and tu bit management.
    * mr toggles on media clock restart, tu=1 on gPTP BTC change.
@@ -1209,6 +1211,7 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->overrun_max_us = overrun_max;
         tx_ctx->i2s_zero_reads = i2s_zero_reads;
         tx_ctx->i2s_nonzero_reads = i2s_nonzero_audio;
+        tx_ctx->ring_underruns = ring_underruns;
         tx_ctx->pll_offset_min_ns = pll_offset_min;
         tx_ctx->pll_offset_max_ns = pll_offset_max;
         tx_ctx->pll_skip_count = pll_skip_count;
@@ -1346,7 +1349,7 @@ static void avb_stream_out_task(void *task_param) {
         i2s_ring_tail += i2s_read_size;
       } else {
         memset(i2s_buf, 0, i2s_read_size); /* underrun — silence */
-        i2s_zero_reads++;
+        ring_underruns++;
       }
       if (is_am824)
         i2s24_to_am824_mono(i2s_buf, audio_dst, params->samples_per_packet,
@@ -1408,9 +1411,9 @@ static void avb_stream_out_task(void *task_param) {
   }
   esp_log_level_set("*", ESP_LOG_INFO);
   avbinfo("Stream out stopped: %lu pkts, %lu fails, %lu overruns (max %lldus), "
-          "i2s: %lu zero_reads, %lu nonzero_audio",
+          "i2s: %lu zero_reads, %lu nonzero_audio, %lu ring underruns",
           loop_count, send_fail_count, overrun_count, overrun_max,
-          i2s_zero_reads, i2s_nonzero_audio);
+          i2s_zero_reads, i2s_nonzero_audio, ring_underruns);
   avbinfo("PLL: %lu measures, %lu skipped, offset [%ldns, %ldns]",
           pll_measure_count, pll_skip_count, (long)pll_offset_min,
           (long)pll_offset_max);
@@ -2407,12 +2410,12 @@ void avb_stream_out_print_diag(void) {
     return;
 
   static uint32_t last_pkts = 0, last_fail = 0, last_over = 0;
-  static uint32_t last_z = 0, last_nz = 0, last_skip = 0;
+  static uint32_t last_z = 0, last_nz = 0, last_skip = 0, last_under = 0;
   static uint32_t last_resync = 0;
   static bool prev_active = false;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
-    last_z = last_nz = last_skip = last_resync = 0;
+    last_z = last_nz = last_skip = last_resync = last_under = 0;
   }
   prev_active = true;
 
@@ -2421,6 +2424,7 @@ void avb_stream_out_print_diag(void) {
   uint32_t over = ctx->overrun_count;
   uint32_t z = ctx->i2s_zero_reads;
   uint32_t nz = ctx->i2s_nonzero_reads;
+  uint32_t under = ctx->ring_underruns;
   uint32_t skip = ctx->pll_skip_count;
   uint32_t resync = ctx->gptp_resync_count;
   int64_t over_max = ctx->overrun_max_us;
@@ -2438,13 +2442,14 @@ void avb_stream_out_print_diag(void) {
   int abs_cppm = drift_centippm < 0 ? -drift_centippm : drift_centippm;
 
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
-          "i2s_zero=%lu i2s_nz=%lu pll=[%s] pll_skip=%lu "
+          "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm rem=[%s] resync=%lu",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
           (unsigned long)(z - last_z),
           (unsigned long)(nz - last_nz),
+          (unsigned long)(under - last_under),
           pll_has_sample ? "" : "no-sample",
           (unsigned long)(skip - last_skip),
           drift_centippm < 0 ? "-" : "",
@@ -2468,6 +2473,7 @@ void avb_stream_out_print_diag(void) {
   last_over = over;
   last_z = z;
   last_nz = nz;
+  last_under = under;
   last_skip = skip;
   last_resync = resync;
 }
