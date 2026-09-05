@@ -362,6 +362,10 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
   state->media_clock.listener_byterate = rate * 2u * 4u; /* 24-in-32 slots */
   if (avb_pll_init(rate * mclk_multiple) != 0) {
     avbwarn("Rate change: PLL re-init failed (sample clock will free-run)");
+  } else {
+    /* The re-init put the APLL back at nominal; the servo still holds
+     * the converged trim, so put it back on the hardware too. */
+    avb_pll_restore_trim(state);
   }
 
   avbinfo("Audio hardware reconfigured to %lu Hz", (unsigned long)rate);

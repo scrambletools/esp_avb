@@ -1061,6 +1061,9 @@ void avb_pll_deinit(void);
 /* Preload the persisted media-clock trim (persist v4) — call after
  * avb_pll_init and before streams start. */
 void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16);
+/* Re-apply the currently accounted trim after avb_pll_init re-ran on a
+ * live system (runtime rate change). */
+void avb_pll_restore_trim(avb_state_s *state);
 /* Called ~once per second from the AVB main loop. Updates measurements,
  * logs stats (including the drift sums maintained by the RX handlers),
  * and applies any due MCLK correction. */

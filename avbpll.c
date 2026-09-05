@@ -574,6 +574,28 @@ void avb_pll_preload_trim(avb_state_s *state, int32_t trim_ppm_q16) {
            (long)(trim_ppm_q16 / 65536));
 }
 
+/* Re-tune the APLL to the trim the servo already accounts for. A
+ * runtime rate change re-initialises the MCLK backend at nominal, which
+ * silently drops the coefficient while pll_applied_ppm_q16 (and a
+ * latched hold) still claim it: the servo then holds a trim the
+ * hardware no longer carries and every peer sees the raw crystal
+ * offset until the hold breaker fires (observed: both ends of a
+ * 48k->192k switch reading -100 ppm with hw=0, then a slew to the
+ * clamp). Call after avb_pll_init on any re-init that keeps state. */
+void avb_pll_restore_trim(avb_state_s *state) {
+  if (!state)
+    return;
+  int32_t trim_ppm_q16 = state->media_clock.pll_applied_ppm_q16;
+  if (trim_ppm_q16 == 0)
+    return;
+  if (mclk_hw_tune_ppm_q16(trim_ppm_q16) != 0) {
+    ESP_LOGW(TAG, "trim restore rejected by hw tune");
+    return;
+  }
+  ESP_LOGI(TAG, "restored trim %ld ppm after MCLK re-init",
+           (long)(trim_ppm_q16 / 65536));
+}
+
 void avb_pll_deinit(void) {
   mclk_hw_deinit();
   s_pll.valid = false;
