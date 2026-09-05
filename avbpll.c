@@ -217,6 +217,9 @@ static struct {
    * new reference. */
   uint8_t hold_btc_id[8];
   bool hold_btc_known;
+  /* Stream reference bookkeeping, see stream_ref_active. */
+  bool stream_ref_was_active;
+  uint32_t stream_ref_epoch_seen;
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -377,6 +380,25 @@ static bool read_crf_anchor(avb_state_s *state, uint64_t *ts_out,
 #define AVB_CLOCK_SOURCE_INTERNAL 0
 #define AVB_CLOCK_SOURCE_CRF_INPUT 1
 
+/* Stream-referenced listener clock. With no CRF flowing, the audio
+ * stream itself is the reference: MCLK is steered so the DAC consumes
+ * exactly what the stream delivers (jitter-ring fill held constant).
+ * Any talker media-clock rate is followed and the local gPTP servo's
+ * phase noise never enters the loop, so this path tracks continuously
+ * with the CRF constants instead of converge-and-hold. Presented to
+ * controllers as the INTERNAL clock source. */
+static bool stream_ref_active(avb_state_s *state) {
+#if CONFIG_ESP_AVB_LISTENER_STREAM_CLOCK_RECOVERY
+  return state->stream_in_active &&
+         state->media_clock.active_clock_source_index ==
+             AVB_CLOCK_SOURCE_INTERNAL &&
+         !avb_crf_stream_valid();
+#else
+  (void)state;
+  return false;
+#endif
+}
+
 /* Sample the time / byte-count pair the PLL will compare against.
  * Dispatches on the active CLOCK_SOURCE that AECP SET_CLOCK_SOURCE
  * selected:
@@ -408,6 +430,57 @@ static bool read_sample(avb_state_s *state, uint64_t *bytes_out,
     *gptp_ns_out = crf_ts;
     return true;
   }
+
+  if (active == AVB_CLOCK_SOURCE_INTERNAL && stream_ref_active(state)) {
+    uint32_t epoch = atomic_load_explicit(&state->media_clock.stream_ref_epoch,
+                                          memory_order_relaxed);
+    if (!s_pll.stream_ref_was_active || epoch != s_pll.stream_ref_epoch_seen) {
+      ESP_LOGI(TAG, "stream reference %s (epoch %lu)",
+               s_pll.stream_ref_was_active ? "re-seeded after a playout gate"
+                                           : "selected",
+               (unsigned long)epoch);
+      s_pll.stream_ref_was_active = true;
+      s_pll.stream_ref_epoch_seen = epoch;
+      s_pll.integrator_ppm_q16 = 0;
+      s_pll.valid = false;
+      return false; /* re-seed on the new reference next tick */
+    }
+    /* Take the drain-published pair (same phase of the I2S queue for
+     * both counters); a stale pair means the drain has stopped. */
+    uint64_t written = 0, received = 0;
+    int64_t stamp_us = 0;
+    bool got_pair = false;
+    for (int retry = 0; retry < 4; retry++) {
+      uint32_t s1 = atomic_load_explicit(&state->media_clock.stream_anchor.seq,
+                                         memory_order_acquire);
+      if (s1 == 0)
+        return false;
+      if (s1 & 1u)
+        continue;
+      written = state->media_clock.stream_anchor.written;
+      received = state->media_clock.stream_anchor.credited;
+      stamp_us = state->media_clock.stream_anchor.stamp_us;
+      uint32_t s2 = atomic_load_explicit(&state->media_clock.stream_anchor.seq,
+                                         memory_order_acquire);
+      if (s1 == s2) {
+        got_pair = true;
+        break;
+      }
+    }
+    if (!got_pair || esp_timer_get_time() - stamp_us > 1000000LL)
+      return false;
+    uint32_t byterate = state->media_clock.listener_byterate;
+    if (byterate == 0)
+      byterate = AVB_PLL_FALLBACK_BYTERATE;
+    /* Delivered bytes expressed as media time at the nominal rate, so
+     * the loop reads zero error exactly when consumption equals
+     * delivery. Split the division to keep it in 64 bits. */
+    *bytes_out = written;
+    *gptp_ns_out = (received / byterate) * 1000000000ULL +
+                   ((received % byterate) * 1000000000ULL) / byterate;
+    return true;
+  }
+  s_pll.stream_ref_was_active = false;
 
   /* Default / AVB_CLOCK_SOURCE_INTERNAL.
    *
@@ -507,7 +580,7 @@ void avb_pll_print_stats(avb_state_s *state) {
   avbinfo("MCLK: crf n=%lu drift=%lldns mean=%ldns min=%ldns max=%ldns | "
           "stream n=%lu drift=%ldns mean=%ldns min=%ldns max=%ldns | "
           "pll inst=%ld.%02ld cumul=%ld.%02ld applied=%ld.%02ld "
-          "tgt=%ld.%02ld hw=%ld ppm",
+          "tgt=%ld.%02ld hw=%ld ppm ref=%s",
           crf_n, state->media_clock.crf_last_drift_ns, crf_mean,
           state->media_clock.crf_drift_min_ns,
           state->media_clock.crf_drift_max_ns, stream_n,
@@ -521,7 +594,11 @@ void avb_pll_print_stats(avb_state_s *state) {
           (applied_centippm < 0 ? -applied_centippm : applied_centippm) % 100,
           target_centippm / 100,
           (target_centippm < 0 ? -target_centippm : target_centippm) % 100,
-          hw_applied_ppm);
+          hw_applied_ppm,
+          state->media_clock.active_clock_source_index ==
+                  AVB_CLOCK_SOURCE_CRF_INPUT
+              ? "crf"
+              : (stream_ref_active(state) ? "stream" : "gptp"));
   if (s_pll.sample_retries) {
     avbinfo("MCLK: sample-pair retries=%u max_spread=%uus",
             (unsigned)s_pll.sample_retries,
@@ -714,11 +791,16 @@ void avb_pll_tick(avb_state_s *state) {
    * any single polluted window, and a 2 ppm deadband stops hunting.
    * CRF mode keeps the proven faster constants. */
   bool internal_mode = state->media_clock.active_clock_source_index ==
-                       AVB_CLOCK_SOURCE_INTERNAL;
+                           AVB_CLOCK_SOURCE_INTERNAL &&
+                       !stream_ref_active(state);
   int64_t correction_interval_us = AVB_PLL_CORRECTION_INTERVAL_US;
   int32_t correction_deadband_q16 = AVB_PLL_CORRECTION_DEADBAND_Q16;
   int32_t max_step_q16 = AVB_PLL_MAX_STEP_PPM_Q16;
-  if (internal_mode) {
+  /* The stream reference shares the long-window constants: its 5 s
+   * windows carry the switch's arrival jitter (several packets in
+   * flight, +/-100 ppm per window), which only averages out over
+   * minutes. It still tracks continuously, no hold. */
+  if (internal_mode || stream_ref_active(state)) {
     if (correction_interval_us < 120LL * 1000000LL)
       correction_interval_us = 120LL * 1000000LL;
     correction_deadband_q16 = 2 * 65536;
@@ -826,8 +908,13 @@ void avb_pll_tick(avb_state_s *state) {
    * that fell just below the discontinuity threshold, or after an EMAC
    * watchdog event), the measurement is noise — reset the baseline and
    * don't apply anything this cycle. */
-  if (cumul_ppm_q16 > AVB_PLL_CUMUL_SANITY_LIMIT_PPM_Q16 ||
-      cumul_ppm_q16 < -AVB_PLL_CUMUL_SANITY_LIMIT_PPM_Q16) {
+  /* The stream reference compares two media clocks that both sit
+   * inside the trim clamp, so a reading beyond it is loss pollution
+   * (DAC free-run through an outage), never a rate. */
+  int32_t sanity_limit_q16 = stream_ref_active(state)
+                                 ? AVB_PLL_MAX_APPLIED_PPM_Q16
+                                 : AVB_PLL_CUMUL_SANITY_LIMIT_PPM_Q16;
+  if (cumul_ppm_q16 > sanity_limit_q16 || cumul_ppm_q16 < -sanity_limit_q16) {
     ESP_LOGW(TAG,
              "cumul %ld ppm out of sanity range — rejecting, resetting baseline",
              (long)(cumul_ppm_q16 / 65536));
@@ -859,7 +946,12 @@ void avb_pll_tick(avb_state_s *state) {
      * 80 ppm seed aborted 20 ppm short on two noisy +6/+18 ppm
      * windows while cumul still read -50). CRF keeps the instant
      * window, its reference is clean. */
-    int32_t crossing_q16 = internal_mode ? cumul_ppm_q16 : inst_ppm_q16;
+    /* The stream reference's instant window carries the I2S queue's
+     * pairing jitter (tens of ppm per 5 s), so it judges crossings on
+     * the cumulative error like INTERNAL mode. */
+    int32_t crossing_q16 = (internal_mode || stream_ref_active(state))
+                               ? cumul_ppm_q16
+                               : inst_ppm_q16;
     bool crossed = (slewing_up && crossing_q16 > 2 * 65536) ||
                    (!slewing_up && crossing_q16 < -2 * 65536);
     /* Only guard slews with meaningful distance left: near

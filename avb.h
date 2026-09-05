@@ -755,6 +755,26 @@ typedef struct avb_state_s {
      * clock; avb_pll's INTERNAL reference picks whichever is live. */
     _Atomic uint64_t i2s_bytes_captured;
 
+    /* Listener stream reference (avb_pll): bytes the audio stream has
+     * delivered into the jitter ring, loss-concealment fill included
+     * (it stands in for talker samples). Paired with i2s_bytes_written
+     * so the DAC is steered to consume exactly what arrives. The epoch
+     * bumps when a playout (re-)gate moved the ring fill by a step,
+     * so the PLL re-seeds instead of reading the step as a rate. */
+    _Atomic uint64_t stream_bytes_received;
+    _Atomic uint32_t stream_ref_epoch;
+    /* Stream-reference sample pair, published by the 1 ms drain right
+     * after its I2S write so both counters are read at the same phase
+     * of the I2S queue (sampling them at the PLL tick instead read the
+     * queue level as +/-100 ppm of jitter per 5 s window). Seqlock as
+     * crf_anchor; stamp_us = esp_timer at publish for staleness. */
+    struct {
+      _Atomic uint32_t seq;
+      uint64_t written;
+      uint64_t credited;
+      int64_t stamp_us;
+    } stream_anchor;
+
     /* Last CONVERGED-STABLE PLL correction (Q16 ppm), 0 = none yet.
      * This is the authoritative live source for the persisted trim:
      * avb_persist_gather rebuilds the whole persist struct from live

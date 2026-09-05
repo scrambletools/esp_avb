@@ -56,6 +56,8 @@ typedef struct {
   volatile uint32_t i2s_zero_reads;  /* mic ring read returned 0 bytes */
   volatile uint32_t i2s_nonzero_reads; /* healthy mic reads */
   volatile uint32_t ring_underruns;    /* mic ring empty: zero-filled packet */
+  volatile int32_t fill_ppm_q8;        /* cadence trim following the ADC, ppm x 256 */
+  volatile int32_t fill_backlog_bytes; /* captured - sent, vs the pre-fill setpoint */
   /* TX PLL offset range, cumulative; AVB-STATS resets via print_diag
    * after reading so the reported range is always per-window. */
   volatile int32_t pll_offset_min_ns;
@@ -811,6 +813,13 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
   uint32_t ring_underruns = 0;    /* packets sent zero-filled, ring empty */
+  /* ADC-following cadence, see the fill controller in the 1 s branch. */
+  int64_t fill_adj_q16 = 0;      /* extra ns per packet, Q16 */
+  int32_t fill_frac_q16 = 0;     /* sub-ns carry of fill_adj_q16 */
+  int64_t fill_integ_ppm_q8 = 0; /* integral term, ppm x 256 */
+  int64_t fill_err_ema_q8 = 0;   /* smoothed backlog error, bytes x 256 */
+  int32_t fill_ppm_q8 = 0;
+  uint64_t adc_bytes_base = 0;
 
   /* gPTP discontinuity detection — mr and tu bit management.
    * mr toggles on media clock restart, tu=1 on gPTP BTC change.
@@ -890,6 +899,11 @@ static void avb_stream_out_task(void *task_param) {
       i2s_ring_head += got;
     }
     avbinfo("Stream out: I2S ring pre-filled %d bytes", (int)i2s_ring_head);
+    /* Backlog setpoint: the blocking pre-fill just drained the RX DMA,
+     * so from here (captured - consumed) tracks how far the ring + DMA
+     * backlog has moved from the pre-fill level. */
+    adc_bytes_base = atomic_load_explicit(
+        &state->media_clock.i2s_bytes_captured, memory_order_relaxed);
   }
 
   /* Sample PTP and send-time as late as possible — all logging and pre-fill
@@ -1069,16 +1083,18 @@ static void avb_stream_out_task(void *task_param) {
     /* Per-packet advance: nominal interval plus filtered adjustment,
      * with sub-µs carry. adj_q16 is ns per packet × 65536. */
     int64_t base_ns = (int64_t)params->interval * 1000LL;
-    int64_t adj_ns = sched_ns_adj_q16 >> 16;
-    int64_t total_ns = base_ns + adj_ns + sched_ns_carry;
+    int64_t adj_ns = gptp_cadence_ready ? (sched_ns_adj_q16 >> 16) : 0;
+    /* ADC-following term with its own sub-ns carry. */
+    fill_frac_q16 += (int32_t)fill_adj_q16;
+    int32_t fill_ns = fill_frac_q16 >> 16;
+    fill_frac_q16 -= fill_ns << 16;
+    int64_t total_ns = base_ns + adj_ns + fill_ns + sched_ns_carry;
     int32_t us_to_wait = (int32_t)(total_ns / 1000);
     sched_ns_carry = (int32_t)(total_ns - (int64_t)us_to_wait * 1000);
-    if (gptp_cadence_ready) {
-      next_send_time += us_to_wait;
-    } else if (overrun > params->interval * 10) {
+    if (!gptp_cadence_ready && overrun > params->interval * 10) {
       next_send_time = now + params->interval;
     } else {
-      next_send_time += params->interval;
+      next_send_time += us_to_wait;
     }
 
     /* Advance AVTP media clock by the nominal increment plus the
@@ -1173,9 +1189,10 @@ static void avb_stream_out_task(void *task_param) {
                * gPTP-corrected cadence double-counted the crystal
                * offset (observed: -22 ppm timestamp slide at every
                * listener). */
+              int64_t cadence_adj_q16 = sched_ns_adj_q16 + fill_adj_q16;
               int64_t spacing_q16 =
-                  (((int64_t)params->interval * 1000LL) << 16) + sched_ns_adj_q16;
-              target_q16 = sched_ns_adj_q16 +
+                  (((int64_t)params->interval * 1000LL) << 16) + cadence_adj_q16;
+              target_q16 = cadence_adj_q16 +
                            (spacing_q16 * drift_ppm_q8) / (256LL * 1000000LL);
             }
             /* Offset pull: drain ts_err at ≤4 ppm. */
@@ -1201,6 +1218,47 @@ static void avb_stream_out_task(void *task_param) {
         }
       }
 
+      /* ADC-following cadence. The mic ring is 5 ms deep and the packet
+       * cadence is gPTP-paced, so any residual between the ADC clock
+       * and gPTP (a held PLL trim drifts with temperature) drains or
+       * floods the ring, and every deficit becomes a zero-filled
+       * packet (observed: 17 ppm -> one every 7 s). Steer the cadence
+       * to what the ADC delivers instead: the backlog (captured since
+       * pre-fill minus consumed) is an exact fill measurement and its
+       * drift IS the rate error. PI on that integrator plant, P 4 ppm
+       * per packet of error, I 1/16 ppm per packet per second, error
+       * smoothed over 8 s: damping 0.7, ~4 min to absorb a 20 ppm
+       * step, a 30 ppm residual (the PLL hold breaker bound) parks
+       * the backlog 0.9 ms below the 2.5 ms setpoint until the
+       * integrator absorbs it, and the 64 B DMA quantisation leaves
+       * under 1 ppm of cadence wander at 192 kHz. The timestamp
+       * rate lock above follows the same adjustment, so presentation
+       * stamps stay true gPTP time and the stream's implied media
+       * clock is the ADC rate. */
+      if (!params->use_sine_wave) {
+        uint64_t captured =
+            atomic_load_explicit(&state->media_clock.i2s_bytes_captured,
+                                 memory_order_relaxed) -
+            adc_bytes_base;
+        int64_t backlog_err = (int64_t)captured - (int64_t)i2s_ring_tail;
+        fill_err_ema_q8 += ((backlog_err << 8) - fill_err_ema_q8) >> 3;
+        int64_t err_pkts_q8 = fill_err_ema_q8 / i2s_read_size;
+        fill_integ_ppm_q8 -= err_pkts_q8 / 16;
+        if (fill_integ_ppm_q8 > 150 * 256)
+          fill_integ_ppm_q8 = 150 * 256;
+        if (fill_integ_ppm_q8 < -150 * 256)
+          fill_integ_ppm_q8 = -150 * 256;
+        int64_t ppm_q8 = -err_pkts_q8 * 4 + fill_integ_ppm_q8;
+        if (ppm_q8 > 200 * 256)
+          ppm_q8 = 200 * 256;
+        if (ppm_q8 < -200 * 256)
+          ppm_q8 = -200 * 256;
+        fill_ppm_q8 = (int32_t)ppm_q8;
+        /* ns per packet, Q16: interval_ns x ppm / 1e6. */
+        fill_adj_q16 = (((int64_t)params->interval * 1000LL * ppm_q8) << 16) /
+                       (256LL * 1000000LL);
+      }
+
       /* Publish diagnostic counters for AVB-STATS (~1 Hz). Piggybacks
        * on the existing sparse branch so the hot path pays nothing. */
       stream_tx_ctx_t *tx_ctx = s_stream_tx_ctx;
@@ -1212,6 +1270,8 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->i2s_zero_reads = i2s_zero_reads;
         tx_ctx->i2s_nonzero_reads = i2s_nonzero_audio;
         tx_ctx->ring_underruns = ring_underruns;
+        tx_ctx->fill_ppm_q8 = fill_ppm_q8;
+        tx_ctx->fill_backlog_bytes = (int32_t)(fill_err_ema_q8 >> 8);
         tx_ctx->pll_offset_min_ns = pll_offset_min;
         tx_ctx->pll_offset_max_ns = pll_offset_max;
         tx_ctx->pll_skip_count = pll_skip_count;
@@ -1826,6 +1886,11 @@ static void stream_in_drain_cb(void *arg) {
       ctx->ever_locked = true;
     }
     ctx->media_locked_count++;
+    /* The gate wait moved consumption relative to arrival: tell the
+     * stream-referenced PLL to re-seed rather than read it as rate. */
+    if (ctx->state)
+      atomic_fetch_add_explicit(&ctx->state->media_clock.stream_ref_epoch, 1u,
+                                memory_order_relaxed);
     /* No logging here (esp_timer task) — stash for the stats printer. */
     ctx->diag_gate_mode = pt_mode ? 1 : 2;
     ctx->diag_gate_err_ns = pt_err_ns;
@@ -1927,6 +1992,23 @@ static void stream_in_drain_cb(void *arg) {
   atomic_store_explicit(&ctx->ring.tail, t + (uint32_t)bytes_written,
                         memory_order_release);
   ctx->drain_count++;
+  /* Stream-reference pair for the media-clock PLL, see avb.h. */
+  if (ctx->state && bytes_written > 0) {
+    avb_state_s *state = ctx->state;
+    uint64_t written_now = atomic_load_explicit(
+        &state->media_clock.i2s_bytes_written, memory_order_relaxed);
+    uint64_t credited_now = atomic_load_explicit(
+        &state->media_clock.stream_bytes_received, memory_order_relaxed);
+    uint32_t seq = atomic_load_explicit(&state->media_clock.stream_anchor.seq,
+                                        memory_order_relaxed);
+    atomic_store_explicit(&state->media_clock.stream_anchor.seq, seq + 1,
+                          memory_order_release);
+    state->media_clock.stream_anchor.written = written_now;
+    state->media_clock.stream_anchor.credited = credited_now;
+    state->media_clock.stream_anchor.stamp_us = esp_timer_get_time();
+    atomic_store_explicit(&state->media_clock.stream_anchor.seq, seq + 2,
+                          memory_order_release);
+  }
 
   /* The media-clock PLL counter is fed by the I2S TX on_sent DMA
    * callback (avbcodec.c), not here: bytes-into-DMA only equals the
@@ -2115,6 +2197,28 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * ignored. */
   uint32_t total = (uint32_t)samples * 8; /* stereo 24-in-32 slots */
 
+  /* Stream reference for the media-clock PLL: credit the talker's
+   * media time by sequence number, so packets the network lost still
+   * count as delivered and a loss clump reads as loss (concealed or
+   * re-gated), never as a DAC rate error (observed: byte-based credit
+   * read 8000 ppm at every clump). A gap the 8-bit sequence cannot
+   * size is a discontinuity: bump the epoch so the PLL re-seeds. */
+  if (ctx->state) {
+    uint32_t credited_packets = 1;
+    if (lost_frames >= 250) {
+      credited_packets = 0; /* duplicate or reordered, already credited */
+    } else if (lost_frames > 200) {
+      atomic_fetch_add_explicit(&ctx->state->media_clock.stream_ref_epoch,
+                                1u, memory_order_relaxed);
+    } else {
+      credited_packets += lost_frames;
+    }
+    if (credited_packets)
+      atomic_fetch_add_explicit(
+          &ctx->state->media_clock.stream_bytes_received,
+          (uint64_t)total * credited_packets, memory_order_relaxed);
+  }
+
   /* Loss concealment: the switch drops multicast frames on egress in
    * clumps (measured: ~8-25 frames every 1-3 min, absent at the talker
    * tap), plus occasional 50-70 ms outages. The DAC keeps consuming,
@@ -2153,6 +2257,14 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     uint32_t fill_bytes = 0;
     bool aligned = false;
     if (pause_us > 10000) {
+      /* The DAC free-ran on auto_clear zeros through this pause while
+       * no sequence numbers arrived to credit, and the 8-bit residue
+       * cannot size the gap: the stream-reference PLL must re-seed
+       * (observed: a 33 ms outage read as 6500 ppm and railed the
+       * trim before the crossing guard caught it). */
+      if (ctx->state)
+        atomic_fetch_add_explicit(&ctx->state->media_clock.stream_ref_epoch,
+                                  1u, memory_order_relaxed);
       /* 10 ms: above this the ring + I2S DMA (~9 ms standing) are
        * drained, so ring fill alone is the queued depth and the
        * presentation-time sizing is exact. Below it the residue path
@@ -2440,10 +2552,14 @@ void avb_stream_out_print_diag(void) {
   /* ppm with 2-decimal precision: drift_ppm_q8 / 256 = ppm, ×100 → centippm */
   int32_t drift_centippm = (int32_t)((int64_t)drift_ppm_q8 * 100 / 256);
   int abs_cppm = drift_centippm < 0 ? -drift_centippm : drift_centippm;
+  int32_t fill_centippm = (int32_t)((int64_t)ctx->fill_ppm_q8 * 100 / 256);
+  int abs_fill_cppm = fill_centippm < 0 ? -fill_centippm : fill_centippm;
+  long backlog_bytes = (long)ctx->fill_backlog_bytes;
 
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
-          "drift=%s%ld.%02d ppm rem=[%s] resync=%lu",
+          "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
+          "resync=%lu",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -2454,6 +2570,9 @@ void avb_stream_out_print_diag(void) {
           (unsigned long)(skip - last_skip),
           drift_centippm < 0 ? "-" : "",
           (long)(abs_cppm / 100), (int)(abs_cppm % 100),
+          fill_centippm < 0 ? "-" : "",
+          (long)(abs_fill_cppm / 100), (int)(abs_fill_cppm % 100),
+          backlog_bytes,
           rem_has_sample ? "" : "no-sample",
           (unsigned long)(resync - last_resync));
 

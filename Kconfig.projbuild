@@ -364,6 +364,19 @@ menu "AVB Configuration"
             MCLK coefficient change, or to isolate the recovery loop
             while diagnosing audio artifacts.
 
+    config ESP_AVB_LISTENER_STREAM_CLOCK_RECOVERY
+        bool "Listener recovers its media clock from the audio stream"
+        default y
+        depends on ESP_AVB
+        help
+            With no CRF stream connected, steer the listener MCLK so the
+            DAC consumes exactly what the audio stream delivers (jitter
+            ring fill held constant) instead of disciplining it to local
+            gPTP time. Any talker media-clock rate is followed and the
+            local gPTP servo's phase noise stays out of the loop. The
+            clock source is still reported as INTERNAL. Disable to use
+            the gPTP (INTERNAL) reference as before.
+
     # ----------------------------------------------------------------
     # Per-port topology — derived from esp_ptp's taxonomy.
     #
