@@ -19,18 +19,32 @@
 #include <stdatomic.h>    /* media-clock byte counter in i2s_tx_on_sent_cb */
 
 #define I2C_NUM (0)
-/* MCLK/fs ratio. 384 keeps MCLK at 18.432/36.864 MHz through 96 kHz; at
- * 192 kHz drop to 192 (still 24-bit compatible: divisible by 3) so MCLK
- * stays at 36.864 MHz instead of an infeasible 73.7 MHz. */
-/* MCLK ratios must match rows the ES8389 coeff table actually has:
- * 48 kHz -> 384 (18.432 MHz), 96 kHz -> 256 and 192 kHz -> 128 (both
- * 24.576 MHz — the codec's design-center master clock). The previous
- * 192 ratio produced 36.864 MHz, which has NO table row: the codec's
- * ADC/DAC modulator ratios were never programmed (ADC halved its
- * output rate, DAC ran noisy and intermittently muted). 128/256 are
- * not multiples of 3, so I2S must run 32-bit slots (see slot_cfg). */
+/* MCLK/fs multiple per sample rate. Two constraints meet here:
+ * - ESP32-P4 I2S full duplex: the second channel (RX) runs as an
+ *   internal slave off the master's BCLK, and the driver's measured
+ *   minimum for a slave to sample correctly is MCLK/BCLK >= 4 (a TX
+ *   slave would need 6). With 2 x 32-bit slots BCLK = 64 fs, so the
+ *   multiple must be >= 256. The old 128 at 192 kHz gave ratio 2 and
+ *   the driver's "data might be sampled incorrectly" warning.
+ * - ES8389 (datasheet rev 6.0): MCLK <= 49.2 MHz, LRCK <= 192 kHz,
+ *   SCLK <= 26 MHz at 3.3 V, ratios 32/50/64/100/128/192/200/256/384
+ *   fs, DVDD 3.3 V for 192 kHz. In slave mode with use_mclk the codec
+ *   derives its ratio from the clocks it sees; the esp_codec_dev
+ *   coefficient table is bypassed (es8389.c set_fs), so table rows
+ *   are not a constraint.
+ * 384 at 44.1/48 kHz (16.9344/18.432 MHz, ratio 6) and 256 at
+ * 88.2/96 kHz (22.5792/24.576 MHz, ratio 4) satisfy both. At 176.4/
+ * 192 kHz they conflict: 256 fs (45.1584/49.152 MHz, ratio 4) is
+ * inside the datasheet limit but the codec's ADC went silent on it
+ * (-125 dBFS wire capture vs -51 dBFS room noise at 128 fs, 2026-09-06),
+ * so with this driver the ES8389 wants its 24.576 MHz design-center
+ * clock there: 128 fs, ratio 2, and the i2s_std "ratio too small"
+ * warning. Wire captures at ratio 2 show intact audio (no impulses,
+ * no discontinuities), so the warning is accepted rather than moving
+ * RX to its own controller. 128/256 are not multiples of 3, so I2S
+ * runs 32-bit slots (see slot_cfg). */
 #define AVB_MCLK_MULTIPLE_FOR_RATE(rate)                                       \
-  ((rate) > 96000 ? 128 : (rate) == 96000 ? 256 : 384)
+  ((rate) > 96000 ? 128 : (rate) > 48000 ? 256 : 384)
 #define AVB_MCLK_MULTIPLE                                                      \
   AVB_MCLK_MULTIPLE_FOR_RATE(state->config.default_sample_rate)
 
