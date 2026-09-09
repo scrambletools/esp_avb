@@ -702,6 +702,7 @@ typedef struct avb_state_s {
   bool avb_lite;               // operating in AVB Lite mode (standard PTP)
   bool codec_enabled;          // codec enabled
   const void *codec_if;        // codec interface (audio_codec_if_t *)
+  const void *codec_ctrl_if;   // register access (audio_codec_ctrl_if_t *), NULL if unused
 
   /* AECP control values */
   codec_control_range_s codec_ranges;        // codec-specific control ranges

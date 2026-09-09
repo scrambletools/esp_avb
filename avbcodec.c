@@ -50,6 +50,10 @@
 
 #define TAG "AVB-CODEC"
 
+/* Defined with the ES8389 factory below; used by the rate-change path. */
+static esp_err_t es8389_apply_clock_row(avb_state_s *state, uint32_t rate_hz,
+                                        uint32_t mclk_hz);
+
 static const avb_codec_caps_s s_es8311_caps = {
     .sample_rates = {.sample_rates = {48000, 96000}, .num_rates = 2},
     .bit_rates = {.bit_rates = {24}, .num_rates = 1},
@@ -242,7 +246,13 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   std_cfg.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_32BIT;
   std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
 
-  // Initialize the I2S TX and RX channels
+  /* Initialize the I2S TX and RX channels. The channel initialised
+   * second becomes the full-duplex internal slave (RX here). The
+   * driver warns below MCLK/BCLK 4 for an RX slave (ratio 2 at
+   * 176.4/192 kHz with the 128 fs the ES8389 needs); wire captures
+   * with RX as master showed the identical corruption, so that ratio
+   * is not what breaks 192 kHz capture (see the DMA-queue note in
+   * avtp.c and the clock-row programming below). */
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_tx_handle, &std_cfg));
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_rx_handle, &std_cfg));
 
@@ -354,6 +364,7 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
     ESP_LOGE(TAG, "Rate change: codec set_fs failed");
     return ESP_FAIL;
   }
+  es8389_apply_clock_row(state, rate, rate * mclk_multiple);
   if (cif->enable && cif->enable(cif, true) != 0) {
     ESP_LOGE(TAG, "Rate change: codec re-enable failed");
     return ESP_FAIL;
@@ -389,7 +400,101 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
 /* Per-codec factory result: the chip-specific create step yields these. */
 typedef struct {
   const audio_codec_if_t *codec_if;
+  const audio_codec_ctrl_if_t *ctrl_if; /* for writes the driver does not do */
 } codec_factory_result_s;
+
+/* ES8389 clock-manager rows for the (MCLK, LRCK) pairs this driver
+ * generates, copied from esp_codec_dev's es8389.c coefficient table
+ * (Reg0x04..0x0A, 0x0F, 0x11, 0x21, 0x22, 0x26, 0x30, 0x41, 0x42, 0x43,
+ * 0xF0, 0xF1, 0x16, 0x18, 0x19). With use_mclk the driver's set_fs
+ * skips that table and leaves the codec's auto clock mode in charge,
+ * which is fine through 96 kHz but at 192 kHz the ADC keeps running at
+ * single speed and repeats every sample (wire capture: consecutive
+ * samples in near-identical pairs, a 96 kHz signal on a 192 kHz frame
+ * clock). Programming the row the driver itself would use puts the
+ * modulator and oversampling ratios where the rate needs them. */
+typedef struct {
+  uint32_t rate_hz;
+  uint32_t mclk_hz;
+  uint8_t reg[21];
+} es8389_clock_row_s;
+
+static const es8389_clock_row_s s_es8389_clock_rows[] = {
+    {48000, 18432000, {0x02, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0x40, 0x00, 0x1F,
+                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
+                       0x28}},
+    {96000, 24576000, {0x00, 0x40, 0x00, 0xC0, 0x10, 0xC1, 0x80, 0xC0, 0x00, 0x9F,
+                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x80, 0x12, 0xC0, 0x35, 0x91,
+                       0x28}},
+    {192000, 24576000, {0x00, 0x50, 0x00, 0xC0, 0x18, 0xC1, 0x81, 0xC0, 0x00, 0x8F,
+                        0x7F, 0xEF, 0xC0, 0x3F, 0x7F, 0x80, 0x12, 0xC0, 0x3F, 0xF9,
+                        0x3F}},
+};
+
+static int es8389_reg_write(const audio_codec_ctrl_if_t *ctrl, uint8_t reg,
+                            uint8_t value) {
+  int data = value;
+  return ctrl->write_reg(ctrl, reg, 1, &data, 1);
+}
+
+static int es8389_reg_update(const audio_codec_ctrl_if_t *ctrl, uint8_t reg,
+                             uint8_t mask, uint8_t value) {
+  int data = 0;
+  int err = ctrl->read_reg(ctrl, reg, 1, &data, 1);
+  if (err != 0)
+    return err;
+  data = (data & ~mask) | (value & mask);
+  return ctrl->write_reg(ctrl, reg, 1, &data, 1);
+}
+
+/* Apply the clock row for rate_hz at the MCLK we generate, mirroring
+ * es8389_config_sample's register sequence. Call with the codec
+ * disabled (before enable), after set_fs. */
+static esp_err_t es8389_apply_clock_row(avb_state_s *state, uint32_t rate_hz,
+                                        uint32_t mclk_hz) {
+  const audio_codec_ctrl_if_t *ctrl =
+      (const audio_codec_ctrl_if_t *)state->codec_ctrl_if;
+  if (state->config.codec_type != avb_codec_type_es8389 || !ctrl)
+    return ESP_OK;
+  const es8389_clock_row_s *row = NULL;
+  for (size_t i = 0; i < sizeof(s_es8389_clock_rows) / sizeof(s_es8389_clock_rows[0]); i++) {
+    if (s_es8389_clock_rows[i].rate_hz == rate_hz &&
+        s_es8389_clock_rows[i].mclk_hz == mclk_hz) {
+      row = &s_es8389_clock_rows[i];
+      break;
+    }
+  }
+  if (!row) {
+    ESP_LOGW(TAG, "ES8389: no clock row for %lu Hz at %lu Hz MCLK, auto mode",
+             (unsigned long)rate_hz, (unsigned long)mclk_hz);
+    return ESP_ERR_NOT_FOUND;
+  }
+  const uint8_t *r = row->reg;
+  int err = 0;
+  for (uint8_t reg = 0x04; reg <= 0x0A; reg++)
+    err |= es8389_reg_write(ctrl, reg, r[reg - 0x04]);
+  err |= es8389_reg_update(ctrl, 0x0F, 0xC0, r[7]);
+  err |= es8389_reg_write(ctrl, 0x11, r[8]);
+  err |= es8389_reg_write(ctrl, 0x21, r[9]);
+  err |= es8389_reg_write(ctrl, 0x22, r[10]);
+  err |= es8389_reg_write(ctrl, 0x26, r[11]);
+  err |= es8389_reg_update(ctrl, 0x30, 0xC0, r[12]);
+  err |= es8389_reg_write(ctrl, 0x41, r[13]);
+  err |= es8389_reg_write(ctrl, 0x42, r[14]);
+  err |= es8389_reg_update(ctrl, 0x43, 0x81, r[15]);
+  err |= es8389_reg_update(ctrl, 0xF0, 0x73, r[16]);
+  err |= es8389_reg_write(ctrl, 0xF1, r[17]);
+  err |= es8389_reg_write(ctrl, 0x16, r[18]);
+  err |= es8389_reg_write(ctrl, 0x18, r[19]);
+  err |= es8389_reg_write(ctrl, 0x19, r[20]);
+  if (err != 0) {
+    ESP_LOGE(TAG, "ES8389: clock row write failed (%d)", err);
+    return ESP_FAIL;
+  }
+  ESP_LOGI(TAG, "ES8389: clock row applied for %lu Hz at %lu Hz MCLK",
+           (unsigned long)rate_hz, (unsigned long)mclk_hz);
+  return ESP_OK;
+}
 
 static esp_err_t codec_factory_es8311(avb_state_s *state,
                                       i2c_master_bus_handle_t bus,
@@ -495,6 +600,7 @@ static esp_err_t codec_factory_es8389(avb_state_s *state,
     ESP_LOGE(TAG, "ES8389: failed to create codec interface");
     return ESP_FAIL;
   }
+  out->ctrl_if = ctrl;
   return ESP_OK;
 }
 
@@ -575,6 +681,9 @@ esp_err_t avb_config_codec(avb_state_s *state) {
     ESP_LOGE(TAG, "Failed to set codec sample format");
     return ESP_FAIL;
   }
+  state->codec_ctrl_if = result.ctrl_if;
+  es8389_apply_clock_row(state, state->config.default_sample_rate,
+                         state->config.default_sample_rate * AVB_MCLK_MULTIPLE);
   if (result.codec_if->enable &&
       result.codec_if->enable(result.codec_if, true) != 0) {
     ESP_LOGE(TAG, "Failed to enable codec");

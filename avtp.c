@@ -1365,11 +1365,20 @@ static void avb_stream_out_task(void *task_param) {
       else
         be32_to_aaf(pcm_buf, audio_dst, total_samples);
     } else {
-      /* Read mic audio via local ring — refill from I2S when low,
-       * consume i2s_read_size bytes per packet */
+      /* Read mic audio via local ring: drain the I2S DMA queue into the
+       * ring on EVERY packet, consume i2s_read_size bytes per packet.
+       * Refilling only when the ring ran low left the standing backlog
+       * (up to the 2.5 ms pre-fill) parked in the RX DMA queue, and at
+       * 192 kHz that queue (64 x 64 B) holds only 2.67 ms: the driver's
+       * read loop then abandons the buffer it is on whenever the queue
+       * is one slot from full ("curr_ptr is nearly to be invalid"),
+       * observed as a waveform step on every 8-frame DMA boundary in
+       * wire captures at 192 kHz (clean at 96 kHz, where the same queue
+       * holds 5.3 ms). Keeping the backlog in this 5 ms ring instead
+       * leaves the DMA queue near empty at any rate. */
       int ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
-      if (ring_avail < i2s_read_size) {
-        /* Refill: read as much as possible from I2S into ring */
+      if (ring_avail < i2s_ring_size) {
+        /* Refill: read as much as fits from I2S into the ring */
         int ring_space = i2s_ring_size - ring_avail;
         int write_pos = (int)(i2s_ring_head % (uint64_t)i2s_ring_size);
         int chunk = i2s_ring_size - write_pos; /* to end of buffer */
