@@ -209,7 +209,7 @@ static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
 #define AEM_MAX_DESC_COUNT 1        // max count of each descriptor in a config
 #define AEM_NUM_CONTROLS 3          // IDENTIFY, Speaker Volume, Mic Gain
 #define AEM_MAX_NUM_SAMPLE_RATES 10 // max number of sample rates
-#define AEM_MAX_NUM_FORMATS 12      // max number of formats
+#define AEM_MAX_NUM_FORMATS 16      // max: 5 rates x 3 families (AM824, AAF24, AAF32)
 #define AEM_MAX_NUM_MAPPINGS                                                   \
   10 // max number of mappings per map descriptor (spec max is 62)
 #define AEM_MAX_NUM_CLOCK_SOURCES                                              \

@@ -130,8 +130,8 @@
    .input_channels_usable = 1,                                                 \
    .output_channels_usable = 1,                                                \
    .channels_per_stream = 8,                                                   \
-   .num_allowed_sample_rates = 3,                                              \
-   .allowed_sample_rates = {48000, 96000, 192000},                             \
+   .num_allowed_sample_rates = 5,                                              \
+   .allowed_sample_rates = {44100, 48000, 88200, 96000, 192000},               \
    .num_allowed_bits_per_sample = 1,                                           \
    .allowed_bits_per_sample = {24},                                            \
    .default_mic_gain_tenth_db = 60,                                            \

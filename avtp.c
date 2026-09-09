@@ -625,8 +625,19 @@ static void avb_stream_out_task(void *task_param) {
    * Codec configures I2S with 24-bit data / 24-bit slot = 3 bytes/sample. */
   int i2s_channels = 2;         /* ES8311 mic is stereo */
   int i2s_bytes_per_sample = 4; /* 24-in-32 slot: [MSB MID LSB 00] */
-  int i2s_read_size =
-      params->samples_per_packet * i2s_channels * i2s_bytes_per_sample;
+  /* Samples per packet: rate / (1e6/interval). Integer for 48/96/192 kHz;
+   * fractional for the 44.1 kHz family (44100/8000 = 5.5125), where a
+   * Bresenham accumulator emits spp_base or spp_base+1 each packet so
+   * the running average is exactly the true rate (a plain floor shipped
+   * a 40 kHz stream at 44.1 kHz). Everything sized per-packet from here. */
+  int spp_den = 1000000 / params->interval;      /* 8000 (A) or 4000 (B) */
+  int spp_base = (int)params->sample_rate / spp_den;
+  int spp_rem = (int)params->sample_rate % spp_den;
+  int spp_acc = 0;
+  int spp_max = spp_base + (spp_rem ? 1 : 0);
+  int i2s_frame_bytes_pkt = i2s_channels * i2s_bytes_per_sample;
+  int i2s_read_nominal = spp_base * i2s_frame_bytes_pkt; /* fill-loop scale */
+  int i2s_read_size = spp_max * i2s_frame_bytes_pkt;     /* buffer size */
 
   i2s_buf = calloc(1, i2s_read_size);
   if (!i2s_buf) {
@@ -643,18 +654,19 @@ static void avb_stream_out_task(void *task_param) {
       goto err;
     }
     int bps = (params->bit_depth == 24) ? 4 : (params->bit_depth / 8);
-    pcm_buf = calloc(1, params->samples_per_packet * params->channels * bps);
+    pcm_buf = calloc(1, spp_max * params->channels * bps);
     if (!pcm_buf)
       goto err;
   }
 
   /* Pre-build the TX frame — constant fields filled once.
    * Audio data offset depends on format (AAF vs AM824). */
-  int audio_data_len = params->samples_per_packet * params->channels * 4;
+  int audio_data_max = spp_max * params->channels * 4;
+  int audio_data_len = spp_base * params->channels * 4; /* nominal, for hdr init/log */
   int stream_data_len =
       is_am824 ? (TX_CIP_HDR_LEN + audio_data_len) : audio_data_len;
   int audio_offset = is_am824 ? TX_HDR_LEN_61883 : TX_HDR_LEN_AAF;
-  int frame_len = audio_offset + audio_data_len;
+  int frame_len = audio_offset + audio_data_max;
   tx_frame = calloc(1, frame_len);
   if (!tx_frame) {
     avberr("Stream out: no memory for TX frame");
@@ -738,8 +750,11 @@ static void avb_stream_out_task(void *task_param) {
           params->use_sine_wave ? "sine" : "mic");
 
   uint32_t avtp_media_ts = 0;
-  uint32_t avtp_ts_increment = (uint32_t)((uint64_t)params->samples_per_packet *
-                                          1000000000ULL / params->sample_rate);
+  /* Base media-clock advance per packet, exact in Q16 ns/sample so a
+   * fractional samples-per-packet still sums to the true rate. */
+  uint64_t ns_per_sample_q16 =
+      ((uint64_t)1000000000ULL << 16) / params->sample_rate;
+  uint64_t ts_base_frac_q16 = 0;
   /* 61883-6 SYT_INTERVAL by rate family (IEC 61883-6 Table 4):
    * ≤48 kHz → 8, 88.2/96 kHz → 16, 176.4/192 kHz → 32. Used with DBC
    * to pick which data block the avtp_timestamp refers to. */
@@ -849,8 +864,10 @@ static void avb_stream_out_task(void *task_param) {
    * to avoid partial-frame reads at ring wrap boundaries.  Target ~5ms. */
   int i2s_frame_bytes = i2s_channels * i2s_bytes_per_sample;
   int i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 5 / 1000);
-  /* Round down to nearest multiple of i2s_read_size */
-  i2s_ring_size -= i2s_ring_size % i2s_read_size;
+  /* Multiple of the frame size so ring wraps land on frame boundaries
+   * (per-packet consume varies with the fractional spp, so it need not
+   * divide the packet size); at least a few max packets deep. */
+  i2s_ring_size -= i2s_ring_size % i2s_frame_bytes;
   if (i2s_ring_size < i2s_read_size * 4)
     i2s_ring_size = i2s_read_size * 4; /* minimum 4 packets */
   /* Monotonic byte counters — MUST be 64-bit. As 32-bit ints they
@@ -1097,6 +1114,19 @@ static void avb_stream_out_task(void *task_param) {
       next_send_time += us_to_wait;
     }
 
+    /* Fractional samples-per-packet (Bresenham): emit spp_base or
+     * spp_base+1 so the running average equals the true rate. */
+    int this_spp = spp_base;
+    spp_acc += spp_rem;
+    if (spp_acc >= spp_den) {
+      spp_acc -= spp_den;
+      this_spp++;
+    }
+    int this_audio_len = this_spp * params->channels * 4;
+    int this_sdl = is_am824 ? (TX_CIP_HDR_LEN + this_audio_len) : this_audio_len;
+    int this_frame_len = audio_offset + this_audio_len;
+    int this_i2s_read = this_spp * i2s_frame_bytes_pkt;
+
     /* Advance AVTP media clock by the nominal increment plus the
      * rate-lock correction (Q16 sub-ns carry). The nominal-only
      * advance accumulated residual pacing error (~35 ppm) without
@@ -1104,10 +1134,13 @@ static void avb_stream_out_task(void *task_param) {
      * the wire after 40 min, which strict listeners (macOS) answer
      * with silence while lenient ones (our pt-gate fallback, 8D)
      * keep playing. */
+    ts_base_frac_q16 += (uint64_t)this_spp * ns_per_sample_q16;
+    uint32_t ts_base_whole = (uint32_t)(ts_base_frac_q16 >> 16);
+    ts_base_frac_q16 &= 0xFFFFULL;
     ts_rate_frac_q16 += ts_rate_corr_q16;
     int32_t ts_whole_ns = ts_rate_frac_q16 >> 16;
     ts_rate_frac_q16 -= ts_whole_ns << 16;
-    avtp_media_ts += avtp_ts_increment + (uint32_t)ts_whole_ns;
+    avtp_media_ts += ts_base_whole + (uint32_t)ts_whole_ns;
 
     /* Check for gPTP BTC change every ~1 second (8000 packets at 125us) */
     if ((loop_count & 0x1FFF) == 0 && loop_count > 0) {
@@ -1242,7 +1275,7 @@ static void avb_stream_out_task(void *task_param) {
             adc_bytes_base;
         int64_t backlog_err = (int64_t)captured - (int64_t)i2s_ring_tail;
         fill_err_ema_q8 += ((backlog_err << 8) - fill_err_ema_q8) >> 3;
-        int64_t err_pkts_q8 = fill_err_ema_q8 / i2s_read_size;
+        int64_t err_pkts_q8 = fill_err_ema_q8 / i2s_read_nominal;
         fill_integ_ppm_q8 -= err_pkts_q8 / 16;
         if (fill_integ_ppm_q8 > 150 * 256)
           fill_integ_ppm_q8 = 150 * 256;
@@ -1304,6 +1337,10 @@ static void avb_stream_out_task(void *task_param) {
         tu_active = false;
     }
     avtp[2] = seq_num++;
+    /* Per-packet stream_data_length: AAF counts audio bytes, 61883
+     * adds the CIP header. Varies by 1 sample on fractional rates. */
+    avtp[20] = (this_sdl >> 8) & 0xFF;
+    avtp[21] = this_sdl & 0xFF;
     uint32_t presentation_ts =
         avtp_media_ts + params->presentation_time_offset_ns;
     bool ts_valid = true;
@@ -1323,7 +1360,7 @@ static void avb_stream_out_task(void *task_param) {
       cip[3] = (uint8_t)(dbc & 0xFF);
       uint32_t phase = (uint32_t)dbc % syt_interval;
       uint32_t k = (syt_interval - phase) % syt_interval;
-      if (k >= (uint32_t)params->samples_per_packet) {
+      if (k >= (uint32_t)this_spp) {
         ts_valid = false; /* no SYT_INTERVAL boundary in this PDU */
       } else {
         presentation_ts += k * ns_per_sample;
@@ -1342,7 +1379,7 @@ static void avb_stream_out_task(void *task_param) {
         presentation_ts = 0;
       }
 #endif
-      dbc += params->samples_per_packet;
+      dbc += this_spp;
     }
 
     if (ts_valid)
@@ -1355,10 +1392,10 @@ static void avb_stream_out_task(void *task_param) {
 
     /* Get audio data and convert directly into tx_frame */
     uint8_t *audio_dst = tx_frame + audio_offset;
-    int total_samples = params->samples_per_packet * params->channels;
+    int total_samples = this_spp * params->channels;
 
     if (params->use_sine_wave) {
-      copy_sine_from_lut(pcm_buf, params->samples_per_packet, params->channels,
+      copy_sine_from_lut(pcm_buf, this_spp, params->channels,
                          params->bit_depth, sine_lut, lut_samples, &lut_pos);
       if (is_am824)
         be32_to_am824(pcm_buf, audio_dst, total_samples);
@@ -1405,26 +1442,26 @@ static void avb_stream_out_task(void *task_param) {
         ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
       }
       skip_refill:
-      /* Consume i2s_read_size bytes from ring */
-      if (ring_avail >= i2s_read_size) {
+      /* Consume this_i2s_read bytes from ring */
+      if (ring_avail >= this_i2s_read) {
         int read_pos = (int)(i2s_ring_tail % (uint64_t)i2s_ring_size);
         int first = i2s_ring_size - read_pos;
-        if (first >= i2s_read_size) {
-          memcpy(i2s_buf, i2s_ring + read_pos, i2s_read_size);
+        if (first >= this_i2s_read) {
+          memcpy(i2s_buf, i2s_ring + read_pos, this_i2s_read);
         } else {
           memcpy(i2s_buf, i2s_ring + read_pos, first);
-          memcpy(i2s_buf + first, i2s_ring, i2s_read_size - first);
+          memcpy(i2s_buf + first, i2s_ring, this_i2s_read - first);
         }
-        i2s_ring_tail += i2s_read_size;
+        i2s_ring_tail += this_i2s_read;
       } else {
-        memset(i2s_buf, 0, i2s_read_size); /* underrun — silence */
+        memset(i2s_buf, 0, this_i2s_read); /* underrun — silence */
         ring_underruns++;
       }
       if (is_am824)
-        i2s24_to_am824_mono(i2s_buf, audio_dst, params->samples_per_packet,
+        i2s24_to_am824_mono(i2s_buf, audio_dst, this_spp,
                             params->channels, &mic_dsp);
       else
-        i2s24_to_aaf_mono(i2s_buf, audio_dst, params->samples_per_packet,
+        i2s24_to_aaf_mono(i2s_buf, audio_dst, this_spp,
                           params->channels, &mic_dsp);
     } /* end else (mic path) */
 
@@ -1441,7 +1478,7 @@ static void avb_stream_out_task(void *task_param) {
     }
     for (int copy = 0; copy < nda; copy++) {
       memcpy(tx_frame, &das[copy], ETH_ADDR_LEN);
-      if (avb_net_transmit_raw(params->eth_handle, tx_frame, frame_len) !=
+      if (avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len) !=
           ESP_OK) {
         /* One immediate retry. Per-listener duplication raises TX-ring
          * pressure enough that the once-per-second control-plane burst
@@ -1449,7 +1486,7 @@ static void avb_stream_out_task(void *task_param) {
          * measured exactly ~1 failed copy/s at fan-out 3, gone with a
          * retry. The failed frame has already drained by re-entry
          * (~3.5 µs per 426 B at 1 Gbps). */
-        if (avb_net_transmit_raw(params->eth_handle, tx_frame, frame_len) !=
+        if (avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len) !=
             ESP_OK) {
           send_fail_count++;
         }

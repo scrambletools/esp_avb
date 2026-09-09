@@ -32,19 +32,26 @@
  *   derives its ratio from the clocks it sees; the esp_codec_dev
  *   coefficient table is bypassed (es8389.c set_fs), so table rows
  *   are not a constraint.
- * 384 at 44.1/48 kHz (16.9344/18.432 MHz, ratio 6) and 256 at
- * 88.2/96 kHz (22.5792/24.576 MHz, ratio 4) satisfy both. At 176.4/
- * 192 kHz they conflict: 256 fs (45.1584/49.152 MHz, ratio 4) is
- * inside the datasheet limit but the codec's ADC went silent on it
- * (-125 dBFS wire capture vs -51 dBFS room noise at 128 fs, 2026-09-06),
- * so with this driver the ES8389 wants its 24.576 MHz design-center
- * clock there: 128 fs, ratio 2, and the i2s_std "ratio too small"
- * warning. Wire captures at ratio 2 show intact audio (no impulses,
- * no discontinuities), so the warning is accepted rather than moving
- * RX to its own controller. 128/256 are not multiples of 3, so I2S
- * runs 32-bit slots (see slot_cfg). */
+ * The multiple must (a) give an MCLK the ES8389 coeff table has a row
+ * for at that rate, and (b) ideally keep MCLK/BCLK >= 4 for the P4
+ * full-duplex RX slave (BCLK = 64 fs with 2x32-bit slots, so >= 256).
+ * The codec table is sparse, so per rate:
+ *   44.1 kHz -> 256 (11.2896 MHz, ratio 4)   clean
+ *   48   kHz -> 384 (18.432  MHz, ratio 6)   clean (validated)
+ *   88.2 kHz -> 128 (11.2896 MHz, ratio 2)   only row; ratio-2 warning
+ *   96   kHz -> 256 (24.576  MHz, ratio 4)   clean
+ *   192  kHz -> 128 (24.576  MHz, ratio 2)   only usable; ratio-2 warning
+ * 176.4 kHz has NO coeff row (any MCLK) so it is not offered. The
+ * ratio-2 warning at 88.2/192 kHz is accepted: wire captures there are
+ * intact once the ring is drained per packet and the row is programmed
+ * (2026-09-08). 128/256 are not multiples of 3, so I2S runs 32-bit
+ * slots (see slot_cfg). */
 #define AVB_MCLK_MULTIPLE_FOR_RATE(rate)                                       \
-  ((rate) > 96000 ? 128 : (rate) > 48000 ? 256 : 384)
+  ((rate) <= 44100   ? 256                                                     \
+   : (rate) <= 48000 ? 384                                                     \
+   : (rate) <= 88200 ? 128                                                     \
+   : (rate) <= 96000 ? 256                                                     \
+                     : 128)
 #define AVB_MCLK_MULTIPLE                                                      \
   AVB_MCLK_MULTIPLE_FOR_RATE(state->config.default_sample_rate)
 
@@ -90,7 +97,8 @@ static const avb_codec_caps_s s_es8388_caps = {
  * -95.5..+32 dB (0.5 dB step) and mic PGA 0..36.5 dB (~3 dB step) per
  * the esp_codec_dev es8389 driver vol_range and PGA gain table. */
 static const avb_codec_caps_s s_es8389_caps = {
-    .sample_rates = {.sample_rates = {48000, 96000, 192000}, .num_rates = 3},
+    .sample_rates = {.sample_rates = {44100, 48000, 88200, 96000, 192000},
+                     .num_rates = 5},
     .bit_rates = {.bit_rates = {24}, .num_rates = 1},
     .max_input_channels = 2,
     .max_output_channels = 2,
@@ -420,9 +428,15 @@ typedef struct {
 } es8389_clock_row_s;
 
 static const es8389_clock_row_s s_es8389_clock_rows[] = {
+    {44100, 11289600, {0x01, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0x40, 0x00, 0x1F,
+                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
+                       0x28}},
     {48000, 18432000, {0x02, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0x40, 0x00, 0x1F,
                        0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
                        0x28}},
+    {88200, 11289600, {0x00, 0x50, 0x00, 0xC0, 0x10, 0xC1, 0x80, 0x40, 0x00, 0x9F,
+                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x80, 0x12, 0xC0, 0x32, 0x89,
+                       0x25}},
     {96000, 24576000, {0x00, 0x40, 0x00, 0xC0, 0x10, 0xC1, 0x80, 0xC0, 0x00, 0x9F,
                        0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x80, 0x12, 0xC0, 0x35, 0x91,
                        0x28}},
