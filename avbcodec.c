@@ -37,24 +37,24 @@
  * full-duplex RX slave (BCLK = 64 fs with 2x32-bit slots, so >= 256).
  * The codec table is sparse, so per rate:
  *   44.1 kHz -> 256 (11.2896 MHz, ratio 4)   clean
- *   48   kHz -> 384 (18.432  MHz, ratio 6)   clean (validated)
+ *   48   kHz -> 512 (24.576  MHz, ratio 8)   clean, constant MCLK with 96/192
  *   88.2 kHz -> 128 (11.2896 MHz, ratio 2)   only row; ratio-2 warning
  *   96   kHz -> 256 (24.576  MHz, ratio 4)   clean
  *   192  kHz -> 128 (24.576  MHz, ratio 2)   only usable; ratio-2 warning
- * A constant MCLK per family (48 kHz at 512x = 24.576 MHz like 96/192,
- * the XMOS lib_tsn arrangement) was tried on 2026-09-09: two of three
- * stream starts matched 384x exactly, one start carried the DMA-edge
- * corruption for its whole capture, while 96/192 kHz on the same MCLK
- * were clean. No gain without also skipping the APLL re-init, so 48 kHz
- * stays at its validated 384x; the 512x row below is kept for that
- * experiment. 176.4 kHz has NO coeff row (any MCLK) so it is not offered. The
+ * 48 kHz moved from 384x to 512x on 2026-09-09 (constant 24.576 MHz
+ * across 48/96/192, the XMOS lib_tsn arrangement) after an 8-start
+ * A/B at each multiple measured identical audio; both multiples share
+ * an open defect where roughly half of RATE-CHANGE starts (never plain
+ * reconnects) carry seconds-long episodes of 3-4 sample slot slips, so
+ * that is not a property of the MCLK (see the bench notes). 176.4 kHz
+ * has NO coeff row (any MCLK) so it is not offered. The
  * ratio-2 warning at 88.2/192 kHz is accepted: wire captures there are
  * intact once the ring is drained per packet and the row is programmed
  * (2026-09-08). 128/256 are not multiples of 3, so I2S runs 32-bit
  * slots (see slot_cfg). */
 #define AVB_MCLK_MULTIPLE_FOR_RATE(rate)                                       \
   ((rate) <= 44100   ? 256                                                     \
-   : (rate) <= 48000 ? 384                                                     \
+   : (rate) <= 48000 ? 512                                                     \
    : (rate) <= 88200 ? 128                                                     \
    : (rate) <= 96000 ? 256                                                     \
                      : 128)
