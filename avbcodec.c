@@ -41,7 +41,13 @@
  *   88.2 kHz -> 128 (11.2896 MHz, ratio 2)   only row; ratio-2 warning
  *   96   kHz -> 256 (24.576  MHz, ratio 4)   clean
  *   192  kHz -> 128 (24.576  MHz, ratio 2)   only usable; ratio-2 warning
- * 176.4 kHz has NO coeff row (any MCLK) so it is not offered. The
+ * A constant MCLK per family (48 kHz at 512x = 24.576 MHz like 96/192,
+ * the XMOS lib_tsn arrangement) was tried on 2026-09-09: two of three
+ * stream starts matched 384x exactly, one start carried the DMA-edge
+ * corruption for its whole capture, while 96/192 kHz on the same MCLK
+ * were clean. No gain without also skipping the APLL re-init, so 48 kHz
+ * stays at its validated 384x; the 512x row below is kept for that
+ * experiment. 176.4 kHz has NO coeff row (any MCLK) so it is not offered. The
  * ratio-2 warning at 88.2/192 kHz is accepted: wire captures there are
  * intact once the ring is drained per packet and the row is programmed
  * (2026-09-08). 128/256 are not multiples of 3, so I2S runs 32-bit
@@ -432,6 +438,9 @@ static const es8389_clock_row_s s_es8389_clock_rows[] = {
                        0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
                        0x28}},
     {48000, 18432000, {0x02, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0x40, 0x00, 0x1F,
+                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
+                       0x28}},
+    {48000, 24576000, {0x03, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0xC0, 0x00, 0x1F,
                        0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
                        0x28}},
     {88200, 11289600, {0x00, 0x50, 0x00, 0xC0, 0x10, 0xC1, 0x80, 0x40, 0x00, 0x9F,
