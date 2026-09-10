@@ -673,6 +673,14 @@ void avb_pll_restore_trim(avb_state_s *state) {
            (long)(trim_ppm_q16 / 65536));
 }
 
+/* Re-seed the measurement baselines only (hardware and trim untouched):
+ * for a rate change that keeps the MCLK, where the byte rate changed
+ * under a window that would otherwise read tens of thousands of ppm. */
+void avb_pll_reseed(void) {
+  s_pll.valid = false;
+  s_pll.next_correction_us = 0;
+}
+
 void avb_pll_deinit(void) {
   mclk_hw_deinit();
   s_pll.valid = false;

@@ -364,6 +364,20 @@ menu "AVB Configuration"
             MCLK coefficient change, or to isolate the recovery loop
             while diagnosing audio artifacts.
 
+    config ESP_AVB_TALKER_SLIP_MUTE
+        bool "Mute the talker when a capture slot slip is detected"
+        default y
+        depends on ESP_AVB
+        help
+            The ESP32-P4 full-duplex RX path can, after a rate change, go
+            through seconds-long episodes in which short runs of capture
+            frames are replaced by data from elsewhere (heard as a dense
+            crackle). The guard watches the jump density of the captured
+            signal (large sample-to-sample steps against its running mean)
+            and, on a burst, mutes the talker for 250 ms (retriggered while
+            the burst continues) and fades back in over 1 ms.
+            STREAM-OUT reports slips=<detections>/<packets muted>.
+
     config ESP_AVB_LISTENER_STREAM_CLOCK_RECOVERY
         bool "Listener recovers its media clock from the audio stream"
         default y

@@ -340,6 +340,9 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
                       "i2s rx disable");
 
   uint32_t mclk_multiple = AVB_MCLK_MULTIPLE_FOR_RATE(rate);
+  uint32_t old_rate = state->config.default_sample_rate;
+  bool same_mclk = rate * mclk_multiple ==
+                   old_rate * AVB_MCLK_MULTIPLE_FOR_RATE(old_rate);
   i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
   clk_cfg.mclk_multiple = mclk_multiple;
 #if SOC_CLK_APLL_SUPPORTED
@@ -347,16 +350,23 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
    * to retune it while more than one owner remains — reconfiguring one
    * channel at a time can never move the APLL to the new rate. Park
    * both channels on XTAL at a low, always-derivable MCLK first so the
-   * APLL is fully released, then re-acquire it at the new rate. */
-  i2s_std_clk_config_t park_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000);
-  park_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-  park_cfg.clk_src = I2S_CLK_SRC_XTAL;
-  ESP_RETURN_ON_ERROR(
-      i2s_channel_reconfig_std_clock(state->i2s_tx_handle, &park_cfg), TAG,
-      "i2s tx park");
-  ESP_RETURN_ON_ERROR(
-      i2s_channel_reconfig_std_clock(state->i2s_rx_handle, &park_cfg), TAG,
-      "i2s rx park");
+   * APLL is fully released, then re-acquire it at the new rate.
+   * Within a rate family the MCLK does not change (24.576 MHz for
+   * 48/96/192 kHz, 11.2896 MHz for 44.1/88.2 kHz): the driver is
+   * asked for the APLL frequency it already records, so it leaves the
+   * coefficients (and the servo's trim) alone; only the BCLK divider
+   * and the codec row move, and the park is skipped. */
+  if (!same_mclk) {
+    i2s_std_clk_config_t park_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000);
+    park_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+    park_cfg.clk_src = I2S_CLK_SRC_XTAL;
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_reconfig_std_clock(state->i2s_tx_handle, &park_cfg), TAG,
+        "i2s tx park");
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_reconfig_std_clock(state->i2s_rx_handle, &park_cfg), TAG,
+        "i2s rx park");
+  }
   clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 #else
   clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
@@ -399,6 +409,14 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
    * PLL at the new nominal MCLK. */
   state->media_clock.listener_sample_rate = rate;
   state->media_clock.listener_byterate = rate * 2u * 4u; /* 24-in-32 slots */
+  if (same_mclk) {
+    /* APLL untouched, so the backend and the trim stand; only the
+     * measurement windows must restart, the byte rate just changed. */
+    avb_pll_reseed();
+    avbinfo("Audio hardware reconfigured to %lu Hz (MCLK unchanged, APLL kept)",
+            (unsigned long)rate);
+    return ESP_OK;
+  }
   if (avb_pll_init(rate * mclk_multiple) != 0) {
     avbwarn("Rate change: PLL re-init failed (sample clock will free-run)");
   } else {

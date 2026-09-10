@@ -49,6 +49,7 @@ static uint8_t avb_msrp_priority_for_stream(avb_state_s *state,
  * stop — same lifecycle as stream_rx_ctx_t. */
 typedef struct {
   volatile bool active;              /* true while stream_out_task running */
+  uint32_t start_serial;             /* increments per task start (stats re-baseline) */
   volatile uint32_t pkt_count;       /* TX packets attempted */
   volatile uint32_t send_fail_count; /* avb_net_transmit_raw failures */
   volatile uint32_t overrun_count;   /* send loop late beyond interval */
@@ -58,6 +59,8 @@ typedef struct {
   volatile uint32_t ring_underruns;    /* mic ring empty: zero-filled packet */
   volatile int32_t fill_ppm_q8;        /* cadence trim following the ADC, ppm x 256 */
   volatile int32_t fill_backlog_bytes; /* captured - sent, vs the pre-fill setpoint */
+  volatile uint32_t slip_events;       /* slot-slip guard: detections */
+  volatile uint32_t slip_muted_pkts;   /* slot-slip guard: packets muted */
   /* TX PLL offset range, cumulative; AVB-STATS resets via print_diag
    * after reading so the reported range is always per-window. */
   volatile int32_t pll_offset_min_ns;
@@ -483,6 +486,11 @@ typedef struct {
   int32_t x_prev;
   int32_t y_prev;
   int32_t gain_q16; /* 65536 = unity */
+  /* Output mute for the slot-slip guard: applied after the DC block so
+   * the filter keeps tracking the live input while muted and unmutes
+   * without a DC step. mute_step ramps mute_q16 back to unity. */
+  int32_t mute_q16; /* 65536 = open */
+  int32_t mute_step;
 } mic_dsp_state_s;
 
 static inline int32_t mic_dsp_sample(mic_dsp_state_s *st, int32_t x) {
@@ -498,6 +506,16 @@ static inline int32_t mic_dsp_sample(mic_dsp_state_s *st, int32_t x) {
     g = 0x7FFFFF;
   if (g < -0x800000)
     g = -0x800000;
+  if (st->mute_q16 < 65536) {
+    g = (g * st->mute_q16) >> 16;
+    if (st->mute_step) {
+      st->mute_q16 += st->mute_step;
+      if (st->mute_q16 >= 65536) {
+        st->mute_q16 = 65536;
+        st->mute_step = 0;
+      }
+    }
+  }
   return (int32_t)g;
 }
 
@@ -597,6 +615,10 @@ static void avb_stream_out_task(void *task_param) {
    * dangling pointer. */
   stream_tx_ctx_t *tx_ctx = calloc(1, sizeof(stream_tx_ctx_t));
   if (tx_ctx) {
+    {
+      static uint32_t s_tx_start_serial = 0;
+      tx_ctx->start_serial = ++s_tx_start_serial;
+    }
     tx_ctx->active = true;
     s_stream_tx_ctx = tx_ctx;
   }
@@ -882,6 +904,20 @@ static void avb_stream_out_task(void *task_param) {
   /* Mic DSP: DC-block always on; digital gain from Kconfig (unity when
    * 0). powf at task start only. */
   mic_dsp_state_s mic_dsp = {0};
+  mic_dsp.mute_q16 = 65536;
+  /* Slot-slip guard (see the packet loop): jump-density state, hold
+   * counter, counters, and a log budget for the first detections. */
+  int32_t slip_prev_x = 0;
+  int32_t slip_absdiff_ema = 0;
+  uint32_t slip_sample = 100;       /* running sample index */
+  uint32_t slip_edge_sample = 0;    /* sample index of the last step */
+  int32_t slip_edge_dx = 0, slip_edge_mag = 0, slip_inner_max = 0;
+  uint8_t slip_window[512] = {0};
+  unsigned slip_window_pos = 0, slip_window_sum = 0;
+  uint32_t slip_armed_pkts = 0;
+  uint32_t slip_mute_hold = 0;
+  uint32_t slip_events = 0, slip_muted_pkts = 0;
+  int slip_log_budget = 6;
   mic_dsp.gain_q16 =
       (int32_t)(powf(10.0f, (float)CONFIG_ESP_AVB_TALKER_MIC_DIGITAL_GAIN_DB /
                                  20.0f) *
@@ -1305,6 +1341,8 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->ring_underruns = ring_underruns;
         tx_ctx->fill_ppm_q8 = fill_ppm_q8;
         tx_ctx->fill_backlog_bytes = (int32_t)(fill_err_ema_q8 >> 8);
+        tx_ctx->slip_events = slip_events;
+        tx_ctx->slip_muted_pkts = slip_muted_pkts;
         tx_ctx->pll_offset_min_ns = pll_offset_min;
         tx_ctx->pll_offset_max_ns = pll_offset_max;
         tx_ctx->pll_skip_count = pll_skip_count;
@@ -1457,6 +1495,88 @@ static void avb_stream_out_task(void *task_param) {
         memset(i2s_buf, 0, this_i2s_read); /* underrun — silence */
         ring_underruns++;
       }
+#if CONFIG_ESP_AVB_TALKER_SLIP_MUTE
+      /* Slot-slip guard. After a rate change (and less often after a
+       * plain reconnect) the RX path goes through seconds-long episodes
+       * in which 3-4 frame runs of the left slot are replaced by data
+       * from elsewhere, heard as a dense crackle. The wire signature of
+       * one slip is a PULSE: a large step (beyond 8x the running mean
+       * |dx| and above a silence floor), 2-5 smooth samples of foreign
+       * audio (their |dx| stays near the running mean), then a step of
+       * similar size back the other way. Speech and percussive room
+       * sounds fail the middle condition: their |dx| stays large across
+       * the whole event (checked offline against a -25 dBFS room event
+       * and every clean capture: zero detections; every corrupted
+       * capture: detected within seconds). Three pulses inside the last
+       * 512 packets (64 ms at 8000 pps) is an episode: mute the output,
+       * hold 500 ms, extend by 250 ms while the window is still busy,
+       * then fade back in over 1 ms. Runs on the raw left input, before
+       * the DC block and the mute, so the mute never hides the evidence
+       * from the detector. */
+      {
+        int pulses = 0;
+        for (int f = 0; f < this_spp; f++) {
+          const uint8_t *fr = i2s_buf + f * 8;
+          int32_t x = ((int32_t)((fr[0] << 24) | (fr[1] << 16) | (fr[2] << 8))) >> 8;
+          int32_t dx = x - slip_prev_x;
+          slip_prev_x = x;
+          int32_t adx = dx < 0 ? -dx : dx;
+          uint32_t since = slip_sample - slip_edge_sample;
+          if (slip_armed_pkts > 400 && adx > 4096 && adx > 8 * slip_absdiff_ema) {
+            bool returns = since >= 2 && since <= 5 &&
+                           ((dx < 0) != (slip_edge_dx < 0)) &&
+                           adx < 2 * slip_edge_mag && adx > slip_edge_mag / 2;
+            int32_t smooth_limit = slip_absdiff_ema > 512 ? slip_absdiff_ema : 512;
+            if (returns && slip_inner_max <= 4 * smooth_limit) {
+              pulses++;
+              slip_edge_sample = slip_sample - 100; /* consumed */
+            } else {
+              slip_edge_sample = slip_sample;
+              slip_edge_dx = dx;
+              slip_edge_mag = adx;
+              slip_inner_max = 0;
+            }
+          } else if (since <= 5 && adx > slip_inner_max) {
+            slip_inner_max = adx;
+          }
+          slip_absdiff_ema += (adx - slip_absdiff_ema) >> 10;
+          slip_sample++;
+        }
+        if (slip_armed_pkts <= 400)
+          slip_armed_pkts++;
+        slip_window_sum -= slip_window[slip_window_pos];
+        slip_window[slip_window_pos] = (uint8_t)(pulses > 255 ? 255 : pulses);
+        slip_window_sum += slip_window[slip_window_pos];
+        slip_window_pos = (slip_window_pos + 1) & 511;
+        if (slip_window_sum >= 3) {
+          if (slip_mute_hold == 0) {
+            slip_events++;
+            mic_dsp.mute_q16 = 0;
+            mic_dsp.mute_step = 0;
+            if (slip_log_budget > 0) {
+              slip_log_budget--;
+              avbwarn("slot slip: %u pulses in 64 ms (mean |dx| %ld), muting",
+                      (unsigned)slip_window_sum, (long)slip_absdiff_ema);
+            }
+          }
+          slip_mute_hold = (uint32_t)(500000 / params->interval); /* 500 ms */
+        }
+        if (slip_mute_hold > 0) {
+          slip_muted_pkts++;
+          if (--slip_mute_hold == 0) {
+            if (slip_window_sum >= 1) {
+              /* Still busy: stay muted another 250 ms. */
+              slip_mute_hold = (uint32_t)(250000 / params->interval);
+            } else {
+              /* Quiet: 1 ms fade-in. */
+              mic_dsp.mute_step = (int32_t)(65536 / (params->sample_rate / 1000));
+              if (mic_dsp.mute_step < 1)
+                mic_dsp.mute_step = 1;
+            }
+          }
+        }
+      }
+#endif
       if (is_am824)
         i2s24_to_am824_mono(i2s_buf, audio_dst, this_spp,
                             params->channels, &mic_dsp);
@@ -2563,19 +2683,26 @@ void avb_stream_in_print_diag(void) {
  * (written ~1 Hz by the TX task) and prints a delta-per-window summary.
  * Silent when no TX session is active. */
 void avb_stream_out_print_diag(void) {
+  static uint32_t prev_serial = 0;
   stream_tx_ctx_t *ctx = s_stream_tx_ctx;
   if (!ctx || !ctx->active)
     return;
+  /* A new start means counters that begin at zero, so the per-window
+   * deltas must re-baseline. Keyed on a start serial: a stop shorter
+   * than one stats period is never seen here, and a freed context is
+   * usually re-allocated at the same address. */
+  bool prev_active = ctx->start_serial == prev_serial;
+  prev_serial = ctx->start_serial;
 
   static uint32_t last_pkts = 0, last_fail = 0, last_over = 0;
   static uint32_t last_z = 0, last_nz = 0, last_skip = 0, last_under = 0;
+  static uint32_t last_slip = 0, last_slip_pkts = 0;
   static uint32_t last_resync = 0;
-  static bool prev_active = false;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = last_under = 0;
+    last_slip = last_slip_pkts = 0;
   }
-  prev_active = true;
 
   uint32_t pkts = ctx->pkt_count;
   uint32_t fail = ctx->send_fail_count;
@@ -2583,6 +2710,8 @@ void avb_stream_out_print_diag(void) {
   uint32_t z = ctx->i2s_zero_reads;
   uint32_t nz = ctx->i2s_nonzero_reads;
   uint32_t under = ctx->ring_underruns;
+  uint32_t slips = ctx->slip_events;
+  uint32_t slip_pkts = ctx->slip_muted_pkts;
   uint32_t skip = ctx->pll_skip_count;
   uint32_t resync = ctx->gptp_resync_count;
   int64_t over_max = ctx->overrun_max_us;
@@ -2605,7 +2734,7 @@ void avb_stream_out_print_diag(void) {
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
-          "resync=%lu",
+          "resync=%lu slips=%lu/%lu",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -2620,7 +2749,9 @@ void avb_stream_out_print_diag(void) {
           (long)(abs_fill_cppm / 100), (int)(abs_fill_cppm % 100),
           backlog_bytes,
           rem_has_sample ? "" : "no-sample",
-          (unsigned long)(resync - last_resync));
+          (unsigned long)(resync - last_resync),
+          (unsigned long)(slips - last_slip),
+          (unsigned long)(slip_pkts - last_slip_pkts));
 
   /* Secondary detail lines only emitted when samples were actually
    * collected, to keep noise-free output when the stream is idle. */
@@ -2639,6 +2770,8 @@ void avb_stream_out_print_diag(void) {
   last_z = z;
   last_nz = nz;
   last_under = under;
+  last_slip = slips;
+  last_slip_pkts = slip_pkts;
   last_skip = skip;
   last_resync = resync;
 }
