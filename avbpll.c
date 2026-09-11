@@ -98,6 +98,32 @@ static int mclk_hw_init(uint32_t nominal_mclk_hz) {
 #endif
 }
 
+bool avb_pll_mclk_derivable(uint32_t mclk_hz, uint32_t *apll_hz) {
+  if (apll_hz)
+    *apll_hz = 0;
+  if (mclk_hz == 0)
+    return false;
+#if SOC_CLK_APLL_SUPPORTED
+  /* Same divider rule as mclk_hw_init, same coefficient calculator as
+   * the retune path: what this accepts is what the servo can drive. */
+  int mclk_div = (int)((CLK_LL_APLL_MIN_HZ / mclk_hz) + 1);
+  if (mclk_div < 2)
+    mclk_div = 2;
+  uint32_t target_hz = mclk_hz * (uint32_t)mclk_div;
+  uint32_t o_div = 0, sdm0 = 0, sdm1 = 0, sdm2 = 0;
+  uint32_t real_hz =
+      rtc_clk_apll_coeff_calc(target_hz, &o_div, &sdm0, &sdm1, &sdm2);
+  if (real_hz == 0)
+    return false;
+  if (apll_hz)
+    *apll_hz = real_hz;
+  return true;
+#else
+  /* XTAL-derived MCLK: the I2S driver picks the nearest divider. */
+  return true;
+#endif
+}
+
 /* Apply an absolute ppm offset (Q16) to the nominal MCLK.
  *   actual_mclk = nominal_mclk * (1 + ppm/1e6)
  * Positive → faster, negative → slower. Repeated calls replace the prior

@@ -559,9 +559,10 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   memcpy(allowed_bits_per_sample.bit_rates,
          state->config.allowed_bits_per_sample,
          sizeof(allowed_bits_per_sample.bit_rates));
+  avb_sample_rates_s codec_sample_rates = {0};
+  avb_codec_plan_sample_rates(codec_caps, &codec_sample_rates);
   avb_intersect_sample_rates(&state->supported_sample_rates,
-                             &allowed_sample_rates,
-                             &codec_caps->sample_rates);
+                             &allowed_sample_rates, &codec_sample_rates);
   avb_intersect_bit_rates(&state->supported_bits_per_sample,
                           &allowed_bits_per_sample,
                           &codec_caps->bit_rates);
@@ -954,6 +955,24 @@ avb_input_stream_decl_event(const avb_listener_stream_s *s) {
     return msrp_listener_event_ready;
   return msrp_listener_event_asking_failed;
 }
+
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+/* True when NVS restored a listener binding that fast-connect (and
+ * superfast connect) will act on right after init. */
+static bool avb_persist_binding_armed(const avb_state_s *state) {
+  static const unique_id_t zero_id = {0};
+  for (int i = 0; i < state->num_input_streams; i++) {
+    if (memcmp(state->input_streams[i].talker_id, zero_id, UNIQUE_ID_LEN) !=
+        0)
+      return true;
+  }
+  return false;
+}
+
+/* Boot with a persisted binding: run the codec clock-plan check this
+ * long after init instead, once superfast connect has settled. */
+#define AVB_CLOCK_PLAN_CHECK_DEFER_US (30LL * 1000000LL)
+#endif /* !CONFIG_ESP_AVB_ROLE_BRIDGE */
 
 /* Send periodic messages */
 static int avb_periodic_send(avb_state_s *state) {
@@ -1360,6 +1379,24 @@ static void avb_task(void *task_param) {
   // persisted volume/gain override the codec defaults
   avb_persist_load(state);
 
+  /* Codec clock-plan check: arithmetic plus one log line per candidate,
+   * so its only cost is console time. A persisted binding means
+   * superfast connect starts provisional playout next; stay out of its
+   * way and run the check from the main loop later instead. */
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+  if (state->codec_enabled) {
+    if (avb_persist_binding_armed(state)) {
+      state->clock_plan_check_due_us =
+          esp_timer_get_time() + AVB_CLOCK_PLAN_CHECK_DEFER_US;
+      avbinfo("codec clock plan check deferred %d s (persisted binding "
+              "armed for fast-connect)",
+              (int)(AVB_CLOCK_PLAN_CHECK_DEFER_US / 1000000LL));
+    } else {
+      avb_codec_validate_clock_plan(state);
+    }
+  }
+#endif
+
 #ifdef CONFIG_ESP_AVB_SUPERFAST_CONNECT
   /* Provisional playout from the restored bindings, before any
    * handshake completes (see avb_superfast_connect_start). */
@@ -1438,6 +1475,15 @@ static void avb_task(void *task_param) {
 
     // Send periodic messages such as announcing entity available, etc
     avb_periodic_send(state);
+
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+    /* Deferred codec clock-plan check (see the gate after persist load). */
+    if (state->clock_plan_check_due_us != 0 &&
+        esp_timer_get_time() >= state->clock_plan_check_due_us) {
+      state->clock_plan_check_due_us = 0;
+      avb_codec_validate_clock_plan(state);
+    }
+#endif
 
     // Sample AAF/CRF drift vs. CLOCK_PTP_SYSTEM at ~100 Hz (the call
     // itself self-rate-limits). Moved here so the 800 Hz RX handlers

@@ -85,6 +85,33 @@ Topology examples:
 AVB-specific knobs (stream VLAN, Class A/B PCP, MILAN compliance, codec
 selection) remain in this component's own Kconfig.
 
+### Codec clock plans
+
+Clocking is a codec property. Each codec in `avbcodec.c` carries a
+clock plan: for every sample rate it is offered at, the MCLK
+frequencies it can run that rate from, in preference order, plus any
+codec-private register row that must be programmed for the pair. The
+rates a codec advertises come from its plan (a rate with no row is not
+offered), the `allowed_sample_rates` policy in `avbconfig.h` narrows
+them, and a rate change keeps the MCLK already running whenever the new
+rate lists it, so the APLL and its converged trim survive the change.
+
+The plan is checked once per boot against the codec's MCLK ceiling and
+MCLK/BCLK floor, the I2S integer-divider rule and the APLL range; a
+candidate that fails is logged and skipped. When NVS restores a stream
+binding, the check is deferred 30 s so its console output cannot delay
+superfast connect.
+
+| Codec | Rate | MCLK candidates (fs multiple) |
+| --- | --- | --- |
+| ES8389 | 44.1 kHz | 11.2896 MHz (256) |
+| ES8389 | 48 kHz | 24.576 MHz (512), 18.432 MHz (384) |
+| ES8389 | 88.2 kHz | 11.2896 MHz (128) |
+| ES8389 | 96 kHz | 24.576 MHz (256) |
+| ES8389 | 192 kHz | 24.576 MHz (128) |
+| ES8311, ES8388 | 48 kHz | 18.432 MHz (384), 12.288 MHz (256) |
+| ES8311, ES8388 | 96 kHz | 24.576 MHz (256) |
+
 ## Tested with
 
 Targets:

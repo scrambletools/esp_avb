@@ -337,15 +337,42 @@ _Static_assert(
     AVB_MAX_NUM_OUTPUT_STREAMS <= AVB_PERSIST_MAX_OUTPUT_STREAMS,
     "AVB_MAX_NUM_OUTPUT_STREAMS exceeds AVB_PERSIST_MAX_OUTPUT_STREAMS");
 
+/* One row of a codec's clock plan: a sample rate and the MCLKs the
+ * codec can run it from, in preference order (0 ends the list). The
+ * matching codec_data entry is the codec-private register row that
+ * apply_clock programs for that (rate, MCLK) pair; NULL when the
+ * driver's own set_fs does the job. Rates are offered from this table:
+ * a rate with no row is not advertised. */
+#define AVB_CODEC_MCLK_CANDIDATES 2
+typedef struct {
+  uint32_t sample_rate_hz;
+  uint32_t mclk_hz[AVB_CODEC_MCLK_CANDIDATES];
+  const void *codec_data[AVB_CODEC_MCLK_CANDIDATES];
+} avb_codec_clock_plan_s;
+
+struct avb_state_s;
+
 /* Codec hardware capability. Codec-specific truth lives in avbcodec.c;
  * avbconfig.h policy filters are intersected with these capabilities during
  * AVB state initialization to produce the effective advertised capabilities. */
 typedef struct {
-  avb_sample_rates_s sample_rates;
   avb_bit_rates_s bit_rates;
   uint8_t max_input_channels;
   uint8_t max_output_channels;
   codec_control_range_s control_ranges;
+  /* Clocking. The plan is the codec's sample-rate truth (see
+   * avb_codec_plan_sample_rates); the limits feed the plan check
+   * (avb_codec_validate_clock_plan): highest MCLK the codec accepts,
+   * and the lowest MCLK/BCLK ratio proven on it (the ESP32-P4 I2S
+   * full-duplex slave warns below 4). */
+  const avb_codec_clock_plan_s *clock_plan;
+  uint8_t num_clock_plans;
+  uint32_t max_mclk_hz;
+  uint8_t min_mclk_bclk_ratio;
+  /* Program the codec's clock manager for (rate, MCLK) after set_fs,
+   * with the codec disabled. NULL when set_fs already covers it. */
+  esp_err_t (*apply_clock)(struct avb_state_s *state, uint32_t rate_hz,
+                           uint32_t mclk_hz, const void *codec_data);
 } avb_codec_caps_s;
 
 /* Default format */
@@ -703,6 +730,13 @@ typedef struct avb_state_s {
   bool codec_enabled;          // codec enabled
   const void *codec_if;        // codec interface (audio_codec_if_t *)
   const void *codec_ctrl_if;   // register access (audio_codec_ctrl_if_t *), NULL if unused
+  uint32_t codec_mclk_hz;      // MCLK the I2S master generates right now (0 before init)
+  /* Clock-plan check bookkeeping: bit (row * AVB_CODEC_MCLK_CANDIDATES
+   * + candidate) is set for a candidate the check rejected, so the MCLK
+   * selection skips it. due_us != 0 schedules a deferred check (boot
+   * with a persisted binding armed for fast-connect). */
+  uint32_t clock_plan_invalid_mask;
+  int64_t clock_plan_check_due_us;
 
   /* AECP control values */
   codec_control_range_s codec_ranges;        // codec-specific control ranges
@@ -1078,6 +1112,10 @@ void avb_stream_in_sample_drift(avb_state_s *state);
  * porting to a different SoC / to an external clock chip (e.g. Cirrus
  * CS2000) only touches avbpll.c. */
 int avb_pll_init(uint32_t nominal_mclk_hz);
+/* Whether the APLL can produce mclk_hz the way avb_pll_init would set
+ * it up; apll_hz receives the APLL frequency that would be programmed
+ * (0 on targets without an APLL, where the check passes). */
+bool avb_pll_mclk_derivable(uint32_t mclk_hz, uint32_t *apll_hz);
 void avb_pll_deinit(void);
 /* Preload the persisted media-clock trim (persist v4) — call after
  * avb_pll_init and before streams start. */
@@ -1138,6 +1176,21 @@ static inline int avb_stream_tx_addrs_snapshot(const avb_talker_stream_s *stream
 
 /* Codec functions */
 const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type);
+/* Sample rates the codec's clock plan offers, in plan order. */
+void avb_codec_plan_sample_rates(const avb_codec_caps_s *caps,
+                                 avb_sample_rates_s *out);
+/* MCLK to run `rate` from: the plan candidate equal to preferred_mclk_hz
+ * when the plan lists it (keeps the APLL and its trim across a rate
+ * change), else the first candidate the plan check has not rejected.
+ * 0 when the rate has no usable candidate. codec_data receives the
+ * matching codec-private row (may be NULL). */
+uint32_t avb_codec_select_mclk(const avb_state_s *state, uint32_t rate,
+                               uint32_t preferred_mclk_hz,
+                               const void **codec_data);
+/* Arithmetic check of every plan candidate against the codec limits,
+ * the I2S divider rule and the APLL range; logs one line per candidate
+ * and flags rejects in clock_plan_invalid_mask. No hardware access. */
+esp_err_t avb_codec_validate_clock_plan(avb_state_s *state);
 esp_err_t avb_config_i2s(avb_state_s *state);
 esp_err_t avb_config_codec(avb_state_s *state);
 /* Reconfigure I2S + codec to a new sample rate. Only valid while no

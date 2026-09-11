@@ -17,58 +17,114 @@
 #include "esp_codec_dev_defaults.h"
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
 #include <stdatomic.h>    /* media-clock byte counter in i2s_tx_on_sent_cb */
+#include <string.h>
 
 #define I2C_NUM (0)
-/* MCLK/fs multiple per sample rate. Two constraints meet here:
- * - ESP32-P4 I2S full duplex: the second channel (RX) runs as an
- *   internal slave off the master's BCLK, and the driver's measured
- *   minimum for a slave to sample correctly is MCLK/BCLK >= 4 (a TX
- *   slave would need 6). With 2 x 32-bit slots BCLK = 64 fs, so the
- *   multiple must be >= 256. The old 128 at 192 kHz gave ratio 2 and
- *   the driver's "data might be sampled incorrectly" warning.
- * - ES8389 (datasheet rev 6.0): MCLK <= 49.2 MHz, LRCK <= 192 kHz,
- *   SCLK <= 26 MHz at 3.3 V, ratios 32/50/64/100/128/192/200/256/384
- *   fs, DVDD 3.3 V for 192 kHz. In slave mode with use_mclk the codec
- *   derives its ratio from the clocks it sees; the esp_codec_dev
- *   coefficient table is bypassed (es8389.c set_fs), so table rows
- *   are not a constraint.
- * The multiple must (a) give an MCLK the ES8389 coeff table has a row
- * for at that rate, and (b) ideally keep MCLK/BCLK >= 4 for the P4
- * full-duplex RX slave (BCLK = 64 fs with 2x32-bit slots, so >= 256).
- * The codec table is sparse, so per rate:
- *   44.1 kHz -> 256 (11.2896 MHz, ratio 4)   clean
- *   48   kHz -> 512 (24.576  MHz, ratio 8)   clean, constant MCLK with 96/192
- *   88.2 kHz -> 128 (11.2896 MHz, ratio 2)   only row; ratio-2 warning
- *   96   kHz -> 256 (24.576  MHz, ratio 4)   clean
- *   192  kHz -> 128 (24.576  MHz, ratio 2)   only usable; ratio-2 warning
- * 48 kHz moved from 384x to 512x on 2026-09-09 (constant 24.576 MHz
- * across 48/96/192, the XMOS lib_tsn arrangement) after an 8-start
- * A/B at each multiple measured identical audio; both multiples share
- * an open defect where roughly half of RATE-CHANGE starts (never plain
- * reconnects) carry seconds-long episodes of 3-4 sample slot slips, so
- * that is not a property of the MCLK (see the bench notes). 176.4 kHz
- * has NO coeff row (any MCLK) so it is not offered. The
- * ratio-2 warning at 88.2/192 kHz is accepted: wire captures there are
- * intact once the ring is drained per packet and the row is programmed
- * (2026-09-08). 128/256 are not multiples of 3, so I2S runs 32-bit
- * slots (see slot_cfg). */
-#define AVB_MCLK_MULTIPLE_FOR_RATE(rate)                                       \
-  ((rate) <= 44100   ? 256                                                     \
-   : (rate) <= 48000 ? 512                                                     \
-   : (rate) <= 88200 ? 128                                                     \
-   : (rate) <= 96000 ? 256                                                     \
-                     : 128)
-#define AVB_MCLK_MULTIPLE                                                      \
-  AVB_MCLK_MULTIPLE_FOR_RATE(state->config.default_sample_rate)
+/* Clocking is a codec property, so it lives in each codec's clock plan
+ * below (avb_codec_clock_plan_s): the MCLKs a codec can run each rate
+ * from, in preference order. The I2S master derives BCLK = 64 fs from
+ * MCLK with an integer divider (2 x 32-bit slots, which also lifts the
+ * driver's multiple-of-3 rule for 24-bit slots), so every candidate is
+ * a multiple of 64 fs, and the APLL runs at MCLK x 2. Candidate order
+ * encodes the preferred family: a rate change keeps the MCLK already
+ * running whenever the new rate lists it, which is what lets the APLL
+ * and its converged trim survive the change (avb_audio_set_rate). The
+ * plan is checked once per boot (avb_codec_validate_clock_plan) and a
+ * candidate that fails is skipped from then on.
+ *
+ * ES8389 (datasheet rev 6.0): MCLK <= 49.2 MHz, LRCK <= 192 kHz. Its
+ * plan is the set of (rate, MCLK) pairs the esp_codec_dev coefficient
+ * table has a row for; 176.4 kHz has none, so it is not offered, and
+ * 192 kHz only runs at 128 fs (256 fs = 49.152 MHz silences the ADC).
+ * The ESP32-P4 full-duplex RX slave warns below MCLK/BCLK 4; ratio 2
+ * (88.2 and 192 kHz) is proven clean on the wire, and half of the
+ * RATE-CHANGE starts carry the slot-slip episodes at every multiple
+ * tried, so that defect is not a property of the MCLK (bench notes).
+ * 48 kHz prefers 24.576 MHz (512 fs): constant MCLK across 48/96/192
+ * kHz, the XMOS lib_tsn arrangement, A/B-tested equal to 384 fs. */
 
 #define TAG "AVB-CODEC"
 
-/* Defined with the ES8389 factory below; used by the rate-change path. */
-static esp_err_t es8389_apply_clock_row(avb_state_s *state, uint32_t rate_hz,
-                                        uint32_t mclk_hz);
+/* ES8389 clock-manager rows for the (MCLK, LRCK) pairs this driver
+ * generates, copied from esp_codec_dev's es8389.c coefficient table
+ * (Reg0x04..0x0A, 0x0F, 0x11, 0x21, 0x22, 0x26, 0x30, 0x41, 0x42, 0x43,
+ * 0xF0, 0xF1, 0x16, 0x18, 0x19). With use_mclk the driver's set_fs
+ * skips that table and leaves the codec's auto clock mode in charge,
+ * which is fine through 96 kHz but at 192 kHz the ADC keeps running at
+ * single speed and repeats every sample (wire capture: consecutive
+ * samples in near-identical pairs, a 96 kHz signal on a 192 kHz frame
+ * clock). Programming the row the driver itself would use puts the
+ * modulator and oversampling ratios where the rate needs them. */
+typedef struct {
+  uint32_t rate_hz;
+  uint32_t mclk_hz;
+  uint8_t reg[21];
+} es8389_clock_row_s;
+
+static const es8389_clock_row_s s_es8389_row_44k1_at_11m = {
+    44100, 11289600,
+    {0x01, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80,
+     0x40, 0x00, 0x1F, 0x7F, 0xBF, 0xC0, 0x7F,
+     0x7F, 0x00, 0x12, 0x00, 0x35, 0x91, 0x28}};
+static const es8389_clock_row_s s_es8389_row_48k_at_18m = {
+    48000, 18432000,
+    {0x02, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80,
+     0x40, 0x00, 0x1F, 0x7F, 0xBF, 0xC0, 0x7F,
+     0x7F, 0x00, 0x12, 0x00, 0x35, 0x91, 0x28}};
+static const es8389_clock_row_s s_es8389_row_48k_at_24m = {
+    48000, 24576000,
+    {0x03, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80,
+     0xC0, 0x00, 0x1F, 0x7F, 0xBF, 0xC0, 0x7F,
+     0x7F, 0x00, 0x12, 0x00, 0x35, 0x91, 0x28}};
+static const es8389_clock_row_s s_es8389_row_88k2_at_11m = {
+    88200, 11289600,
+    {0x00, 0x50, 0x00, 0xC0, 0x10, 0xC1, 0x80,
+     0x40, 0x00, 0x9F, 0x7F, 0xBF, 0xC0, 0x7F,
+     0x7F, 0x80, 0x12, 0xC0, 0x32, 0x89, 0x25}};
+static const es8389_clock_row_s s_es8389_row_96k_at_24m = {
+    96000, 24576000,
+    {0x00, 0x40, 0x00, 0xC0, 0x10, 0xC1, 0x80,
+     0xC0, 0x00, 0x9F, 0x7F, 0xBF, 0xC0, 0x7F,
+     0x7F, 0x80, 0x12, 0xC0, 0x35, 0x91, 0x28}};
+static const es8389_clock_row_s s_es8389_row_192k_at_24m = {
+    192000, 24576000,
+    {0x00, 0x50, 0x00, 0xC0, 0x18, 0xC1, 0x81,
+     0xC0, 0x00, 0x8F, 0x7F, 0xEF, 0xC0, 0x3F,
+     0x7F, 0x80, 0x12, 0xC0, 0x3F, 0xF9, 0x3F}};
+
+/* Program the codec's clock manager for (rate, MCLK); defined with the
+ * ES8389 factory below. */
+static esp_err_t es8389_apply_clock(avb_state_s *state, uint32_t rate_hz,
+                                    uint32_t mclk_hz, const void *codec_data);
+
+/* ES8389 clock plan: every (rate, MCLK) pair above. 48 kHz prefers the
+ * 24.576 MHz family shared with 96/192 kHz. */
+static const avb_codec_clock_plan_s s_es8389_clock_plan[] = {
+    {44100, {11289600, 0}, {&s_es8389_row_44k1_at_11m, NULL}},
+    {48000,
+     {24576000, 18432000},
+     {&s_es8389_row_48k_at_24m, &s_es8389_row_48k_at_18m}},
+    {88200, {11289600, 0}, {&s_es8389_row_88k2_at_11m, NULL}},
+    {96000, {24576000, 0}, {&s_es8389_row_96k_at_24m, NULL}},
+    {192000, {24576000, 0}, {&s_es8389_row_192k_at_24m, NULL}},
+};
+
+/* ES8311 / ES8388: the esp_codec_dev drivers derive the codec's own
+ * dividers from (MCLK, fs) in set_fs, so these plans carry no rows.
+ * Candidates are the driver coefficient rows that keep MCLK/BCLK at 4
+ * or better; 384 fs at 48 kHz is the multiple both ran on before the
+ * plan existed. Not re-verified on hardware since. */
+static const avb_codec_clock_plan_s s_es8311_clock_plan[] = {
+    {48000, {18432000, 12288000}, {NULL, NULL}},
+    {96000, {24576000, 0}, {NULL, NULL}},
+};
+static const avb_codec_clock_plan_s s_es8388_clock_plan[] = {
+    {48000, {18432000, 12288000}, {NULL, NULL}},
+    {96000, {24576000, 0}, {NULL, NULL}},
+};
+#define AVB_PLAN_ROWS(plan) (sizeof(plan) / sizeof((plan)[0]))
 
 static const avb_codec_caps_s s_es8311_caps = {
-    .sample_rates = {.sample_rates = {48000, 96000}, .num_rates = 2},
     .bit_rates = {.bit_rates = {24}, .num_rates = 1},
     .max_input_channels = 1,
     .max_output_channels = 1,
@@ -80,12 +136,16 @@ static const avb_codec_caps_s s_es8311_caps = {
                        .gain_max_tenth_db = 420,
                        .gain_step_tenth_db = 60,
                        .gain_default_tenth_db = 60},
+    .clock_plan = s_es8311_clock_plan,
+    .num_clock_plans = AVB_PLAN_ROWS(s_es8311_clock_plan),
+    .max_mclk_hz = 24576000, /* highest MCLK in the driver's table */
+    .min_mclk_bclk_ratio = 4,
+    .apply_clock = NULL,
 };
 
 /* ES8388: 24-bit, max 96 kHz (datasheet); 2-ch ADC/DAC. DAC digital
  * volume -96..0 dB (0.5 dB step), mic PGA 0..24 dB (3 dB step). */
 static const avb_codec_caps_s s_es8388_caps = {
-    .sample_rates = {.sample_rates = {48000, 96000}, .num_rates = 2},
     .bit_rates = {.bit_rates = {24}, .num_rates = 1},
     .max_input_channels = 2,
     .max_output_channels = 2,
@@ -97,14 +157,17 @@ static const avb_codec_caps_s s_es8388_caps = {
                        .gain_max_tenth_db = 240,
                        .gain_step_tenth_db = 30,
                        .gain_default_tenth_db = 90},
+    .clock_plan = s_es8388_clock_plan,
+    .num_clock_plans = AVB_PLAN_ROWS(s_es8388_clock_plan),
+    .max_mclk_hz = 24576000, /* 256 fs at its 96 kHz ceiling */
+    .min_mclk_bclk_ratio = 4,
+    .apply_clock = NULL,
 };
 
-/* ES8389: 24-bit, up to 192 kHz; 2-ch ADC/DAC. DAC digital volume
+/* ES8389: 24-bit, up to 192 kHz (rates per its clock plan); 2-ch ADC/DAC. DAC digital volume
  * -95.5..+32 dB (0.5 dB step) and mic PGA 0..36.5 dB (~3 dB step) per
  * the esp_codec_dev es8389 driver vol_range and PGA gain table. */
 static const avb_codec_caps_s s_es8389_caps = {
-    .sample_rates = {.sample_rates = {44100, 48000, 88200, 96000, 192000},
-                     .num_rates = 5},
     .bit_rates = {.bit_rates = {24}, .num_rates = 1},
     .max_input_channels = 2,
     .max_output_channels = 2,
@@ -116,6 +179,11 @@ static const avb_codec_caps_s s_es8389_caps = {
                        .gain_max_tenth_db = 365,
                        .gain_step_tenth_db = 30,
                        .gain_default_tenth_db = 90},
+    .clock_plan = s_es8389_clock_plan,
+    .num_clock_plans = AVB_PLAN_ROWS(s_es8389_clock_plan),
+    .max_mclk_hz = 49200000, /* datasheet rev 6.0 */
+    .min_mclk_bclk_ratio = 2, /* ratio 2 proven at 88.2 and 192 kHz */
+    .apply_clock = es8389_apply_clock,
 };
 
 int16_t avb_codec_quantize_tenth_db(const codec_control_range_s *ranges,
@@ -158,13 +226,124 @@ const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type) {
   }
 }
 
+/* The plan row for sample_rate, with its index for the reject mask. */
+static const avb_codec_clock_plan_s *
+codec_plan_for_rate(const avb_codec_caps_s *caps, uint32_t sample_rate,
+                    uint8_t *row_index) {
+  for (uint8_t i = 0; i < caps->num_clock_plans; i++) {
+    if (caps->clock_plan[i].sample_rate_hz == sample_rate) {
+      if (row_index)
+        *row_index = i;
+      return &caps->clock_plan[i];
+    }
+  }
+  return NULL;
+}
+
 static bool codec_caps_support_sample_rate(const avb_codec_caps_s *caps,
                                            uint32_t sample_rate) {
-  for (uint8_t i = 0; i < caps->sample_rates.num_rates; i++) {
-    if (caps->sample_rates.sample_rates[i] == sample_rate)
-      return true;
+  return codec_plan_for_rate(caps, sample_rate, NULL) != NULL;
+}
+
+void avb_codec_plan_sample_rates(const avb_codec_caps_s *caps,
+                                 avb_sample_rates_s *out) {
+  memset(out, 0, sizeof(*out));
+  size_t max_rates = sizeof(out->sample_rates) / sizeof(out->sample_rates[0]);
+  for (uint8_t i = 0; i < caps->num_clock_plans && out->num_rates < max_rates;
+       i++) {
+    out->sample_rates[out->num_rates++] = caps->clock_plan[i].sample_rate_hz;
   }
-  return false;
+}
+
+uint32_t avb_codec_select_mclk(const avb_state_s *state, uint32_t rate,
+                               uint32_t preferred_mclk_hz,
+                               const void **codec_data) {
+  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
+  uint8_t row_index = 0;
+  const avb_codec_clock_plan_s *plan =
+      caps ? codec_plan_for_rate(caps, rate, &row_index) : NULL;
+  if (codec_data)
+    *codec_data = NULL;
+  if (!plan)
+    return 0;
+  int chosen = -1;
+  for (int candidate = 0; candidate < AVB_CODEC_MCLK_CANDIDATES; candidate++) {
+    uint32_t mclk_hz = plan->mclk_hz[candidate];
+    if (mclk_hz == 0)
+      break;
+    uint32_t bit_index =
+        (uint32_t)row_index * AVB_CODEC_MCLK_CANDIDATES + (uint32_t)candidate;
+    if (bit_index < 32 && (state->clock_plan_invalid_mask & (1u << bit_index)))
+      continue;
+    if (mclk_hz == preferred_mclk_hz) {
+      chosen = candidate;
+      break;
+    }
+    if (chosen < 0)
+      chosen = candidate;
+  }
+  if (chosen < 0)
+    return 0;
+  if (codec_data)
+    *codec_data = plan->codec_data[chosen];
+  return plan->mclk_hz[chosen];
+}
+
+esp_err_t avb_codec_validate_clock_plan(avb_state_s *state) {
+  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
+  if (!caps || !caps->clock_plan)
+    return ESP_ERR_INVALID_STATE;
+  const uint32_t bclk_per_fs = 2u * 32u; /* stereo 32-bit slots */
+  int rejected = 0;
+  state->clock_plan_invalid_mask = 0;
+  for (uint8_t row = 0; row < caps->num_clock_plans; row++) {
+    const avb_codec_clock_plan_s *plan = &caps->clock_plan[row];
+    uint32_t bclk_hz = plan->sample_rate_hz * bclk_per_fs;
+    for (int candidate = 0; candidate < AVB_CODEC_MCLK_CANDIDATES; candidate++) {
+      uint32_t mclk_hz = plan->mclk_hz[candidate];
+      if (mclk_hz == 0)
+        break;
+      uint32_t apll_hz = 0;
+      const char *reason = NULL;
+      if (mclk_hz % bclk_hz != 0)
+        reason = "MCLK/BCLK is not an integer";
+      else if (mclk_hz / bclk_hz < caps->min_mclk_bclk_ratio)
+        reason = "MCLK/BCLK below the codec floor";
+      else if (mclk_hz > caps->max_mclk_hz)
+        reason = "MCLK above the codec ceiling";
+      else if (caps->apply_clock && !plan->codec_data[candidate])
+        reason = "no codec clock row";
+      else if (!avb_pll_mclk_derivable(mclk_hz, &apll_hz))
+        reason = "APLL cannot produce this MCLK";
+      bool running = mclk_hz == state->codec_mclk_hz &&
+                     plan->sample_rate_hz == state->config.default_sample_rate;
+      uint32_t bit_index =
+          (uint32_t)row * AVB_CODEC_MCLK_CANDIDATES + (uint32_t)candidate;
+      if (reason) {
+        rejected++;
+        if (bit_index < 32)
+          state->clock_plan_invalid_mask |= 1u << bit_index;
+        ESP_LOGE(TAG, "clock plan: %lu Hz from MCLK %lu Hz (%lu fs) rejected: %s%s",
+                 (unsigned long)plan->sample_rate_hz, (unsigned long)mclk_hz,
+                 (unsigned long)(mclk_hz / plan->sample_rate_hz), reason,
+                 running ? " (currently running)" : "");
+      } else {
+        ESP_LOGI(TAG,
+                 "clock plan: %lu Hz from MCLK %lu Hz (%lu fs, MCLK/BCLK %lu, "
+                 "APLL %lu Hz)%s",
+                 (unsigned long)plan->sample_rate_hz, (unsigned long)mclk_hz,
+                 (unsigned long)(mclk_hz / plan->sample_rate_hz),
+                 (unsigned long)(mclk_hz / bclk_hz), (unsigned long)apll_hz,
+                 running ? " active" : "");
+      }
+    }
+  }
+  if (rejected) {
+    ESP_LOGW(TAG, "clock plan: %d candidate(s) rejected, see above", rejected);
+    return ESP_FAIL;
+  }
+  ESP_LOGI(TAG, "clock plan: all %u rates check out", caps->num_clock_plans);
+  return ESP_OK;
 }
 
 /* TX DMA completion callback — accumulates DAC-consumed bytes for the
@@ -194,6 +373,15 @@ static IRAM_ATTR bool i2s_rx_on_recv_cb(i2s_chan_handle_t handle,
  * @param state: AVB state
  */
 esp_err_t avb_config_i2s(avb_state_s *state) {
+  /* First plan candidate for the boot rate; later rate changes prefer
+   * whatever MCLK is already running (avb_codec_select_mclk). */
+  state->codec_mclk_hz = avb_codec_select_mclk(
+      state, state->config.default_sample_rate, 0, NULL);
+  if (state->codec_mclk_hz == 0) {
+    ESP_LOGE(TAG, "No clock plan for %lu Hz on this codec",
+             (unsigned long)state->config.default_sample_rate);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
 
   // Create an I2S channel and set the handles in the state
   i2s_chan_config_t chan_cfg =
@@ -235,7 +423,8 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
                   },
           },
   };
-  std_cfg.clk_cfg.mclk_multiple = AVB_MCLK_MULTIPLE;
+  std_cfg.clk_cfg.mclk_multiple =
+      state->codec_mclk_hz / state->config.default_sample_rate;
   /* Use APLL as the clock source so the Milan media-clock PLL
    * (avb_mclk / avb_mclk_apll) can retune MCLK with sub-ppm precision
    * without having to disable/reconfigure the I2S channel.
@@ -300,9 +489,7 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
       state->config.default_sample_rate * 2u * 4u; /* 24-in-32 slots */
 
   /* Initialise the media-clock PLL now that I2S (and hence APLL) is up */
-  uint32_t nominal_mclk =
-      state->config.default_sample_rate * AVB_MCLK_MULTIPLE;
-  if (avb_pll_init(nominal_mclk) != 0) {
+  if (avb_pll_init(state->codec_mclk_hz) != 0) {
     avbwarn("PLL init failed (sample clock will free-run)");
   }
 
@@ -321,8 +508,13 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
   if (rate == state->config.default_sample_rate)
     return ESP_OK;
   const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
-  if (!caps || !codec_caps_support_sample_rate(caps, rate)) {
-    ESP_LOGE(TAG, "Rate change to %lu Hz: not supported by codec",
+  const void *codec_clock_data = NULL;
+  uint32_t mclk_hz =
+      caps ? avb_codec_select_mclk(state, rate, state->codec_mclk_hz,
+                                   &codec_clock_data)
+           : 0;
+  if (mclk_hz == 0) {
+    ESP_LOGE(TAG, "Rate change to %lu Hz: no usable clock plan on this codec",
              (unsigned long)rate);
     return ESP_ERR_NOT_SUPPORTED;
   }
@@ -339,10 +531,8 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
   ESP_RETURN_ON_ERROR(i2s_channel_disable(state->i2s_rx_handle), TAG,
                       "i2s rx disable");
 
-  uint32_t mclk_multiple = AVB_MCLK_MULTIPLE_FOR_RATE(rate);
-  uint32_t old_rate = state->config.default_sample_rate;
-  bool same_mclk = rate * mclk_multiple ==
-                   old_rate * AVB_MCLK_MULTIPLE_FOR_RATE(old_rate);
+  uint32_t mclk_multiple = mclk_hz / rate;
+  bool same_mclk = mclk_hz == state->codec_mclk_hz;
   i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
   clk_cfg.mclk_multiple = mclk_multiple;
 #if SOC_CLK_APLL_SUPPORTED
@@ -351,8 +541,8 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
    * channel at a time can never move the APLL to the new rate. Park
    * both channels on XTAL at a low, always-derivable MCLK first so the
    * APLL is fully released, then re-acquire it at the new rate.
-   * Within a rate family the MCLK does not change (24.576 MHz for
-   * 48/96/192 kHz, 11.2896 MHz for 44.1/88.2 kHz): the driver is
+   * When the plan keeps the running MCLK (24.576 MHz across 48/96/192
+   * kHz, 11.2896 MHz across 44.1/88.2 kHz on the ES8389) the driver is
    * asked for the APLL frequency it already records, so it leaves the
    * coefficients (and the servo's trim) alone; only the BCLK divider
    * and the codec row move, and the park is skipped. */
@@ -388,7 +578,11 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
     ESP_LOGE(TAG, "Rate change: codec set_fs failed");
     return ESP_FAIL;
   }
-  es8389_apply_clock_row(state, rate, rate * mclk_multiple);
+  if (caps->apply_clock &&
+      caps->apply_clock(state, rate, mclk_hz, codec_clock_data) != ESP_OK) {
+    ESP_LOGE(TAG, "Rate change: codec clock programming failed");
+    return ESP_FAIL;
+  }
   if (cif->enable && cif->enable(cif, true) != 0) {
     ESP_LOGE(TAG, "Rate change: codec re-enable failed");
     return ESP_FAIL;
@@ -404,6 +598,7 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
    * re-runs the full path instead of short-circuiting on the rate
    * compare at the top and reporting success with stale hardware. */
   state->config.default_sample_rate = rate;
+  state->codec_mclk_hz = mclk_hz;
 
   /* Mirror avb_config_i2s's media-clock bookkeeping and re-seed the
    * PLL at the new nominal MCLK. */
@@ -417,7 +612,7 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
             (unsigned long)rate);
     return ESP_OK;
   }
-  if (avb_pll_init(rate * mclk_multiple) != 0) {
+  if (avb_pll_init(mclk_hz) != 0) {
     avbwarn("Rate change: PLL re-init failed (sample clock will free-run)");
   } else {
     /* The re-init put the APLL back at nominal; the servo still holds
@@ -435,42 +630,6 @@ typedef struct {
   const audio_codec_ctrl_if_t *ctrl_if; /* for writes the driver does not do */
 } codec_factory_result_s;
 
-/* ES8389 clock-manager rows for the (MCLK, LRCK) pairs this driver
- * generates, copied from esp_codec_dev's es8389.c coefficient table
- * (Reg0x04..0x0A, 0x0F, 0x11, 0x21, 0x22, 0x26, 0x30, 0x41, 0x42, 0x43,
- * 0xF0, 0xF1, 0x16, 0x18, 0x19). With use_mclk the driver's set_fs
- * skips that table and leaves the codec's auto clock mode in charge,
- * which is fine through 96 kHz but at 192 kHz the ADC keeps running at
- * single speed and repeats every sample (wire capture: consecutive
- * samples in near-identical pairs, a 96 kHz signal on a 192 kHz frame
- * clock). Programming the row the driver itself would use puts the
- * modulator and oversampling ratios where the rate needs them. */
-typedef struct {
-  uint32_t rate_hz;
-  uint32_t mclk_hz;
-  uint8_t reg[21];
-} es8389_clock_row_s;
-
-static const es8389_clock_row_s s_es8389_clock_rows[] = {
-    {44100, 11289600, {0x01, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0x40, 0x00, 0x1F,
-                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
-                       0x28}},
-    {48000, 18432000, {0x02, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0x40, 0x00, 0x1F,
-                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
-                       0x28}},
-    {48000, 24576000, {0x03, 0x41, 0x04, 0xD0, 0x10, 0xD1, 0x80, 0xC0, 0x00, 0x1F,
-                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x00, 0x12, 0x00, 0x35, 0x91,
-                       0x28}},
-    {88200, 11289600, {0x00, 0x50, 0x00, 0xC0, 0x10, 0xC1, 0x80, 0x40, 0x00, 0x9F,
-                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x80, 0x12, 0xC0, 0x32, 0x89,
-                       0x25}},
-    {96000, 24576000, {0x00, 0x40, 0x00, 0xC0, 0x10, 0xC1, 0x80, 0xC0, 0x00, 0x9F,
-                       0x7F, 0xBF, 0xC0, 0x7F, 0x7F, 0x80, 0x12, 0xC0, 0x35, 0x91,
-                       0x28}},
-    {192000, 24576000, {0x00, 0x50, 0x00, 0xC0, 0x18, 0xC1, 0x81, 0xC0, 0x00, 0x8F,
-                        0x7F, 0xEF, 0xC0, 0x3F, 0x7F, 0x80, 0x12, 0xC0, 0x3F, 0xF9,
-                        0x3F}},
-};
 
 static int es8389_reg_write(const audio_codec_ctrl_if_t *ctrl, uint8_t reg,
                             uint8_t value) {
@@ -488,25 +647,18 @@ static int es8389_reg_update(const audio_codec_ctrl_if_t *ctrl, uint8_t reg,
   return ctrl->write_reg(ctrl, reg, 1, &data, 1);
 }
 
-/* Apply the clock row for rate_hz at the MCLK we generate, mirroring
- * es8389_config_sample's register sequence. Call with the codec
- * disabled (before enable), after set_fs. */
-static esp_err_t es8389_apply_clock_row(avb_state_s *state, uint32_t rate_hz,
-                                        uint32_t mclk_hz) {
+/* avb_codec_caps_s::apply_clock for the ES8389: write the plan's row
+ * for (rate_hz, mclk_hz), mirroring es8389_config_sample's register
+ * sequence. Call with the codec disabled (before enable), after set_fs. */
+static esp_err_t es8389_apply_clock(avb_state_s *state, uint32_t rate_hz,
+                                    uint32_t mclk_hz, const void *codec_data) {
   const audio_codec_ctrl_if_t *ctrl =
       (const audio_codec_ctrl_if_t *)state->codec_ctrl_if;
-  if (state->config.codec_type != avb_codec_type_es8389 || !ctrl)
-    return ESP_OK;
-  const es8389_clock_row_s *row = NULL;
-  for (size_t i = 0; i < sizeof(s_es8389_clock_rows) / sizeof(s_es8389_clock_rows[0]); i++) {
-    if (s_es8389_clock_rows[i].rate_hz == rate_hz &&
-        s_es8389_clock_rows[i].mclk_hz == mclk_hz) {
-      row = &s_es8389_clock_rows[i];
-      break;
-    }
-  }
-  if (!row) {
-    ESP_LOGW(TAG, "ES8389: no clock row for %lu Hz at %lu Hz MCLK, auto mode",
+  const es8389_clock_row_s *row = (const es8389_clock_row_s *)codec_data;
+  if (!ctrl)
+    return ESP_ERR_INVALID_STATE;
+  if (!row || row->rate_hz != rate_hz || row->mclk_hz != mclk_hz) {
+    ESP_LOGE(TAG, "ES8389: no clock row for %lu Hz at %lu Hz MCLK",
              (unsigned long)rate_hz, (unsigned long)mclk_hz);
     return ESP_ERR_NOT_FOUND;
   }
@@ -561,7 +713,7 @@ static esp_err_t codec_factory_es8311(avb_state_s *state,
       .pa_pin = state->config.codec_pins.pa,
       .pa_reverted = state->config.codec_pins.pa_reverted,
       .use_mclk = true,
-      .mclk_div = AVB_MCLK_MULTIPLE,
+      .mclk_div = state->codec_mclk_hz / state->config.default_sample_rate,
   };
   out->codec_if = es8311_codec_new(&cfg);
   if (!out->codec_if) {
@@ -624,8 +776,9 @@ static esp_err_t codec_factory_es8389(avb_state_s *state,
   /* The hat feeds an external MCLK from the P4 (GPIO16), so use_mclk=true.
    * That makes the driver run off the provided MCLK in slave mode and skip
    * its internal MCLK=fs*bits*4 coefficient path (es8389.c set_fs), which
-   * assumes a different ratio than our 384x clock. mclk_div carries the
-   * actual MCLK/LRCK ratio. */
+   * assumes a different ratio than the plan's MCLK. mclk_div carries the
+   * actual MCLK/LRCK ratio; the clock row itself is applied through
+   * apply_clock. */
   es8389_codec_cfg_t cfg = {
       .ctrl_if = ctrl,
       .gpio_if = gpio_if,
@@ -634,7 +787,7 @@ static esp_err_t codec_factory_es8389(avb_state_s *state,
       .pa_reverted = state->config.codec_pins.pa_reverted,
       .master_mode = false,
       .use_mclk = true,
-      .mclk_div = AVB_MCLK_MULTIPLE,
+      .mclk_div = state->codec_mclk_hz / state->config.default_sample_rate,
   };
   out->codec_if = es8389_codec_new(&cfg);
   if (!out->codec_if) {
@@ -715,7 +868,7 @@ esp_err_t avb_config_codec(avb_state_s *state) {
       .bits_per_sample = 32,
       .channel = 2,
       .sample_rate = state->config.default_sample_rate,
-      .mclk_multiple = AVB_MCLK_MULTIPLE,
+      .mclk_multiple = state->codec_mclk_hz / state->config.default_sample_rate,
   };
   if (result.codec_if->set_fs &&
       result.codec_if->set_fs(result.codec_if, &fs) != 0) {
@@ -723,8 +876,18 @@ esp_err_t avb_config_codec(avb_state_s *state) {
     return ESP_FAIL;
   }
   state->codec_ctrl_if = result.ctrl_if;
-  es8389_apply_clock_row(state, state->config.default_sample_rate,
-                         state->config.default_sample_rate * AVB_MCLK_MULTIPLE);
+  if (caps->apply_clock) {
+    const void *codec_clock_data = NULL;
+    uint32_t mclk_hz =
+        avb_codec_select_mclk(state, state->config.default_sample_rate,
+                              state->codec_mclk_hz, &codec_clock_data);
+    if (mclk_hz != state->codec_mclk_hz ||
+        caps->apply_clock(state, state->config.default_sample_rate, mclk_hz,
+                          codec_clock_data) != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to program codec clocks");
+      return ESP_FAIL;
+    }
+  }
   if (result.codec_if->enable &&
       result.codec_if->enable(result.codec_if, true) != 0) {
     ESP_LOGE(TAG, "Failed to enable codec");
