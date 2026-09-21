@@ -2667,7 +2667,7 @@ void avb_stream_in_print_diag(void) {
     uint8_t snap[12];
     for (int i = 0; i < 12; i++)
       snap[i] = ctx->ring.buf[(t + i) & mask];
-    avbinfo("STREAM-RING tail: %02x%02x%02x %02x%02x%02x | %02x%02x%02x %02x%02x%02x",
+    avbdebug("STREAM-RING tail: %02x%02x%02x %02x%02x%02x | %02x%02x%02x %02x%02x%02x",
             snap[0], snap[1], snap[2], snap[3], snap[4], snap[5], snap[6],
             snap[7], snap[8], snap[9], snap[10], snap[11]);
   }
@@ -2760,7 +2760,7 @@ void avb_stream_out_print_diag(void) {
             (long)pll_min, (long)pll_max);
   }
   if (rem_has_sample) {
-    avbinfo("  STREAM-OUT-rem: min=%ldns max=%ldns",
+    avbdebug("  STREAM-OUT-rem: min=%ldns max=%ldns",
             (long)rem_min, (long)rem_max);
   }
 

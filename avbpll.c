@@ -603,7 +603,7 @@ void avb_pll_print_stats(avb_state_s *state) {
                                : 0;
   int32_t target_centippm =
       (int32_t)(((int64_t)state->media_clock.pll_target_ppm_q16 * 100) >> 16);
-  avbinfo("MCLK: crf n=%lu drift=%lldns mean=%ldns min=%ldns max=%ldns | "
+  avbdebug("MCLK: crf n=%lu drift=%lldns mean=%ldns min=%ldns max=%ldns | "
           "stream n=%lu drift=%ldns mean=%ldns min=%ldns max=%ldns | "
           "pll inst=%ld.%02ld cumul=%ld.%02ld applied=%ld.%02ld "
           "tgt=%ld.%02ld hw=%ld ppm ref=%s",

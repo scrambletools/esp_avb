@@ -254,7 +254,7 @@ static void avb_cpu_stats_tick(void) {
   size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
   size_t heap_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
   size_t heap_min_ever = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
-  avbinfo("  ====> HEAP free=%u largest=%u min_ever=%u",
+  avbdebug("  ====> HEAP free=%u largest=%u min_ever=%u",
           (unsigned)heap_free, (unsigned)heap_largest, (unsigned)heap_min_ever);
 
   /* EMAC DMA hardware missed-frame counter. missed_fc counts frames the

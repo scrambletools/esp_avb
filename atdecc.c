@@ -2952,7 +2952,7 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     default: {
       /* IEEE 1722.1-2021 §9.2.1.3.1.4: unhandled AEM commands must be reflected
        * back with NOT_IMPLEMENTED status rather than silently dropped */
-      avbinfo("AECP: unhandled AEM command 0x%04x, returning NOT_IMPLEMENTED",
+      avbdebug("AECP: unhandled AEM command 0x%04x, returning NOT_IMPLEMENTED",
               msg->basic.aem.command_type);
       struct timespec ts;
       uint16_t cdl =
@@ -2998,7 +2998,7 @@ int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
   case acmp_msg_type_connect_rx_command:
     if (memcmp(msg->listener_entity_id, state->own_entity.summary.entity_id,
                UNIQUE_ID_LEN) != 0) {
-      avbinfo("Ignoring ACMP Connect RX Command for different listener");
+      avbdebug("Ignoring ACMP Connect RX Command for different listener");
       break;
     }
     avb_process_acmp_connect_rx_command(state, msg, false, false);
@@ -3014,7 +3014,7 @@ int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
   case acmp_msg_type_connect_tx_command:
     if (memcmp(msg->talker_entity_id, state->own_entity.summary.entity_id,
                UNIQUE_ID_LEN) != 0) {
-      avbinfo("Ignoring ACMP Connect TX Command for different talker");
+      avbdebug("Ignoring ACMP Connect TX Command for different talker");
       break;
     }
     avb_process_acmp_connect_tx_command(state, msg, false);
@@ -3022,7 +3022,7 @@ int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
   case acmp_msg_type_connect_tx_response:
     if (memcmp(msg->listener_entity_id, state->own_entity.summary.entity_id,
                UNIQUE_ID_LEN) != 0) {
-      avbinfo("Ignoring ACMP Connect TX Response for different listener");
+      avbdebug("Ignoring ACMP Connect TX Response for different listener");
       break;
     }
     avb_process_acmp_connect_tx_response(state, msg, false);
@@ -3112,7 +3112,7 @@ int avb_send_acmp_command(avb_state_s *state, acmp_msg_type_t msg_type,
     avb_add_inflight_command(state, (atdecc_command_u *)command, false);
   }
 
-  avbinfo("Sent %s%s", get_acmp_message_type_name(msg_type),
+  avbdebug("Sent %s%s", get_acmp_message_type_name(msg_type),
           track_inflight ? "" : " (best-effort)");
   return ret;
 }
@@ -3143,7 +3143,7 @@ int avb_send_acmp_response(avb_state_s *state, acmp_msg_type_t msg_type,
     avberr("Failed to send %s (error: %d)",
            get_acmp_message_type_name(msg_type), errno);
   }
-  avbinfo("Sent %s", get_acmp_message_type_name(msg_type));
+  avbdebug("Sent %s", get_acmp_message_type_name(msg_type));
   return ret;
 }
 
@@ -3537,7 +3537,7 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
     // if succcessful connect tx response then connect the listener
     if (response->header.status_valtime == acmp_status_success) {
       status = avb_connect_listener(state, response);
-      avbinfo("ConnTX rsp: listener_uid=%d, connect_status=%d", listener_uid,
+      avbdebug("ConnTX rsp: listener_uid=%d, connect_status=%d", listener_uid,
               status);
       start_stream_in = status == acmp_status_success && !was_connected;
       if (status == acmp_status_success && was_connected) {
@@ -3552,7 +3552,7 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
           avb_stop_stream_in(state, listener_uid);
           start_stream_in = true;
         } else {
-          avbinfo("ConnTX rsp: listener_uid=%d already connected; "
+          avbdebug("ConnTX rsp: listener_uid=%d already connected; "
                   "keeping stream-in", listener_uid);
         }
       }
