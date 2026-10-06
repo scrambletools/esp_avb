@@ -10,6 +10,9 @@
  */
 
 #include "avb.h"
+#include "ptp_status_path.h"
+_Static_assert(AECP_MAX_AS_PATH_COUNT >= PTP_PATH_TRACE_MAX_CLOCKS + 1,
+               "AS path response must hold the received path plus this clock");
 #include "esp_timer.h" /* connected-listener liveness stamps */
 #include <stddef.h>    /* offsetof */
 
@@ -43,7 +46,7 @@ int avb_send_adp_entity_available(avb_state_s *state) {
   msg.header.status_valtime = 10; // valid time: 20 seconds (Milan v1.3)
   msg.header.control_data_len = body_size;
   memcpy(&msg.entity, &state->own_entity.summary, sizeof(avb_entity_summary_s));
-  memcpy(msg.gptp_btc_id, state->ptp_status.clock_source_info.btc_id, 8);
+  memcpy(msg.gptp_btc_id, ptpd_status_source(&state->ptp_status)->btc_id, 8);
   msg.gptp_domain_num = 0;
   uint16_t current_config_index = 0;
   uint16_t identify_control_index = 0;
@@ -537,18 +540,19 @@ int avb_send_aecp_rsp_read_descr_stream(avb_state_s *state,
 
 /* Update AVB interface descriptor with current PTP status */
 void avb_update_avb_interface_from_ptp(avb_state_s *state) {
+  const clock_info_s *source = ptpd_status_source(&state->ptp_status);
   memcpy(state->avb_interface.clock_identity,
          state->ptp_status.own_identity_info.id, sizeof(unique_id_t));
   state->avb_interface.priority1 =
-      state->ptp_status.clock_source_info.priority1;
+      source->priority1;
   state->avb_interface.clock_class =
-      state->ptp_status.clock_source_info.clockclass;
-  uint16_t oslv = state->ptp_status.clock_source_info.variance;
+      source->clockclass;
+  uint16_t oslv = source->variance;
   int_to_octets(&oslv, state->avb_interface.offset_scaled_log_variance, 2);
   state->avb_interface.clock_accuracy =
-      state->ptp_status.clock_source_info.accuracy;
+      source->accuracy;
   state->avb_interface.priority2 =
-      state->ptp_status.clock_source_info.priority2;
+      source->priority2;
 }
 
 int avb_send_aecp_rsp_read_descr_avb_interface(avb_state_s *state,
@@ -608,7 +612,7 @@ int avb_send_aecp_rsp_read_descr_clock_source(avb_state_s *state,
     uint16_t location_type = aem_desc_type_audio_unit;
     int_to_octets(&localized_description, descriptor.localized_description, 2);
     memcpy(&descriptor.clock_source_id,
-           state->ptp_status.clock_source_info.btc_id, sizeof(unique_id_t));
+           ptpd_status_source(&state->ptp_status)->btc_id, sizeof(unique_id_t));
     int_to_octets(&location_type, &descriptor.clock_source_location_type, 2);
   }
 
@@ -2561,7 +2565,7 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   //      report our own clock identity, otherwise the field stays
   //      zero and looks like "no BTC" to controllers like Hive.
   //      Applies in both gPTP and standard PTP profiles.
-  if (state->ptp_status.clock_source_valid) {
+  if (state->ptp_status.clock_source_selected) {
     memcpy(&response.gptp_btc_id, state->ptp_status.clock_source_info.btc_id,
            UNIQUE_ID_LEN);
   } else {
@@ -2574,7 +2578,7 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   int_to_octets(&prop_delay, response.propagation_delay, 4);
 
   response.gptp_domain_number = state->avb_interface.domain_number;
-  response.flags.as_capable = state->ptp_status.clock_source_valid;
+  response.flags.as_capable = state->ptp_status.as_capable;
   response.flags.gptp_enabled = state->avb_interface.flags.gptp_supported;
   response.flags.srp_enabled = state->avb_interface.flags.srp_supported;
 
@@ -2630,37 +2634,17 @@ int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
   memcpy(&response, msg, sizeof(aecp_get_as_path_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
 
-  // Build path sequence: BTC -> [intermediate clocks] -> this entity
-  uint16_t count = 0;
-  if (state->ptp_status.clock_source_valid) {
-    // Add BTC clock identity
-    memcpy(&response.path_sequence[count],
-           state->ptp_status.clock_source_info.btc_id, UNIQUE_ID_LEN);
-    count++;
-    // If the selected source is not the BTC (i.e. an intermediate
-    // boundary clock like the AVB switch), add it to the path
-    if (memcmp(state->ptp_status.clock_source_info.id,
-               state->ptp_status.clock_source_info.btc_id,
-               UNIQUE_ID_LEN) != 0) {
-      memcpy(&response.path_sequence[count],
-             state->ptp_status.clock_source_info.id, UNIQUE_ID_LEN);
-      count++;
-    }
-  }
-  // always end with this entity's own clock identity
-  memcpy(&response.path_sequence[count], state->ptp_status.own_identity_info.id,
-         UNIQUE_ID_LEN);
-  count++;
+  uint16_t count = ptpd_status_path(&state->ptp_status,
+                                    response.path_sequence, AECP_MAX_AS_PATH_COUNT);
   int_to_octets(&count, response.count, 2);
 
-  uint16_t control_data_len = sizeof(aecp_common_s) - AVTP_CDL_PREAMBLE_LEN +
-                              sizeof(aecp_common_aem_s) + 4 + 2 +
-                              (count * UNIQUE_ID_LEN);
+  uint16_t msg_len = offsetof(aecp_get_as_path_rsp_s, path_sequence) +
+                     count * UNIQUE_ID_LEN;
+  uint16_t control_data_len = msg_len - AVTP_CDL_PREAMBLE_LEN;
 
   response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
   response.common.header.control_data_len = control_data_len & 0xFF;
 
-  uint16_t msg_len = AVTP_CDL_PREAMBLE_LEN + control_data_len;
   ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
                         dest_addr);
   if (ret < 0) {

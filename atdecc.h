@@ -84,7 +84,7 @@ typedef enum {
   aecp_cmd_code_register_unsol_notif = 0x0024,
   aecp_cmd_code_deregister_unsol_notif = 0x0025,
   aecp_cmd_code_get_avb_info = 0x0027,
-  aecp_cmd_code_get_as_path = 0x0028, // unsupported
+  aecp_cmd_code_get_as_path = 0x0028,
   aecp_cmd_code_get_counters = 0x0029,
   aecp_cmd_code_set_max_transit_time = 0x004c,
   aecp_cmd_code_get_max_transit_time = 0x004d,
@@ -899,14 +899,14 @@ typedef struct {
 } aecp_get_as_path_s;          // 28 bytes
 
 /* AECP get AS path response */
-#define AECP_MAX_AS_PATH_COUNT 7
+#define AECP_MAX_AS_PATH_COUNT 17
 typedef struct {
   aecp_common_s common;
   aecp_common_aem_s aem;
   uint8_t descriptor_index[2]; // descriptor index
   uint8_t count[2];            // number of clock identities in path sequence
   unique_id_t path_sequence[AECP_MAX_AS_PATH_COUNT]; // clock identity path
-} aecp_get_as_path_rsp_s;                            // 44 bytes
+} aecp_get_as_path_rsp_s; // serialized length depends on count
 
 /* AEM Entity counters valid flags */
 typedef struct {
