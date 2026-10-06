@@ -1435,6 +1435,28 @@ typedef struct {
   uint8_t command_type;   // command type
 } aecp_cvu_common_s;
 
+/* AVB Lite status query, profiles/avb_lite.md §2.4: same MA-S OUI as CVU
+ * SRP with sub-protocol 0x003. The command carries only the command word
+ * and the interface index; the response appends the 28-octet status body. */
+#define LITE_STATUS_PROTOCOL_ID {0x8C, 0x1F, 0x64, 0x36, 0xC0, 0x03}
+#define LITE_STATUS_CMD_GET 0x0000
+#define LITE_STATUS_BODY_LEN 28
+#define LITE_STATUS_FLAG_CAPABLE 0x01
+#define LITE_STATUS_FLAG_ACTIVE 0x02
+#define LITE_STATUS_FLAG_OFFSET_VALID 0x04
+#define LITE_STATUS_FLAG_EGRESS_VALID 0x08
+#define LITE_STATUS_OFFSET_ALARM_NS 50000
+
+typedef struct {
+  aecp_common_s common;
+  uint8_t protocol_id[6];
+  uint8_t command_type[2];        // u (bit 15) | command_type
+  uint8_t avb_interface_index[2];
+  uint8_t body[LITE_STATUS_BODY_LEN]; // flags, reason, profile, domain,
+                                      // vlan, fanout, reserved, link,
+                                      // egress, grandmaster, offset
+} aecp_lite_status_s; // 60 bytes, control_data_length 48
+
 /* AVB Lite CVU SRP talker message */
 typedef struct {
   aecp_cvu_common_s cvu;             // CVU common header

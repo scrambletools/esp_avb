@@ -1975,6 +1975,170 @@ int avb_process_aecp_cmd_mvu_get_stream_input_info_ex(avb_state_s *state,
                                aecp_status_success);
 }
 
+
+/* AVB Lite status query, profiles/avb_lite.md §2.4. */
+
+static int avb_lite_controller_index(avb_state_s *state,
+                                     const uint8_t *controller_id,
+                                     eth_addr_t *src_addr) {
+  int index =
+      avb_find_entity_by_addr(state, src_addr, avb_entity_type_controller);
+  if (index != NOT_FOUND)
+    return index;
+  avb_controller_s controller;
+  memset(&controller, 0, sizeof(controller));
+  memcpy(controller.entity_id, controller_id, UNIQUE_ID_LEN);
+  memcpy(controller.mac_addr, src_addr, ETH_ADDR_LEN);
+  if (state->num_controllers < AVB_MAX_NUM_CONTROLLERS) {
+    state->controllers[state->num_controllers] = controller;
+    return state->num_controllers++;
+  }
+  memmove(&state->controllers[0], &state->controllers[1],
+          (state->num_controllers - 1) * sizeof(avb_controller_s));
+  state->controllers[state->num_controllers - 1] = controller;
+  return state->num_controllers - 1;
+}
+
+static void avb_put_be32(uint8_t *out, uint32_t value) {
+  out[0] = (uint8_t)(value >> 24);
+  out[1] = (uint8_t)(value >> 16);
+  out[2] = (uint8_t)(value >> 8);
+  out[3] = (uint8_t)value;
+}
+
+/* Bandwidth of the streams this entity is sending, in kb/s, as the §6
+ * admission rule counts it: TSpec frame size times frames per second,
+ * each unicast copy counted separately. */
+static uint32_t avb_lite_committed_egress_kbps(avb_state_s *state) {
+  uint64_t bps = 0;
+  for (int i = 0; i < AVB_MAX_NUM_OUTPUT_STREAMS; i++) {
+    avb_talker_stream_s *stream = &state->output_streams[i];
+    if (!stream->streaming)
+      continue;
+    uint32_t intervals = stream->stream_info_flags.class_b ? 4000u : 8000u;
+    uint32_t copies = 1;
+    if (state->avb_lite && stream->tx_da_count > 1)
+      copies = stream->tx_da_count;
+    bps += (uint64_t)avb_compute_tspec_max_frame_size(state, i) * intervals *
+           8u * copies;
+  }
+  return (uint32_t)(bps / 1000u);
+}
+
+static void avb_lite_status_fill(avb_state_s *state, uint8_t *body) {
+  struct ptpd_status_s *ptp = &state->ptp_status;
+  memset(body, 0, LITE_STATUS_BODY_LEN);
+  uint8_t flags = 0;
+  if (state->config.avb_lite_compliant)
+    flags |= LITE_STATUS_FLAG_CAPABLE;
+  if (state->avb_lite)
+    flags |= LITE_STATUS_FLAG_ACTIVE;
+  bool offset_valid =
+      ptp->clock_source_selected && ptp->last_clock_update.tv_sec != 0;
+  if (offset_valid)
+    flags |= LITE_STATUS_FLAG_OFFSET_VALID;
+  if (state->config.talker)
+    flags |= LITE_STATUS_FLAG_EGRESS_VALID;
+  body[0] = flags;
+  body[1] = state->avb_lite ? ptp->avb_lite_fallback_reason : 0;
+  body[2] = ptp->ptp_profile == ptp_profile_gptp ? 0 : 1;
+  body[3] = ptp->domain;
+  memcpy(&body[4], state->msrp_mappings[0].vlan_id, 2);
+  body[6] = state->config.talker ? CONFIG_ESP_AVB_LITE_UNICAST_FANOUT : 0;
+  avb_put_be32(&body[8], state->port[0].link_speed_mbps);
+  avb_put_be32(&body[12], avb_lite_committed_egress_kbps(state));
+  if (ptp->clock_source_selected)
+    memcpy(&body[16], ptp->clock_source_info.btc_id, 8);
+  int64_t offset = ptp->last_delta_ns;
+  if (offset > INT32_MAX)
+    offset = INT32_MAX;
+  if (offset < INT32_MIN)
+    offset = INT32_MIN;
+  avb_put_be32(&body[24], (uint32_t)(int32_t)offset);
+}
+
+static int avb_lite_status_send(avb_state_s *state, aecp_lite_status_s *rsp,
+                                uint16_t msg_len, uint8_t status,
+                                eth_addr_t *dest_addr) {
+  struct timespec ts;
+  rsp->common.header.subtype = avtp_subtype_aecp;
+  rsp->common.header.msg_type = aecp_msg_type_vendor_unique_response;
+  rsp->common.header.status_valtime = status;
+  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
+  rsp->common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  rsp->common.header.control_data_len = cdl & 0xFF;
+  int ret =
+      avb_net_send_to(state, ethertype_avtp, rsp, msg_len, &ts, dest_addr);
+  if (ret < 0)
+    avberr("send AVB Lite status response failed: %d", errno);
+  return ret;
+}
+
+int avb_process_aecp_cmd_lite_status(avb_state_s *state, aecp_message_u *msg,
+                                     eth_addr_t *src_addr) {
+  aecp_lite_status_s rsp;
+  const uint16_t echo_len = offsetof(aecp_lite_status_s, body);
+  memset(&rsp, 0, sizeof(rsp));
+  memcpy(&rsp, msg, echo_len);
+  uint16_t command_type = octets_to_uint(rsp.command_type, 2) & 0x7FFF;
+  uint16_t index = octets_to_uint(rsp.avb_interface_index, 2);
+  if (command_type != LITE_STATUS_CMD_GET) {
+    return avb_lite_status_send(state, &rsp, echo_len,
+                                aecp_status_not_implemented, src_addr);
+  }
+  if (index != 0) {
+    return avb_lite_status_send(state, &rsp, echo_len,
+                                aecp_status_no_such_descriptor, src_addr);
+  }
+  avb_lite_status_fill(state, rsp.body);
+  return avb_lite_status_send(state, &rsp, sizeof(rsp), aecp_status_success,
+                              src_addr);
+}
+
+/* Send the status unsolicited when anything but the offset changed, or
+ * when the offset crossed the §9 alarm threshold. Runs from the periodic
+ * loop, so a change is reported within one PTP status interval. */
+void avb_lite_status_tick(avb_state_s *state) {
+  uint8_t body[LITE_STATUS_BODY_LEN];
+  avb_lite_status_fill(state, body);
+  int32_t offset = (int32_t)(((uint32_t)body[24] << 24) |
+                             ((uint32_t)body[25] << 16) |
+                             ((uint32_t)body[26] << 8) | body[27]);
+  bool alarm = (body[0] & LITE_STATUS_FLAG_OFFSET_VALID) &&
+               (offset > LITE_STATUS_OFFSET_ALARM_NS ||
+                offset < -LITE_STATUS_OFFSET_ALARM_NS);
+  bool changed = !state->lite_status_sent_valid ||
+                 memcmp(body, state->lite_status_sent,
+                        LITE_STATUS_BODY_LEN - 4) != 0 ||
+                 alarm != state->lite_offset_alarm;
+  if (!changed)
+    return;
+  memcpy(state->lite_status_sent, body, LITE_STATUS_BODY_LEN);
+  state->lite_status_sent_valid = true;
+  state->lite_offset_alarm = alarm;
+
+  uint8_t protocol_id[] = LITE_STATUS_PROTOCOL_ID;
+  for (size_t i = 0; i < state->num_controllers; i++) {
+    avb_controller_s *controller = &state->controllers[i];
+    if (!controller->unsol_registered)
+      continue;
+    aecp_lite_status_s rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
+           UNIQUE_ID_LEN);
+    memcpy(rsp.common.controller_entity_id, controller->entity_id,
+           UNIQUE_ID_LEN);
+    uint16_t seq_id = state->unsol_seq_id++;
+    rsp.common.seq_id[0] = (uint8_t)(seq_id >> 8);
+    rsp.common.seq_id[1] = (uint8_t)seq_id;
+    memcpy(rsp.protocol_id, protocol_id, sizeof(rsp.protocol_id));
+    rsp.command_type[0] = 0x80; // u = 1, GET_LITE_STATUS
+    memcpy(rsp.body, body, LITE_STATUS_BODY_LEN);
+    avb_lite_status_send(state, &rsp, sizeof(rsp), aecp_status_success,
+                         &controller->mac_addr);
+  }
+}
+
 /* Process AECP command register unsolicited notification.
  * Response body is target + controller + seq + u+cmd_type + flags = 24
  * bytes, so cdl = 24 and the on-wire frame is 28 bytes (4-byte AVTP
@@ -2006,6 +2170,9 @@ int avb_process_aecp_cmd_register_unsol_notif(avb_state_s *state,
            errno);
   } else {
     state->unsol_notif_enabled = true;
+    int index = avb_lite_controller_index(
+        state, msg->common.controller_entity_id, src_addr);
+    state->controllers[index].unsol_registered = true;
   }
   return ret;
 }
@@ -2035,6 +2202,10 @@ int avb_process_aecp_cmd_deregister_unsol_notif(avb_state_s *state,
            errno);
   } else {
     state->unsol_notif_enabled = false;
+    int index = avb_find_entity_by_addr(state, src_addr,
+                                        avb_entity_type_controller);
+    if (index != NOT_FOUND)
+      state->controllers[index].unsol_registered = false;
   }
   return ret;
 }
@@ -2828,6 +2999,10 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     uint8_t expected_cvu_pid[] = CVU_PROTOCOL_ID;
     if (memcmp(cvu->protocol_id, expected_cvu_pid, 6) == 0) {
       return avb_process_aecp_cmd_cvu_srp(state, msg, src_addr);
+    }
+    uint8_t lite_status_pid[] = LITE_STATUS_PROTOCOL_ID;
+    if (memcmp(cvu->protocol_id, lite_status_pid, 6) == 0) {
+      return avb_process_aecp_cmd_lite_status(state, msg, src_addr);
     }
 
     /* Validate MVU protocol ID */

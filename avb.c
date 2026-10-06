@@ -1471,6 +1471,9 @@ static void avb_task(void *task_param) {
     if (timespec_to_ms(&delta) > PTP_STATUS_UPDATE_INTERVAL_MSEC) {
       state->last_ptp_status_update = time_now;
       avb_update_ptp_status(state);
+#ifdef CONFIG_ESP_AVB_ATDECC
+      avb_lite_status_tick(state);
+#endif
     }
 
     // Send periodic messages such as announcing entity available, etc

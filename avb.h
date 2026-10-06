@@ -491,6 +491,7 @@ typedef struct {
   unique_id_t model_id;  // model ID
   eth_addr_t mac_addr;   // mac address
   bool ready;            // status
+  bool unsol_registered; // asked for unsolicited notifications
 } avb_controller_s;
 
 /* Listener stream flags */
@@ -917,6 +918,9 @@ typedef struct avb_state_s {
   /* Unsolicited notifications */
   bool unsol_notif_enabled;
   struct timespec last_unsol_notif;
+  uint8_t lite_status_sent[28]; // last AVB Lite status body sent unsolicited
+  bool lite_status_sent_valid;
+  bool lite_offset_alarm;       // |offset| above the §9 50 us threshold
 
   /* Deferred NVS persist.
    *  persist_dirty  — set by any writer that wants the current state
@@ -960,6 +964,7 @@ typedef struct avb_state_s {
   /* Sequence IDs for outbound ATDECC messages */
   uint32_t adp_seq_id;
   uint16_t aecp_seq_id;
+  uint16_t unsol_seq_id; // unsolicited responses have their own counter
   int16_t acmp_seq_id;
 
   /* Logo */
@@ -1070,6 +1075,7 @@ uint32_t avb_bridge_forward_stats_restored(void);
 
 /* dest = NULL broadcasts (talker declarations); listener declarations
  * pass the talker's MAC per avb_lite.md §6 item 2. */
+void avb_lite_status_tick(avb_state_s *state);
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
                           const char *label, const eth_addr_t *dest);
 
