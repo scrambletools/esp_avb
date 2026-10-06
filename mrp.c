@@ -553,6 +553,10 @@ typedef struct {
    * every admit-declare. */
   uint16_t last_propagated_mfs;
   uint16_t last_propagated_mfi;
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  uint32_t admitted_bps[CONFIG_ESP_AVB_NUM_PORTS];
+  avb_sr_class_e admitted_class[CONFIG_ESP_AVB_NUM_PORTS];
+#endif
   /* Mid-life value change quarantine: after an Lv for the old value,
    * hold off re-declaring the new one until the peer's LeaveTimer has
    * fully deregistered the old attribute. Re-declaring the same
@@ -797,6 +801,30 @@ extern int avb_srp_admission_try_admit(int port_index, avb_sr_class_e cls,
                                        uint32_t request_bps);
 extern void avb_srp_admission_release(int port_index, avb_sr_class_e cls,
                                       uint32_t request_bps);
+
+static void msrp_release_admission(msrp_talker_entry_t *entry, int port) {
+  if (!entry || !entry->admitted_bps[port])
+    return;
+  avb_srp_admission_release(port, entry->admitted_class[port],
+                            entry->admitted_bps[port]);
+  entry->admitted_bps[port] = 0;
+}
+
+static int msrp_update_admission(msrp_talker_entry_t *entry, int port,
+                                 avb_sr_class_e cls, uint32_t bps) {
+  if (!entry)
+    return -1;
+  if (entry->admitted_bps[port] == bps && bps != 0 &&
+      entry->admitted_class[port] == cls)
+    return 0;
+  msrp_release_admission(entry, port);
+  int result = avb_srp_admission_try_admit(port, cls, bps);
+  if (result == 0) {
+    entry->admitted_bps[port] = bps;
+    entry->admitted_class[port] = cls;
+  }
+  return result;
+}
 #endif
 /* Same forward-decl rationale — used by the domain callback. */
 static uint16_t avb_msrp_mapping_index_for_class_id(uint8_t class_id);
@@ -1046,16 +1074,9 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
   uint8_t old_priority = ingress ? ingress->last_propagated_priority : 0;
   uint16_t old_mfs = ingress ? ingress->last_propagated_mfs : 0;
   uint16_t old_mfi = ingress ? ingress->last_propagated_mfi : 0;
-  avb_sr_class_e old_cls =
-      (old_priority == 3) ? AVB_SR_CLASS_A : AVB_SR_CLASS_B;
-  uint32_t old_intervals = (old_cls == AVB_SR_CLASS_A) ? 8000u : 4000u;
-  /* Use the snapshotted TSpec for old_bps so a §35-mid-life
-   * SET_STREAM_FORMAT (mfs / mfi change) is detected even when the
-   * Registrar stays IN and class doesn't change. */
-  uint32_t old_bps = (uint32_t)old_mfs * (uint32_t)old_mfi * old_intervals * 8u;
 
   /* Decide the kind of MAP work needed. */
-  bool do_release = false;       /* release admission for old_cls/old_bps */
+  bool do_release = false;      /* release the recorded reservation */
   bool do_withdraw = false;      /* mrp_withdraw_talker on egress */
   bool do_admit_declare = false; /* admit + declare with new class */
 
@@ -1088,7 +1109,7 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
       continue;
 
     if (do_release) {
-      avb_srp_admission_release(y, old_cls, old_bps);
+      msrp_release_admission(ingress, y);
     }
     if (do_withdraw) {
       mrp_withdraw_talker(state, y, stream_id);
@@ -1130,6 +1151,7 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
      * the data plane end-to-end. */
     if (state->port[y].medium == avb_port_medium_wifi_ftm &&
         new_cls == AVB_SR_CLASS_A && !state->config.allow_class_a_over_wifi) {
+      msrp_release_admission(ingress, y);
       avbwarn("MAP: Class A blocked on Wi-Fi egress port %d (opt-in off)", y);
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
                                 insufficient_bandwidth_for_traffic_class,
@@ -1139,7 +1161,7 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
       continue;
     }
 
-    int adm = avb_srp_admission_try_admit(y, new_cls, new_bps);
+    int adm = msrp_update_admission(ingress, y, new_cls, new_bps);
     if (adm == 0) {
       mrp_declare_talker_advertise(state, y, stream_id, dest, vlan, mfs,
                                    propagate_class_b);
@@ -1534,7 +1556,7 @@ static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
  * /deregister edge) so the caller can fire the MAP / application
  * callback only on transition edges, not on every RX. */
 static mrp_reg_transition_e
-msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
+msrp_rx_talker_attr(avb_state_s *state, int port, msrp_attr_type_t attr_type,
                     const msrp_talker_message_u *wire, eth_addr_t *src_addr) {
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
   {
@@ -1570,12 +1592,12 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
   e->last_refresh_us = esp_timer_get_time();
   if (src_addr != NULL)
     memcpy(e->src_mac, src_addr, ETH_ADDR_LEN);
-  /* Decode the 3pe vector. event_data[] is at the same offset in
-   * both talker_adv and talker_failed (after the per-type info
-   * block); since both share the union, indexing via .talker works
-   * regardless of which discriminant is in use. */
+  /* Failed carries nine extra FirstValue bytes before its events. */
   int e1, e2, e3;
-  three_pe_to_int(wire->talker.event_data[0], &e1, &e2, &e3);
+  uint8_t event_data = attr_type == msrp_attr_type_talker_failed
+                           ? wire->talker_failed.event_data[0]
+                           : wire->talker.event_data[0];
+  three_pe_to_int(event_data, &e1, &e2, &e3);
   /* For MSRP, num_vals is almost always 1, so only the first event
    * in the first 3pe slot is meaningful. The remaining e2/e3 carry
    * 6 (no-op) per the spec when num_vals < 3. */
@@ -1605,6 +1627,8 @@ msrp_rx_talker_attr(int port, msrp_attr_type_t attr_type,
     msrp_talker_entry_t *twin = msrp_talker_find(
         port, (const unique_id_t *)&wire->talker.info.stream_id, twin_type);
     if (twin != NULL && twin->sm.registrar != mrp_registrar_mt) {
+      mrp_on_talker_registrar_change(state, port, twin_type, &twin->wire,
+                                     mrp_reg_transition_deregister, NULL);
       twin->sm.registrar = mrp_registrar_mt;
       ESP_LOGW("avb_srp", "MSRP: talker %s displaced stale %s registration",
                (attr_type == msrp_attr_type_talker_failed) ? "FAILED"
@@ -1952,7 +1976,7 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
           else
             wire.talker_failed.event_data[0] = int_to_3pe(ev, 0, 0);
           mrp_reg_transition_e tr =
-              msrp_rx_talker_attr(port, attr_type, &wire, src_addr);
+              msrp_rx_talker_attr(state, port, attr_type, &wire, src_addr);
           mrp_on_talker_registrar_change(state, port, attr_type, &wire, tr,
                                          src_addr);
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
@@ -2502,13 +2526,8 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
     return false;
   bool fired = false;
-  /* LV→MT expiry is reg_transition_none under the IN-centric edge
-   * rule (the deregister edge fired at IN→LV, when the callback ran
-   * from the RX path). Talker/domain loops therefore fire no callback
-   * here. LISTENER attributes are the exception: a peer that ages out
-   * via LeaveAll never sends a wire Lv, and the rLA dispatch fires no
-   * callbacks, so the listener loop below surfaces the expiry as an
-   * explicit deregister for the talker-side bookkeeping. */
+  /* LeaveAll starts a leave timer without withdrawing propagated state.
+   * Surface expiry so a peer that never refreshes releases its reservation. */
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
     if (!e->valid)
@@ -2517,6 +2536,8 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
       mrp_registrar_state_e before = e->sm.registrar;
       mrp_sm_step(&e->sm, mrp_event_leave_timer);
       mrp_reg_transition_e tr = mrp_reg_transition(before, e->sm.registrar);
+      if (before == mrp_registrar_lv && e->sm.registrar == mrp_registrar_mt)
+        tr = mrp_reg_transition_deregister;
       if (tr != mrp_reg_transition_none) {
         mrp_on_talker_registrar_change(state, port, e->attr_type, &e->wire, tr,
                                        NULL);
