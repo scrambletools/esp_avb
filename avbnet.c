@@ -258,6 +258,8 @@ uint32_t avb_net_ptp_rx_seen(void) { return s_ptp_rx_seen; }
 /* PTP-frame L2TAP handoff outcome counters (wedge diagnosis): after
  * esp_vfs_l2tap_eth_filter_frame, frame_len==0 means an fd matched and
  * consumed the frame; frame_len>0 means no fd matched (dropped here). */
+extern void ptpd_note_wired_peer_follow_up(const uint8_t *message, size_t length)
+    __attribute__((weak));
 static volatile uint32_t s_ptp_l2tap_consumed = 0;
 static volatile uint32_t s_ptp_l2tap_unmatched = 0;
 uint32_t avb_net_ptp_l2tap_consumed(void) { return s_ptp_l2tap_consumed; }
@@ -631,13 +633,17 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
                     different downstream API. */
     if (eth_handle == NULL) {
       if (s_wifi_port_idx >= 0 && len >= ETH_HEADER_LEN) {
-        (void)ptp_inject_received_frame(s_wifi_port_idx,
+        (void)ptp_inject_received_frame_from(s_wifi_port_idx,
                                         buf + ETH_HEADER_LEN,
-                                        (uint16_t)(len - ETH_HEADER_LEN));
+                                        (uint16_t)(len - ETH_HEADER_LEN),
+                                        buf + ETH_ADDR_LEN);
       }
       free(buf);
       return ESP_OK;
     }
+    if (len >= ETH_HEADER_LEN + 54 &&
+        (buf[ETH_HEADER_LEN] & 0x0f) == 0x0a && ptpd_note_wired_peer_follow_up)
+      ptpd_note_wired_peer_follow_up(buf + ETH_HEADER_LEN, len - ETH_HEADER_LEN);
     size_t frame_len = len;
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
     /* v6.2 changed the filter contract: info is now a typed struct.
