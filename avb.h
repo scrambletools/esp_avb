@@ -1205,6 +1205,11 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state);
 /* Writes stream journal records deferred while ingress was heavy (a
  * flash write then can latch the EMAC RX FIFO). Main loop, every pass. */
 void avb_persist_journal_tick(avb_state_s *state);
+
+/* EMAC RX un-wedge guard: recovers a receive DMA stuck in Suspended and
+ * the P4's latched RX FIFO. Call every main-loop pass; no-op on targets
+ * without an on-chip EMAC. */
+void avb_emac_rx_unwedge_tick(void);
 bool avb_persist_ingress_quiet(void);
 
 /* Lock-free TX-side snapshot of a stream's published unicast DAs.

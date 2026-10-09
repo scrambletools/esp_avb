@@ -1414,6 +1414,7 @@ static int avb_periodic_send(avb_state_s *state) {
    * (AVB Lite unicast transport; no-op outside Lite mode). */
   avb_lite_update_stream_tx_addrs(state);
   avb_persist_journal_tick(state);
+  avb_emac_rx_unwedge_tick();
 
   // PTP snapshot for the stream out PLL is no longer needed here — the
   // stream out task now reads the PTP clock directly on Core 1 with a
