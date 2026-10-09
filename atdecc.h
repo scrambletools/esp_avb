@@ -1440,11 +1440,13 @@ typedef struct {
  * and the interface index; the response appends the 28-octet status body. */
 #define LITE_STATUS_PROTOCOL_ID {0x8C, 0x1F, 0x64, 0x36, 0xC0, 0x03}
 #define LITE_STATUS_CMD_GET 0x0000
+#define LITE_STATUS_CMD_SET_CONFIG 0x0001
 #define LITE_STATUS_BODY_LEN 28
 #define LITE_STATUS_FLAG_CAPABLE 0x01
 #define LITE_STATUS_FLAG_ACTIVE 0x02
 #define LITE_STATUS_FLAG_OFFSET_VALID 0x04
 #define LITE_STATUS_FLAG_EGRESS_VALID 0x08
+#define LITE_STATUS_FLAG_ESCALATION_ALLOWED 0x10
 #define LITE_STATUS_OFFSET_ALARM_NS 50000
 
 typedef struct {
@@ -1456,6 +1458,17 @@ typedef struct {
                                       // vlan, fanout, reserved, link,
                                       // egress, grandmaster, offset
 } aecp_lite_status_s; // 60 bytes, control_data_length 48
+
+/* SET_LITE_CONFIG (profile §2.4, Configuration): the response carries
+ * the configuration the interface has after the command. */
+typedef struct {
+  aecp_common_s common;
+  uint8_t protocol_id[6];
+  uint8_t command_type[2];        // u (bit 15) | command_type
+  uint8_t avb_interface_index[2];
+  uint8_t config_flags;           // LITE_CONFIG_FLAG_*
+  uint8_t reserved[3];
+} aecp_lite_config_s; // 36 bytes, control_data_length 24
 
 /* AVB Lite CVU SRP talker message */
 typedef struct {

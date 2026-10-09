@@ -1604,8 +1604,10 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
 
 /* Send a CVU SRP attribute. CVU SRP attributes are transported as AECP vendor
  * unique commands but semantically originate from the talker/listener endpoint
- * itself, just like native MSRP. The response reflects the command payload with
- * AECP status set. */
+ * itself, just like native MSRP. They are not answered: MRP's repetition and
+ * refresh carry reliability (profiles/avb_lite.md §6, Message format). */
+static uint16_t s_cvu_seq_id;
+
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
                           const char *label, const eth_addr_t *dest) {
   msrp_attr_header_s *header = (msrp_attr_header_s *)attr;
@@ -1630,7 +1632,7 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
   memcpy(msg.cvu.common.target_entity_id, &EMPTY_ID, UNIQUE_ID_LEN);
   memcpy(msg.cvu.common.controller_entity_id,
          state->own_entity.summary.entity_id, UNIQUE_ID_LEN);
-  uint16_t seq_id = state->aecp_seq_id++;
+  uint16_t seq_id = s_cvu_seq_id++;
   int_to_octets(&seq_id, msg.cvu.common.seq_id, 2);
   uint8_t protocol_id[] = CVU_PROTOCOL_ID;
   memcpy(msg.cvu.protocol_id, protocol_id, sizeof(msg.cvu.protocol_id));
@@ -1660,22 +1662,6 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
   return ret;
 }
 
-static int avb_send_cvu_response(avb_state_s *state, void *msg,
-                                 eth_addr_t *src_addr, uint16_t msg_len,
-                                 uint8_t status) {
-  struct timespec ts;
-  aecp_cvu_common_s *cvu = (aecp_cvu_common_s *)msg;
-  cvu->common.header.msg_type = aecp_msg_type_vendor_unique_response;
-  cvu->common.header.status_valtime = status;
-  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
-  cvu->common.header.control_data_len_h = (cdl >> 8) & 0x07;
-  cvu->common.header.control_data_len = cdl & 0xFF;
-  int ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, src_addr);
-  if (ret < 0)
-    avberr("send CVU response failed: %d", errno);
-  return ret;
-}
-
 static uint16_t avb_aecp_msg_len(aecp_message_u *msg) {
   uint16_t cdl =
       (msg->header.control_data_len_h << 8) | msg->header.control_data_len;
@@ -1684,13 +1670,14 @@ static uint16_t avb_aecp_msg_len(aecp_message_u *msg) {
 
 /* AVB Lite CVU SRP wrapper. The embedded payload is a normal MSRP attribute;
  * synthesize a one-attribute MSRP buffer and route through the existing MSRP
- * handlers so talker/listener state logic stays in exactly one place. */
+ * handlers so talker/listener state logic stays in exactly one place. A
+ * target_entity_id of 0 names no entity, so nothing is ever sent back, a
+ * malformed message is dropped. */
 int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
                                  eth_addr_t *src_addr) {
   size_t msg_len = avb_aecp_msg_len(msg);
   if (msg_len < sizeof(aecp_cvu_common_s) + sizeof(msrp_attr_header_s)) {
-    return avb_send_cvu_response(state, msg, src_addr, msg_len,
-                                 aecp_status_bad_arguments);
+    return OK;
   }
 
   uint8_t *payload = ((uint8_t *)msg) + sizeof(aecp_cvu_common_s);
@@ -1700,8 +1687,7 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
 
   if (attr_size < sizeof(msrp_attr_header_s) || attr_size > max_attr ||
       attr_size > sizeof(((msrp_msgbuf_s *)0)->messages_raw)) {
-    return avb_send_cvu_response(state, msg, src_addr, msg_len,
-                                 aecp_status_bad_arguments);
+    return OK;
   }
 
   msrp_msgbuf_s msrp_msg;
@@ -1721,12 +1707,9 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
     break;
   default:
     avbdebug("CVU: unsupported MSRP attribute type 0x%02x", attr->attr_type);
-    return avb_send_cvu_response(state, msg, src_addr, msg_len,
-                                 aecp_status_not_implemented);
+    break;
   }
-
-  return avb_send_cvu_response(state, msg, src_addr, msg_len,
-                               aecp_status_success);
+  return OK;
 }
 
 /* ---- Milan Vendor Unique (MVU) command handlers ---- */
@@ -2007,20 +1990,18 @@ static void avb_put_be32(uint8_t *out, uint32_t value) {
 }
 
 /* Bandwidth of the streams this entity is sending, in kb/s, as the §6
- * admission rule counts it: TSpec frame size times frames per second,
- * each unicast copy counted separately. */
+ * admission rule counts it: each copy's TSpec frames plus Ethernet
+ * overhead per class interval, each unicast copy counted separately. */
 static uint32_t avb_lite_committed_egress_kbps(avb_state_s *state) {
   uint64_t bps = 0;
-  for (int i = 0; i < AVB_MAX_NUM_OUTPUT_STREAMS; i++) {
+  for (int i = 0; i < state->num_output_streams; i++) {
     avb_talker_stream_s *stream = &state->output_streams[i];
     if (!stream->streaming)
       continue;
-    uint32_t intervals = stream->stream_info_flags.class_b ? 4000u : 8000u;
     uint32_t copies = 1;
     if (state->avb_lite && stream->tx_da_count > 1)
       copies = stream->tx_da_count;
-    bps += (uint64_t)avb_compute_tspec_max_frame_size(state, i) * intervals *
-           8u * copies;
+    bps += (uint64_t)avb_stream_out_copy_bps(state, i) * copies;
   }
   return (uint32_t)(bps / 1000u);
 }
@@ -2039,6 +2020,8 @@ static void avb_lite_status_fill(avb_state_s *state, uint8_t *body) {
     flags |= LITE_STATUS_FLAG_OFFSET_VALID;
   if (state->config.talker)
     flags |= LITE_STATUS_FLAG_EGRESS_VALID;
+  if (state->lite_config_flags & LITE_CONFIG_FLAG_ESCALATION_ALLOWED)
+    flags |= LITE_STATUS_FLAG_ESCALATION_ALLOWED;
   body[0] = flags;
   body[1] = state->avb_lite ? ptp->avb_lite_fallback_reason : 0;
   body[2] = ptp->ptp_profile == ptp_profile_gptp ? 0 : 1;
@@ -2078,6 +2061,62 @@ static int avb_lite_status_send(avb_state_s *state, aecp_lite_status_s *rsp,
   return ret;
 }
 
+/* SET_LITE_CONFIG: set how the interface runs AVB Lite. The response
+ * carries the resulting configuration; a change is persisted and
+ * reported with an unsolicited GET_LITE_STATUS. */
+static int avb_process_aecp_cmd_lite_config(avb_state_s *state,
+                                            aecp_message_u *msg,
+                                            eth_addr_t *src_addr) {
+  aecp_lite_config_s rsp;
+  const uint16_t echo_len = offsetof(aecp_lite_config_s, config_flags);
+  memset(&rsp, 0, sizeof(rsp));
+  memcpy(&rsp, msg, echo_len);
+  uint16_t index = octets_to_uint(rsp.avb_interface_index, 2);
+  uint16_t msg_len = avb_aecp_msg_len(msg);
+  /* Every response carries the full layout; the configuration is the
+   * interface's, none for an interface the endpoint does not have. */
+  if (index != 0) {
+    return avb_lite_status_send(state, (aecp_lite_status_s *)&rsp, sizeof(rsp),
+                                aecp_status_no_such_descriptor, src_addr);
+  }
+  aecp_status_t status = aecp_status_success;
+  uint8_t requested = 0;
+  if (msg_len < sizeof(aecp_lite_config_s)) {
+    status = aecp_status_bad_arguments;
+  } else {
+    const aecp_lite_config_s *cmd = (const aecp_lite_config_s *)msg;
+    requested = cmd->config_flags;
+    bool reserved_set = (requested & ~LITE_CONFIG_FLAGS_KNOWN) ||
+                        cmd->reserved[0] || cmd->reserved[1] ||
+                        cmd->reserved[2];
+    if (state->locked &&
+        memcmp(state->locked_by, rsp.common.controller_entity_id,
+               UNIQUE_ID_LEN) != 0) {
+      status = aecp_status_entity_locked;
+    } else if (state->acquired &&
+               memcmp(state->acquired_by, rsp.common.controller_entity_id,
+                      UNIQUE_ID_LEN) != 0) {
+      status = aecp_status_entity_acquired;
+    } else if (reserved_set) {
+      status = aecp_status_bad_arguments;
+    }
+  }
+  if (status == aecp_status_success &&
+      requested != state->lite_config_flags) {
+    state->lite_config_flags = requested;
+    avb_persist_request_save(state);
+    avbinfo("AVB Lite: escalation %s by controller",
+            (requested & LITE_CONFIG_FLAG_ESCALATION_ALLOWED) ? "allowed"
+                                                              : "not allowed");
+  }
+  rsp.config_flags = state->lite_config_flags;
+  int ret = avb_lite_status_send(state, (aecp_lite_status_s *)&rsp,
+                                 sizeof(rsp), status, src_addr);
+  if (status == aecp_status_success)
+    avb_lite_status_tick(state);
+  return ret;
+}
+
 int avb_process_aecp_cmd_lite_status(avb_state_s *state, aecp_message_u *msg,
                                      eth_addr_t *src_addr) {
   aecp_lite_status_s rsp;
@@ -2086,6 +2125,13 @@ int avb_process_aecp_cmd_lite_status(avb_state_s *state, aecp_message_u *msg,
   memcpy(&rsp, msg, echo_len);
   uint16_t command_type = octets_to_uint(rsp.command_type, 2) & 0x7FFF;
   uint16_t index = octets_to_uint(rsp.avb_interface_index, 2);
+  /* An endpoint without AVB Lite support answers NOT_IMPLEMENTED. */
+  if (!state->config.avb_lite_compliant) {
+    return avb_lite_status_send(state, &rsp, echo_len,
+                                aecp_status_not_implemented, src_addr);
+  }
+  if (command_type == LITE_STATUS_CMD_SET_CONFIG)
+    return avb_process_aecp_cmd_lite_config(state, msg, src_addr);
   if (command_type != LITE_STATUS_CMD_GET) {
     return avb_lite_status_send(state, &rsp, echo_len,
                                 aecp_status_not_implemented, src_addr);
@@ -2995,6 +3041,15 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     return OK;
   }
 
+  /* CVU SRP is never answered; earlier implementations did answer, and
+   * those responses must be ignored rather than matched to anything. */
+  if (msg_type == aecp_msg_type_vendor_unique_response) {
+    aecp_cvu_common_s *cvu = (aecp_cvu_common_s *)msg;
+    uint8_t cvu_pid[] = CVU_PROTOCOL_ID;
+    if (memcmp(cvu->protocol_id, cvu_pid, 6) == 0)
+      return OK;
+  }
+
   /* Process ADDRESS_ACCESS command (separate message type from AEM) */
   if (msg->header.msg_type == aecp_msg_type_addr_access_command) {
     return avb_process_aecp_addr_access(state, msg, src_addr);
@@ -3639,9 +3694,10 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
         stream->stream_info_flags.class_b ? 'B' : 'A');
 
     /* If MSRP Ready arrived before ACMP CONNECT_TX, start now that both halves
-     * of the connection state are present. */
+     * of the connection state are present. In AVB Lite the transport pass
+     * starts the stream once it serves a listener. */
     if (stream->connected_listeners[listener_idx].msrp_ready &&
-        !stream->streaming) {
+        !stream->streaming && !state->avb_lite) {
       avb_start_stream_out(state, talker_uid);
     }
   }
@@ -4306,7 +4362,7 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
    * will declare AskingFailed; the periodic re-declare flips to Ready
    * once the talker_advertised flag is set by the MRP RX callback. */
   mrp_declare_listener(state, 0, &state->input_streams[index].stream_id,
-                       avb_input_stream_decl_event(stream));
+                       avb_listener_decl_event(state, index));
 
   return status;
 }

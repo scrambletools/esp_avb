@@ -66,6 +66,9 @@
 
 /* Unicast fan-out limit is Kconfig-gated on AVB Lite compliance;
  * builds without it still need the tx_da[] mailbox to compile. */
+#ifndef CONFIG_ESP_AVB_LITE_MEDIA_VLAN_ID
+#define CONFIG_ESP_AVB_LITE_MEDIA_VLAN_ID 2
+#endif
 #ifndef CONFIG_ESP_AVB_LITE_UNICAST_FANOUT
 #define CONFIG_ESP_AVB_LITE_UNICAST_FANOUT 1
 #endif
@@ -123,6 +126,10 @@
 #define AVB_PERSIST_FORCED_FLUSH_MSEC (10 * 60 * 1000)
 
 // Commonly used mac addresses
+/* SET_LITE_CONFIG config_flags (profiles/avb_lite.md §2.4). */
+#define LITE_CONFIG_FLAG_ESCALATION_ALLOWED 0x01
+#define LITE_CONFIG_FLAGS_KNOWN LITE_CONFIG_FLAG_ESCALATION_ALLOWED
+
 /* AVB Lite tags CVU SRP and media frames at 802.1p priority 5
  * (profiles/avb_lite.md section 7), regardless of SR class. */
 #define AVB_LITE_PCP 5
@@ -290,7 +297,7 @@ typedef struct {
       presentation_time_offset_ns; /* user-configured presentation offset. */
 } avb_persist_output_stream_s;     /* 12 bytes */
 
-#define AVB_PERSIST_VERSION 5
+#define AVB_PERSIST_VERSION 6
 typedef struct {
   uint8_t version;       /* struct version — bump on every append */
   uint8_t reserved_v[3]; /* pad to 4-byte boundary */
@@ -326,6 +333,10 @@ typedef struct {
    * value (observed: talker held at +25 ppm, measured -90 ppm, after
    * moving benches). All-zero = unknown (pre-v5 blob). */
   uint8_t pll_trim_btc_id[8];
+  /* v6: AVB Lite SET_LITE_CONFIG flags (LITE_CONFIG_FLAG_*). Zero, as
+   * an older blob reads, leaves escalation off (profile §2.4). */
+  uint8_t lite_config_flags;
+  uint8_t reserved_lite[3];
 } avb_persistent_data_s;
 
 /* Enforce that build-time sizes fit in the frozen persist layout.
@@ -581,6 +592,14 @@ typedef struct {
   volatile uint32_t tx_da_seq;
   volatile uint8_t tx_da_count;
   eth_addr_t tx_da[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
+  /* AVB Lite escalation (profiles/avb_lite.md §6, Stream transport
+   * addressing): the declaration shows the multicast address first,
+   * the frames follow at lite_multicast_tx_at_us. */
+  bool lite_declared_multicast;
+  bool lite_tx_multicast;
+  bool lite_multicast_admitted; /* the multicast copy holds egress budget */
+  int64_t lite_multicast_tx_at_us;
+  int64_t lite_start_retry_us; /* next allowed stream start attempt */
   struct {
     eth_addr_t mac_addr;      // from MSRP source
     identity_pair_t identity; // from ACMP connect_tx
@@ -615,6 +634,13 @@ typedef struct {
      * stamp (a dead listener's unicast copy otherwise floods as
      * unknown-unicast indefinitely); plain AVB ignores it. */
     int64_t last_seen_us;
+    /* AVB Lite service order: when this listener first asked for the
+     * stream (0 = not asking), whether a unicast Talker Failed refuses
+     * it, and how long it keeps its place after a refusal ends. */
+    uint32_t lite_order;
+    bool lite_refused;
+    bool lite_admitted; /* its unicast copy holds egress budget */
+    int64_t lite_hold_until_us;
   } connected_listeners[AVB_MAX_NUM_CONNECTED_LISTENERS];
 } avb_talker_stream_s;
 
@@ -926,6 +952,7 @@ typedef struct avb_state_s {
   uint8_t lite_status_sent[28]; // last AVB Lite status body sent unsolicited
   bool lite_status_sent_valid;
   bool lite_offset_alarm;       // |offset| above the §9 50 us threshold
+  uint8_t lite_config_flags;    // SET_LITE_CONFIG flags, persisted
 
   /* Deferred NVS persist.
    *  persist_dirty  — set by any writer that wants the current state
@@ -1103,6 +1130,15 @@ void avb_identify_tone(avb_state_s *state, uint32_t duration_ms);
  * talker's MSRP state. See avb.c for the rule. */
 msrp_listener_event_t
 avb_input_stream_decl_event(const avb_listener_stream_s *s);
+/* avb_input_stream_decl_event plus the AVB Lite listener rules. */
+msrp_listener_event_t avb_listener_decl_event(avb_state_s *state,
+                                              uint16_t index);
+/* Wire bandwidth of one stream copy from its TSpec, bit/s, and of one
+ * copy of output stream `index` (profiles/avb_lite.md §6 admission). */
+uint64_t avb_tspec_copy_bps(uint16_t max_frame_size,
+                            uint16_t max_interval_frames, bool class_b,
+                            uint32_t overhead_octets);
+uint64_t avb_stream_out_copy_bps(avb_state_s *state, uint16_t index);
 
 /* Stream functions */
 int avb_start_stream_in(avb_state_s *state, uint16_t index);

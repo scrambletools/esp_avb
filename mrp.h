@@ -414,6 +414,26 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
 void mrp_withdraw_listener(avb_state_s *state, int port,
                            const unique_id_t *stream_id);
 
+/* AVB Lite (profiles/avb_lite.md §6). mrp_lite_enter sends every local
+ * declaration again as CVU SRP once the endpoint falls back.
+ * mrp_lite_sync_refusals keeps one unicast Talker Failed per refused
+ * listener of a stream: each MAC in refused_macs is refused with its
+ * failure code, earlier refusals of the stream not listed are
+ * withdrawn with one Lv. Called each main loop pass. */
+void mrp_lite_enter(avb_state_s *state, int port);
+void mrp_lite_exit(avb_state_s *state);
+void mrp_lite_sync_refusals(avb_state_s *state, const unique_id_t *stream_id,
+                            const eth_addr_t *refused_macs,
+                            const uint8_t *failure_codes, int refused_count,
+                            const eth_addr_t *declared_da,
+                            const uint8_t *vlan_id, uint16_t max_frame_size,
+                            bool class_b);
+/* TSpec of the registered Talker Advertise for a stream, false when
+ * none is registered. */
+bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,
+                                uint16_t *max_frame_size,
+                                uint16_t *max_interval_frames);
+
 /* Other MSRP utilities. mrp_declare_* / mrp_withdraw_* emit;
  * mrp_rx_msrp consumes. Endpoint bookkeeping (talker DB,
  * accumulated_latency, listener readiness) runs inside the SM

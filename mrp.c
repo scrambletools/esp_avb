@@ -39,6 +39,10 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 
+/* True while the endpoint runs AVB Lite (set by mrp_lite_enter, cleared
+ * by mrp_lite_exit), for helpers that have no state argument. */
+static bool s_mrp_lite;
+
 /* ===== §1  Generic MRP state machines =====
  *
  * IEEE 802.1Q-2018 §10.7. Per-attribute Applicant + Registrar.
@@ -393,10 +397,12 @@ void mrp_tx_flush_port(avb_state_s *state, int port);
 /* Spec-allowed jitter spread for LeaveAllTime: 10 s ≤ T ≤ 15 s on
  * wired ports; 30 s ≤ T ≤ 60 s on Wi-Fi (cut #2 above). Returns an
  * absolute monotonic-µs expiry. */
-static int64_t mrp_leaveall_next_expiry_us(const avb_port_s *p) {
+static int64_t mrp_leaveall_next_expiry_us(const avb_port_s *p, bool lite) {
   uint32_t base = MRP_LEAVEALL_TIMER_US;
   uint32_t jitter_span = 5 * 1000 * 1000;
-  if (p->medium == avb_port_medium_wifi_ftm) {
+  /* AVB Lite peers age declarations out at 16 s, so the redeclaration
+   * this timer drives stays at 10 to 15 s on every medium. */
+  if (p->medium == avb_port_medium_wifi_ftm && !lite) {
     base = MRP_LEAVEALL_TIMER_WIFI_US;
     jitter_span = MRP_LEAVEALL_JITTER_WIFI_US;
   }
@@ -417,7 +423,7 @@ void mrp_port_init(avb_state_s *state, int port) {
     return;
   avb_port_s *p = &state->port[port];
   p->mrp_join_timer_us = 0; /* disarmed; armed when first sm->pending_tx set */
-  p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
+  p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p, state->avb_lite);
   p->mrp_periodic_timer_us = esp_timer_get_time() + MRP_PERIODIC_TIMER_US;
   p->mrp_leaveall_tx_pending = false;
 }
@@ -427,6 +433,9 @@ void mrp_port_init(avb_state_s *state, int port) {
 static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
                                            int64_t now);
 static void mrp_port_dispatch_periodic(int port);
+/* AVB Lite declaration timing, defined after the TX flush helpers. */
+static bool mrp_lite_flush(avb_state_s *state, int port, int64_t now);
+static void mrp_lite_redeclare_all(int port, int64_t now);
 
 /* Called from avb_periodic / avb main loop on every tick. Fires
  * expired port-scoped timers. Returns true if anything fired. */
@@ -451,14 +460,16 @@ bool mrp_port_tick(avb_state_s *state, int port) {
       suppress = true;
     }
 #endif
-    /* AVB Lite: declarations refresh via CVU, not MRPDUs, so a legacy
-     * LeaveAll would demolish peer registrations with no in-protocol
-     * refresh to follow. Staleness is handled by the CVU idle timeout
-     * in mrp_port_dispatch_leave_timers instead. */
-    if (!suppress && !state->avb_lite) {
+    /* AVB Lite: no LeaveAll goes out, a peer has no shared link to
+     * redeclare on. Each endpoint instead sends all its declarations
+     * again, twice and JoinTime apart, as an MRP participant does after
+     * a LeaveAll (profiles/avb_lite.md §6, Declaration timing). */
+    if (!suppress && state->avb_lite) {
+      mrp_lite_redeclare_all(port, now);
+    } else if (!suppress) {
       p->mrp_leaveall_tx_pending = true;
     }
-    p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p);
+    p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p, state->avb_lite);
     fired = true;
     /* TODO: iterate this port's attribute table and step
      * applicant + registrar with mrp_event_r_la on each entry. */
@@ -472,6 +483,11 @@ bool mrp_port_tick(avb_state_s *state, int port) {
    * listener loses sight of the talker and its decl flaps between
    * Ready and AskingFailed — which the bridge MAP merger then
    * propagates backward as a flapping listener decl. */
+  /* AVB Lite does not use PeriodicTime. */
+  if (p->mrp_periodic_timer_us != 0 && now >= p->mrp_periodic_timer_us &&
+      state->avb_lite) {
+    p->mrp_periodic_timer_us = now + MRP_PERIODIC_TIMER_US;
+  }
   if (p->mrp_periodic_timer_us != 0 && now >= p->mrp_periodic_timer_us) {
     p->mrp_periodic_timer_us = now + MRP_PERIODIC_TIMER_US;
     fired = true;
@@ -494,6 +510,12 @@ bool mrp_port_tick(avb_state_s *state, int port) {
     p->mrp_join_timer_us = 0; /* disarm; rearm when next state change */
     fired = true;
     mrp_tx_flush_port(state, port);
+  }
+
+  /* AVB Lite: MSRP talker and listener declarations go out on their
+   * own per-entry schedule as CVU SRP messages. */
+  if (state->avb_lite && mrp_lite_flush(state, port, now)) {
+    fired = true;
   }
 
   /* LeaveTimer dispatch — implementation below in §7 (after the
@@ -565,10 +587,13 @@ typedef struct {
    * propagating the stream's advertise entirely until a LeaveAll
    * cycles it out (minutes). 0 = no quarantine. */
   int64_t redeclare_after_us;
-  /* CVU idle-timeout stamp (avb_lite.md §6.6 "MSRP-like timeout"):
+  /* CVU idle-timeout stamp (avb_lite.md §6, Declaration timing):
    * refreshed on every RX of this attribute; with LeaveAll disabled
    * in AVB Lite this is the only staleness mechanism. */
   int64_t last_refresh_us;
+  /* AVB Lite: earliest time this entry's Applicant may send again,
+   * keeping each pair of sends JoinTime apart. */
+  int64_t lite_next_tx_us;
   /* Source MAC of the peer that declared this attribute (zero for
    * locally-originated entries). AVB Lite listeners unicast their
    * CVU listener declarations to this address (avb_lite.md §6
@@ -603,6 +628,7 @@ typedef struct {
   eth_addr_t peer_mac;
   mrp_sm_state_t sm;
   int64_t last_refresh_us; /* see msrp_talker_entry_t */
+  int64_t lite_next_tx_us; /* see msrp_talker_entry_t */
 } msrp_listener_entry_t;
 
 typedef struct {
@@ -680,12 +706,29 @@ bool mrp_talker_advertise_active(int port, const unique_id_t *stream_id) {
                        e->sm.registrar == mrp_registrar_lv);
 }
 
+bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,
+                                uint16_t *max_frame_size,
+                                uint16_t *max_interval_frames) {
+  if (!mrp_talker_advertise_active(port, stream_id))
+    return false;
+  msrp_talker_entry_t *e =
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
+  *max_frame_size =
+      (uint16_t)octets_to_uint(e->wire.talker.info.tspec_max_frame_size, 2);
+  *max_interval_frames =
+      (uint16_t)octets_to_uint(e->wire.talker.info.tspec_max_frame_interval, 2);
+  return true;
+}
+
 bool mrp_talker_failed_active(int port, const unique_id_t *stream_id,
                               uint8_t *failure_code_out) {
   msrp_talker_entry_t *e =
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_failed);
+  /* AVB Lite has no LeaveAll, so LV only follows the talker's Lv, which
+   * ends the refusal's precedence at once (profiles/avb_lite.md §6
+   * item 10). */
   if (e == NULL || (e->sm.registrar != mrp_registrar_in &&
-                    e->sm.registrar != mrp_registrar_lv)) {
+                    (s_mrp_lite || e->sm.registrar != mrp_registrar_lv))) {
     return false;
   }
   if (failure_code_out) {
@@ -1014,8 +1057,12 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
           state->input_streams[i].msrp_failure_code[0] =
               wire->talker_failed.failure_code;
           state->input_streams[i].msrp_failure_code[1] = 0;
-        } else {
-          /* Fresh TALKER_ADVERTISE supersedes any stale failure. */
+        } else if (!state->avb_lite ||
+                   !mrp_talker_failed_active(port,
+                                             (const unique_id_t *)info->stream_id,
+                                             NULL)) {
+          /* Fresh TALKER_ADVERTISE supersedes any stale failure, except
+           * an AVB Lite unicast refusal still in force. */
           state->input_streams[i].msrp_failure_code[0] = 0;
           state->input_streams[i].msrp_failure_code[1] = 0;
         }
@@ -1288,7 +1335,12 @@ static void mrp_on_listener_registrar_change(
      * and purge rows that never completed ACMP, so connection_count
      * tracks live listeners again. */
     if (src_addr == NULL) {
-      if (tr == mrp_reg_transition_deregister) {
+      /* AVB Lite: every listener's declarations go unicast to this
+       * talker and refresh only every 10 to 15 s, so one listener's Lv
+       * lets the shared registration expire while the others still
+       * want the stream. Rows age out one by one on their own refresh
+       * stamps (avb_lite_update_stream_tx_addrs) instead. */
+      if (tr == mrp_reg_transition_deregister && !state->avb_lite) {
         int count = octets_to_uint(stream->connection_count, 2);
         if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
           count = AVB_MAX_NUM_CONNECTED_LISTENERS;
@@ -1330,7 +1382,9 @@ static void mrp_on_listener_registrar_change(
         bool should_stop = !any_listener_ready(stream) ||
                            (!state->config.milan_compliant &&
                             !any_listener_acmp_connected(stream));
-        if (should_stop && stream->streaming) {
+        /* AVB Lite: the transport pass stops the stream once it serves
+         * no listener. */
+        if (should_stop && stream->streaming && !state->avb_lite) {
           avb_stop_stream_out(state, i);
         }
       }
@@ -1362,7 +1416,9 @@ static void mrp_on_listener_registrar_change(
           state->config.milan_compliant
               ? stream->connected_listeners[lidx].msrp_ready
               : stream->connected_listeners[lidx].acmp_connected;
-      if (should_start && !stream->streaming) {
+      /* AVB Lite: avb_lite_update_stream_tx_addrs starts the stream
+       * once it serves a listener, a refused one must not start it. */
+      if (should_start && !stream->streaming && !state->avb_lite) {
         avb_start_stream_out(state, i);
       }
       break;
@@ -1410,7 +1466,7 @@ static void mrp_on_listener_registrar_change(
           bool should_stop = !any_listener_ready(stream) ||
                              (!state->config.milan_compliant &&
                               !any_listener_acmp_connected(stream));
-          if (should_stop && stream->streaming) {
+          if (should_stop && stream->streaming && !state->avb_lite) {
             avbinfo("MSRP: no listener can receive stream %d — stopping", i);
             avb_stop_stream_out(state, i);
           }
@@ -1622,8 +1678,12 @@ msrp_rx_talker_attr(avb_state_s *state, int port, msrp_attr_type_t attr_type,
    * latches forever — the bridge sends no Failed-type PDUs once
    * healthy, so no per-type LeaveAll ever ages the stale registrar
    * out, and decl_event keeps reporting ReadyFailed. */
-  if (e->sm.registrar == mrp_registrar_in ||
-      e->sm.registrar == mrp_registrar_lv) {
+  /* AVB Lite keeps both: a talker refuses one listener with a unicast
+   * Talker Failed while its broadcast declaration stays Advertise, and
+   * the Failed takes precedence until withdrawn or aged out (§6 item
+   * 10, see avb_input_stream_decl_event). */
+  if (!state->avb_lite && (e->sm.registrar == mrp_registrar_in ||
+                           e->sm.registrar == mrp_registrar_lv)) {
     msrp_attr_type_t twin_type = (attr_type == msrp_attr_type_talker_failed)
                                      ? msrp_attr_type_talker_advertise
                                      : msrp_attr_type_talker_failed;
@@ -2030,6 +2090,57 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
  * listener subscribes, etc.). Drives the matching Applicant via
  * the appropriate local-origin event and arms the JoinTimer. */
 
+/* Applicant states that send on the next tx! (Table 10-3). */
+static bool mrp_applicant_will_send(mrp_applicant_state_e applicant) {
+  return applicant == mrp_applicant_vp || applicant == mrp_applicant_vn ||
+         applicant == mrp_applicant_an || applicant == mrp_applicant_aa ||
+         applicant == mrp_applicant_la;
+}
+
+/* A local event that leaves the Applicant newly due to send makes the
+ * first send go out at once in AVB Lite; mrp_lite_flush sends the
+ * second JoinTime later. */
+static void mrp_lite_note_local(const mrp_sm_state_t *sm,
+                                mrp_applicant_state_e before,
+                                int64_t *next_tx_us) {
+  if (sm->applicant != before && mrp_applicant_will_send(sm->applicant))
+    *next_tx_us = esp_timer_get_time();
+}
+
+/* Local withdrawal. AVB Lite sends a withdrawn declaration once with Lv
+ * (profiles/avb_lite.md §6): Lv! from VN or AN would go to LO and send
+ * nothing although a declaration may already be out, so take LA, which
+ * sends one Lv. */
+static void mrp_withdraw_step(mrp_sm_state_t *sm) {
+  mrp_applicant_state_e before = sm->applicant;
+  mrp_applicant_step(sm, mrp_event_lv);
+  if (s_mrp_lite &&
+      (before == mrp_applicant_vn || before == mrp_applicant_an))
+    sm->applicant = mrp_applicant_la;
+}
+
+/* FailureInformation Bridge ID for a failure this node detects: an
+ * AVB Lite endpoint gives priority 0 followed by its MAC address
+ * (profiles/avb_lite.md §6, Declaration content); otherwise the EUI-64
+ * form used so far. */
+static void mrp_own_failure_bridge_id(avb_state_s *state, uint8_t *out) {
+  const uint8_t *mac = (const uint8_t *)state->port[0].internal_mac_addr;
+  if (state->avb_lite) {
+    out[0] = 0;
+    out[1] = 0;
+    memcpy(&out[2], mac, ETH_ADDR_LEN);
+    return;
+  }
+  out[0] = mac[0];
+  out[1] = mac[1];
+  out[2] = mac[2];
+  out[3] = 0xff;
+  out[4] = 0xfe;
+  out[5] = mac[3];
+  out[6] = mac[4];
+  out[7] = mac[5];
+}
+
 /* Build the TALKER ADVERTISE wire struct from individual fields.
  * Used by both mrp_declare_ entry points; the SM-driven TX flush
  * re-uses these fields verbatim. */
@@ -2150,8 +2261,20 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
   memcpy(fresh.talker.info.accumulated_latency,
          e->wire.talker.info.accumulated_latency,
          sizeof(fresh.talker.info.accumulated_latency));
-  if (memcmp(&e->wire.talker.info, &fresh.talker.info,
-             sizeof(fresh.talker.info)) != 0) {
+  mrp_applicant_state_e applicant_before = e->sm.applicant;
+  if (state->avb_lite && memcmp(&e->wire.talker.info, &fresh.talker.info,
+                                sizeof(fresh.talker.info)) != 0) {
+    /* AVB Lite: a changed value, the unicast/multicast mode change of
+     * the destination_address in particular, is a new declaration sent
+     * with New at once and again JoinTime later; receivers replace the
+     * stream's registration with it (profiles/avb_lite.md §6,
+     * Declaration content). No withdrawal or quarantine. */
+    mrp_sm_reset_for_new_value(&e->sm);
+    e->redeclare_after_us = 0;
+    e->wire = fresh;
+    e->lite_next_tx_us = esp_timer_get_time();
+  } else if (memcmp(&e->wire.talker.info, &fresh.talker.info,
+                    sizeof(fresh.talker.info)) != 0) {
     /* Freshness must be judged by the destination address, not the
      * stream_id: find_or_insert pre-copies the stream_id into a new
      * slot, so a stream_id test mistakes the very first declaration
@@ -2182,6 +2305,7 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
   }
   e->wire = fresh;
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
+  mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
   mrp_port_arm_join_timer(state, port);
 }
 
@@ -2196,6 +2320,7 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
   if (e == NULL)
     return;
   e->locally_originated = true;
+  mrp_applicant_state_e applicant_before = e->sm.applicant;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker_failed.info, stream_id,
                         stream_dest_addr, vlan_id, max_frame_size, class_b);
@@ -2212,17 +2337,10 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
   if (src_bridge_id != NULL) {
     memcpy(e->wire.talker_failed.failure_bridge_id, src_bridge_id, 8);
   } else {
-    const uint8_t *m = (const uint8_t *)state->port[0].internal_mac_addr;
-    e->wire.talker_failed.failure_bridge_id[0] = m[0];
-    e->wire.talker_failed.failure_bridge_id[1] = m[1];
-    e->wire.talker_failed.failure_bridge_id[2] = m[2];
-    e->wire.talker_failed.failure_bridge_id[3] = 0xff;
-    e->wire.talker_failed.failure_bridge_id[4] = 0xfe;
-    e->wire.talker_failed.failure_bridge_id[5] = m[3];
-    e->wire.talker_failed.failure_bridge_id[6] = m[4];
-    e->wire.talker_failed.failure_bridge_id[7] = m[5];
+    mrp_own_failure_bridge_id(state, e->wire.talker_failed.failure_bridge_id);
   }
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
+  mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
   mrp_port_arm_join_timer(state, port);
 }
 
@@ -2232,8 +2350,27 @@ void mrp_declare_listener(avb_state_s *state, int port,
   msrp_listener_entry_t *e = msrp_listener_find_or_insert(port, stream_id);
   if (e == NULL)
     return;
+  mrp_applicant_state_e applicant_before = e->sm.applicant;
+  bool decl_changed = e->decl_event != decl;
   e->decl_event = decl;
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
+  /* AVB Lite: a changed declaration type goes out at once and again
+   * JoinTime later, Join from a quiet or anxious Applicant would not
+   * send it until the next 10 to 15 s redeclaration. */
+  if (state->avb_lite && decl_changed &&
+      (e->sm.applicant == mrp_applicant_qa ||
+       e->sm.applicant == mrp_applicant_aa ||
+       e->sm.applicant == mrp_applicant_ap ||
+       e->sm.applicant == mrp_applicant_qp)) {
+    e->sm.applicant = mrp_applicant_vp;
+    applicant_before = mrp_applicant_qa;
+  } else if (state->avb_lite && decl_changed &&
+             e->sm.applicant == mrp_applicant_an) {
+    /* One New went out with the old type: send the new one twice. */
+    e->sm.applicant = mrp_applicant_vn;
+    e->lite_next_tx_us = esp_timer_get_time();
+  }
+  mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
   mrp_port_arm_join_timer(state, port);
 }
 
@@ -2259,12 +2396,16 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
   msrp_talker_entry_t *e =
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
   if (e != NULL) {
-    mrp_applicant_step(&e->sm, mrp_event_lv);
+    mrp_applicant_state_e applicant_before = e->sm.applicant;
+    mrp_withdraw_step(&e->sm);
+    mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
     armed = true;
   }
   e = msrp_talker_find(port, stream_id, msrp_attr_type_talker_failed);
   if (e != NULL) {
-    mrp_applicant_step(&e->sm, mrp_event_lv);
+    mrp_applicant_state_e applicant_before = e->sm.applicant;
+    mrp_withdraw_step(&e->sm);
+    mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
     armed = true;
   }
   if (armed)
@@ -2276,7 +2417,9 @@ void mrp_withdraw_listener(avb_state_s *state, int port,
   msrp_listener_entry_t *e = msrp_listener_find(port, stream_id);
   if (e == NULL)
     return;
-  mrp_applicant_step(&e->sm, mrp_event_lv);
+  mrp_applicant_state_e applicant_before = e->sm.applicant;
+  mrp_withdraw_step(&e->sm);
+  mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
   mrp_port_arm_join_timer(state, port);
 }
 
@@ -2413,8 +2556,10 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
   mrp_event_e tx_ev =
       p->mrp_leaveall_tx_pending ? mrp_event_tx_la : mrp_event_tx;
   bool leaveall = p->mrp_leaveall_tx_pending;
+  /* AVB Lite sends talker and listener declarations from mrp_lite_flush. */
+  bool lite = state->avb_lite;
 
-  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE && !lite; i++) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
     if (!e->valid)
       continue;
@@ -2424,7 +2569,7 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
       e->sm.pending_tx = mrp_tx_none;
     }
   }
-  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE && !lite; i++) {
     msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
     if (!e->valid)
       continue;
@@ -2450,6 +2595,266 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
   mrp_tx_flush_mvrp(state, port, leaveall, tx_ev);
 
   p->mrp_leaveall_tx_pending = false;
+}
+
+/* ----- §6d  AVB Lite declaration timing and listener refusals -----
+ *
+ * CVU SRP keeps MRP's timers between endpoints (profiles/avb_lite.md
+ * §6, Declaration timing): a new or changed declaration goes out at
+ * once and again JoinTime later, every declaration is sent again twice
+ * each time the 10 to 15 s LeaveAll timer expires, a withdrawal goes
+ * out once with Lv, and a registration not refreshed within 16 s ages
+ * out. Each entry keeps its own next send time, so the two sends of a
+ * pair stay JoinTime apart whatever else changes.
+ *
+ * A talker refuses one listener with a Talker Failed sent to that
+ * listener alone (§6 item 10) while its broadcast declaration stays
+ * Talker Advertise. Those unicast declarations live in their own
+ * table, keyed by stream and listener MAC address. */
+#define MRP_LITE_JOIN_TIME_US (200 * 1000)
+#define MSRP_LITE_REFUSAL_TABLE_SIZE                                           \
+  (AVB_MAX_NUM_OUTPUT_STREAMS * AVB_MAX_NUM_CONNECTED_LISTENERS)
+
+typedef struct {
+  bool valid;
+  eth_addr_t listener_mac;
+  msrp_talker_message_u wire; /* Talker Failed form */
+  mrp_sm_state_t sm;
+  int64_t lite_next_tx_us;
+} msrp_lite_refusal_entry_t;
+
+static msrp_lite_refusal_entry_t s_lite_refusals[MSRP_LITE_REFUSAL_TABLE_SIZE];
+
+/* Applicant states that hold an active local declaration. */
+static bool mrp_applicant_declaring(mrp_applicant_state_e applicant) {
+  switch (applicant) {
+  case mrp_applicant_vn:
+  case mrp_applicant_an:
+  case mrp_applicant_aa:
+  case mrp_applicant_qa:
+  case mrp_applicant_vp:
+  case mrp_applicant_ap:
+  case mrp_applicant_qp:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* Fire tx! on an entry whose send is due. Returns true when the
+ * Applicant produced a send. */
+static bool mrp_lite_entry_due(mrp_sm_state_t *sm, int64_t *next_tx_us,
+                               int64_t now) {
+  if (!mrp_applicant_will_send(sm->applicant) || now < *next_tx_us)
+    return false;
+  mrp_applicant_step(sm, mrp_event_tx);
+  *next_tx_us = now + MRP_LITE_JOIN_TIME_US;
+  return sm->pending_tx != mrp_tx_none;
+}
+
+static void mrp_tx_flush_refusal(avb_state_s *state, int port,
+                                 msrp_lite_refusal_entry_t *refusal) {
+  msrp_talker_message_u msg = refusal->wire;
+  msg.header.attr_type = msrp_attr_type_talker_failed;
+  msg.header.attr_len = 34;
+  int attr_list_len = 39;
+  int_to_octets(&attr_list_len, msg.header.attr_list_len, 2);
+  msg.header.vechead_leaveall = 0;
+  msg.header.vechead_num_vals = 1;
+  int pe = mrp_resolve_3pe(refusal->sm.pending_tx, refusal->sm.registrar);
+  if (pe < 0)
+    return;
+  msg.talker_failed.event_data[0] = int_to_3pe(pe, 0, 0);
+  mrp_send_attr(state, port, &msg, attr_list_len, "talker refusal",
+                (const eth_addr_t *)&refusal->listener_mac);
+}
+
+static bool mrp_lite_flush(avb_state_s *state, int port, int64_t now) {
+  bool sent = false;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
+    if (!e->valid)
+      continue;
+    if (mrp_lite_entry_due(&e->sm, &e->lite_next_tx_us, now)) {
+      mrp_tx_flush_talker(state, port, e, false);
+      sent = true;
+    }
+    e->sm.pending_tx = mrp_tx_none;
+  }
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
+    msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
+    if (!e->valid)
+      continue;
+    if (mrp_lite_entry_due(&e->sm, &e->lite_next_tx_us, now)) {
+      mrp_tx_flush_listener(state, port, e, false);
+      sent = true;
+    }
+    e->sm.pending_tx = mrp_tx_none;
+  }
+  if (port != 0)
+    return sent;
+  for (int i = 0; i < MSRP_LITE_REFUSAL_TABLE_SIZE; i++) {
+    msrp_lite_refusal_entry_t *refusal = &s_lite_refusals[i];
+    if (!refusal->valid)
+      continue;
+    if (mrp_lite_entry_due(&refusal->sm, &refusal->lite_next_tx_us, now)) {
+      mrp_tx_flush_refusal(state, port, refusal);
+      sent = true;
+    }
+    refusal->sm.pending_tx = mrp_tx_none;
+    /* Withdrawn and its Lv sent: the refusal is gone. */
+    if (!mrp_applicant_declaring(refusal->sm.applicant) &&
+        refusal->sm.applicant != mrp_applicant_la)
+      refusal->valid = false;
+  }
+  return sent;
+}
+
+/* Redeclare every local declaration twice, JoinTime apart, as an MRP
+ * participant does after a LeaveAll. Only the Applicant steps: no
+ * LeaveAll is sent or received, so registrations stay as they are. */
+static void mrp_lite_redeclare_sm(mrp_sm_state_t *sm, int64_t *next_tx_us,
+                                  int64_t now) {
+  if (!mrp_applicant_declaring(sm->applicant))
+    return;
+  mrp_applicant_state_e before = sm->applicant;
+  mrp_applicant_step(sm, mrp_event_r_la);
+  if (sm->applicant != before && mrp_applicant_will_send(sm->applicant))
+    *next_tx_us = now;
+}
+
+static void mrp_lite_redeclare_all(int port, int64_t now) {
+  if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
+    if (e->valid && e->locally_originated)
+      mrp_lite_redeclare_sm(&e->sm, &e->lite_next_tx_us, now);
+  }
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
+    msrp_listener_entry_t *e = &s_msrp_listeners[port][i];
+    if (e->valid)
+      mrp_lite_redeclare_sm(&e->sm, &e->lite_next_tx_us, now);
+  }
+  if (port != 0)
+    return;
+  for (int i = 0; i < MSRP_LITE_REFUSAL_TABLE_SIZE; i++) {
+    msrp_lite_refusal_entry_t *refusal = &s_lite_refusals[i];
+    if (refusal->valid)
+      mrp_lite_redeclare_sm(&refusal->sm, &refusal->lite_next_tx_us, now);
+  }
+}
+
+void mrp_lite_enter(avb_state_s *state, int port) {
+  (void)state;
+  s_mrp_lite = true;
+  /* Declarations made before the fallback went out as MRPDUs; send
+   * them again as CVU SRP. */
+  mrp_lite_redeclare_all(port, esp_timer_get_time());
+}
+
+void mrp_lite_exit(avb_state_s *state) {
+  (void)state;
+  s_mrp_lite = false;
+  /* Refusals belong to the AVB Lite session; gPTP mode has bridges. */
+  memset(s_lite_refusals, 0, sizeof(s_lite_refusals));
+}
+
+static msrp_lite_refusal_entry_t *
+mrp_lite_refusal_find(const unique_id_t *stream_id,
+                      const eth_addr_t *listener_mac) {
+  for (int i = 0; i < MSRP_LITE_REFUSAL_TABLE_SIZE; i++) {
+    msrp_lite_refusal_entry_t *refusal = &s_lite_refusals[i];
+    if (refusal->valid &&
+        stream_id_eq((const unique_id_t *)&refusal->wire.talker_failed.info
+                         .stream_id,
+                     stream_id) &&
+        memcmp(refusal->listener_mac, listener_mac, ETH_ADDR_LEN) == 0)
+      return refusal;
+  }
+  return NULL;
+}
+
+void mrp_lite_sync_refusals(avb_state_s *state, const unique_id_t *stream_id,
+                            const eth_addr_t *refused_macs,
+                            const uint8_t *failure_codes, int refused_count,
+                            const eth_addr_t *declared_da,
+                            const uint8_t *vlan_id, uint16_t max_frame_size,
+                            bool class_b) {
+  int64_t now = esp_timer_get_time();
+  /* Withdraw, with one Lv, every refusal of this stream that is no
+   * longer wanted: the talker can serve that listener now, or the
+   * listener has gone. */
+  for (int i = 0; i < MSRP_LITE_REFUSAL_TABLE_SIZE; i++) {
+    msrp_lite_refusal_entry_t *refusal = &s_lite_refusals[i];
+    if (!refusal->valid ||
+        !stream_id_eq((const unique_id_t *)&refusal->wire.talker_failed.info
+                          .stream_id,
+                      stream_id))
+      continue;
+    bool still_refused = false;
+    for (int k = 0; k < refused_count; k++) {
+      if (memcmp(refusal->listener_mac, refused_macs[k], ETH_ADDR_LEN) == 0) {
+        still_refused = true;
+        break;
+      }
+    }
+    if (still_refused || !mrp_applicant_declaring(refusal->sm.applicant))
+      continue;
+    mrp_applicant_state_e before = refusal->sm.applicant;
+    mrp_withdraw_step(&refusal->sm);
+    mrp_lite_note_local(&refusal->sm, before, &refusal->lite_next_tx_us);
+    avbinfo("CVU: talker serves %02x:%02x:%02x:%02x:%02x:%02x again, "
+            "refusal withdrawn",
+            refusal->listener_mac[0], refusal->listener_mac[1],
+            refusal->listener_mac[2], refusal->listener_mac[3],
+            refusal->listener_mac[4], refusal->listener_mac[5]);
+  }
+  for (int k = 0; k < refused_count; k++) {
+    msrp_talker_message_u candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    mrp_build_talker_info(state, &candidate.talker_failed.info, stream_id,
+                          declared_da, vlan_id, max_frame_size, class_b);
+    candidate.talker_failed.failure_code = failure_codes[k];
+    mrp_own_failure_bridge_id(state, candidate.talker_failed.failure_bridge_id);
+    msrp_lite_refusal_entry_t *refusal =
+        mrp_lite_refusal_find(stream_id, &refused_macs[k]);
+    if (refusal == NULL) {
+      for (int i = 0; i < MSRP_LITE_REFUSAL_TABLE_SIZE; i++) {
+        if (!s_lite_refusals[i].valid) {
+          refusal = &s_lite_refusals[i];
+          break;
+        }
+      }
+      if (refusal == NULL)
+        continue; /* table full: the listener keeps hearing Advertise */
+      memset(refusal, 0, sizeof(*refusal));
+      refusal->valid = true;
+      memcpy(refusal->listener_mac, refused_macs[k], ETH_ADDR_LEN);
+      refusal->sm.applicant = mrp_applicant_vo;
+      refusal->sm.registrar = mrp_registrar_mt;
+      refusal->wire = candidate;
+      avbwarn("CVU: refusing %02x:%02x:%02x:%02x:%02x:%02x, failure code %u",
+              refused_macs[k][0], refused_macs[k][1], refused_macs[k][2],
+              refused_macs[k][3], refused_macs[k][4], refused_macs[k][5],
+              failure_codes[k]);
+    } else if (memcmp(&refusal->wire.talker_failed.info,
+                      &candidate.talker_failed.info,
+                      sizeof(candidate.talker_failed.info)) != 0 ||
+               refusal->wire.talker_failed.failure_code !=
+                   candidate.talker_failed.failure_code) {
+      /* A changed refusal is a new declaration, as for Advertise. */
+      mrp_sm_reset_for_new_value(&refusal->sm);
+      refusal->wire = candidate;
+    } else if (mrp_applicant_declaring(refusal->sm.applicant)) {
+      continue; /* unchanged and still declared */
+    }
+    mrp_applicant_state_e before = refusal->sm.applicant;
+    mrp_applicant_step(&refusal->sm, mrp_declare_event(&refusal->sm));
+    if (refusal->sm.applicant != before ||
+        refusal->sm.applicant == mrp_applicant_vn)
+      refusal->lite_next_tx_us = now;
+  }
 }
 
 /* SRP class-mapping helpers. SR Class A = mapping index 0 (sr_class_id 6),
@@ -2549,14 +2954,14 @@ static bool mrp_port_dispatch_leave_timers(avb_state_s *state, int port,
       fired = true;
     }
   }
-#define MRP_CVU_IDLE_TIMEOUT_US (30 * 1000 * 1000)
-  /* AVB Lite staleness (avb_lite.md §6.6): with LeaveAll disabled the
-   * registrar only leaves IN on an explicit wire Lv — a silently dead
-   * peer would pin its registration forever. Expire registrations not
-   * refreshed for 30 s. The SM-paced CVU refresh cadence is measured
-   * ~3.7 s aggregate across streams, so 30 s gives ~8x margin while
-   * still bounding dead-peer staleness within the MSRP-like envelope through the same deregister
-   * callbacks a LeaveTimer expiry fires. */
+/* 1.5 x LeaveAllTime + LeaveTime (profiles/avb_lite.md §6). */
+#define MRP_CVU_IDLE_TIMEOUT_US (16 * 1000 * 1000)
+  /* AVB Lite staleness (avb_lite.md §6, Declaration timing): with no
+   * LeaveAll the registrar only leaves IN on an explicit Lv, so a
+   * silently dead peer would pin its registration forever. Expire
+   * registrations not refreshed within 16 s, the longest MRP keeps a
+   * registration whose declarant fell silent, through the same
+   * deregister callbacks a LeaveTimer expiry fires. */
   if (state->avb_lite) {
     for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; ++i) {
       msrp_talker_entry_t *e = &s_msrp_talkers[port][i];

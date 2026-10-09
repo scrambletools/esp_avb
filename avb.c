@@ -155,6 +155,33 @@ static void avb_intersect_bit_rates(avb_bit_rates_s *out,
   }
 }
 
+/* Media VLAN for the current mode: the AVB Lite media VLAN
+ * (profiles/avb_lite.md §7, 2 by default or 0 for a priority tag only)
+ * while in AVB Lite, the SR class VLANs otherwise. Streams already
+ * running keep their tag until they restart. */
+static void avb_apply_media_vlan(avb_state_s *state) {
+  uint16_t class_a_vlan = state->config.class_a_vlan_id
+                              ? state->config.class_a_vlan_id
+                              : CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_A;
+  uint16_t class_b_vlan = state->config.class_b_vlan_id
+                              ? state->config.class_b_vlan_id
+                              : CONFIG_ESP_AVB_STREAM_VLAN_ID_CLASS_B;
+  if (state->avb_lite) {
+    class_a_vlan = CONFIG_ESP_AVB_LITE_MEDIA_VLAN_ID;
+    class_b_vlan = CONFIG_ESP_AVB_LITE_MEDIA_VLAN_ID;
+  }
+  int_to_octets(&class_a_vlan, state->msrp_mappings[0].vlan_id, 2);
+  int_to_octets(&class_b_vlan, state->msrp_mappings[1].vlan_id, 2);
+  for (int i = 0; i < state->num_output_streams; i++) {
+    uint16_t mapping_index =
+        state->output_streams[i].stream_info_flags.class_b ? 1 : 0;
+    memcpy(state->output_streams[i].vlan_id,
+           state->msrp_mappings[mapping_index].vlan_id, 2);
+  }
+}
+
+static void avb_declare_output_stream(avb_state_s *state, uint16_t index);
+
 static void avb_update_avb_lite_from_ptp(avb_state_s *state) {
   bool avb_lite = state->config.avb_lite_compliant &&
                   state->ptp_status.ptp_profile == ptp_profile_standard;
@@ -163,6 +190,35 @@ static void avb_update_avb_lite_from_ptp(avb_state_s *state) {
             avb_lite ? "enabled" : "disabled",
             state->ptp_status.ptp_profile == ptp_profile_gptp ? "gPTP" : "standard",
             state->config.avb_lite_compliant ? "yes" : "no");
+    /* MVRP stops in AVB Lite: withdraw the SR class VLANs once. */
+    if (avb_lite) {
+      for (int m = 0; m < state->msrp_mappings_count; m++)
+        mrp_withdraw_vlan(state, 0, state->msrp_mappings[m].vlan_id);
+    }
+    state->avb_lite = avb_lite;
+    avb_apply_media_vlan(state);
+    for (int i = 0; i < state->num_output_streams; i++) {
+      avb_talker_stream_s *stream = &state->output_streams[i];
+      stream->lite_declared_multicast = false;
+      stream->lite_tx_multicast = false;
+      stream->lite_multicast_admitted = false;
+    }
+    if (avb_lite) {
+      /* Declare the Lite value (zero address, priority 5, media VLAN)
+       * before the CVU redeclaration, so the gPTP value never goes out
+       * as CVU SRP. */
+      if (state->config.talker) {
+        for (int i = 0; i < state->num_output_streams; i++) {
+          static const uint8_t zero_sid[UNIQUE_ID_LEN] = {0};
+          if (memcmp(state->output_streams[i].stream_id, zero_sid,
+                     UNIQUE_ID_LEN) != 0)
+            avb_declare_output_stream(state, i);
+        }
+      }
+      mrp_lite_enter(state, 0);
+    } else {
+      mrp_lite_exit(state);
+    }
   }
   state->avb_lite = avb_lite;
 }
@@ -230,35 +286,335 @@ void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream,
          sizeof(stream->connected_listeners[0]));
 }
 
-/* AVB Lite unicast transport (avb_lite.md §6, "Stream transport
+/* Bandwidth one copy of a stream takes on the wire, in bit/s: TSpec
+ * frames plus the 42 octets per frame MaxFrameSize leaves out
+ * (preamble, header, tag, FCS, interframe gap), at the class
+ * measurement interval (IEEE 802.1Q-2022 34.4, 35.2.2.8.4). */
+#define AVB_TSPEC_OVERHEAD_OCTETS 42u
+uint64_t avb_tspec_copy_bps(uint16_t max_frame_size,
+                            uint16_t max_interval_frames, bool class_b,
+                            uint32_t overhead_octets) {
+  uint64_t intervals = class_b ? 4000u : 8000u;
+  return ((uint64_t)max_frame_size + overhead_octets) * max_interval_frames *
+         intervals * 8u;
+}
+
+uint64_t avb_stream_out_copy_bps(avb_state_s *state, uint16_t index) {
+  return avb_tspec_copy_bps(
+      avb_compute_tspec_max_frame_size(state, index), 1,
+      state->output_streams[index].stream_info_flags.class_b,
+      AVB_TSPEC_OVERHEAD_OCTETS);
+}
+
+/* Destination address an output stream's Talker declaration carries.
+ * In AVB Lite it shows the transport mode: zero while the stream goes
+ * unicast, the MAAP address once it has escalated (profiles/avb_lite.md
+ * §6, Declaration content). */
+static const eth_addr_t *avb_declared_dest_addr(avb_state_s *state,
+                                                avb_talker_stream_s *stream) {
+  static const eth_addr_t zero_da = {0};
+  if (state->avb_lite && !stream->lite_declared_multicast)
+    return &zero_da;
+  return &stream->stream_dest_addr;
+}
+
+/* Declare (or keep declaring) an output stream's Talker Advertise. */
+static void avb_declare_output_stream(avb_state_s *state, uint16_t index) {
+  avb_talker_stream_s *stream = &state->output_streams[index];
+  mrp_declare_talker_advertise(state, 0, &stream->stream_id,
+                               avb_declared_dest_addr(state, stream),
+                               stream->vlan_id,
+                               avb_compute_tspec_max_frame_size(state, index),
+                               stream->stream_info_flags.class_b);
+}
+
+/* AVB Lite unicast transport (profiles/avb_lite.md §6, "Stream transport
  * addressing"): publish each output stream's active unicast DAs into
- * its tx_da[] seqlock mailbox for the TX paths. A listener counts as
- * active once either half of its connection state is present (MSRP
- * Ready or ACMP connected); stale entries age out via the CVU idle
- * timeout. On a wired egress port, more active listeners than the
- * fan-out limit escalates the stream to its multicast (MAAP) address,
- * published as count 0, which the TX paths resolve to their
- * template DA. On a Wi-Fi egress port there is no such escalation:
- * group addressing there is roughly 20x slower than unicast and
- * cannot carry even one Class B stream, so the fan-out is capped and
- * the stream stays unicast. Called every main loop tick; publishes
- * (and logs) only on change. */
-/* Per-listener idle limit for AVB Lite. Live listeners refresh their
- * row at ~1 Hz via CVU declarations; 30 s matches the CVU attribute
- * idle timeout in mrp.c. */
-#define AVB_LITE_LISTENER_IDLE_US (30 * 1000 * 1000)
+ * its tx_da[] seqlock mailbox for the TX paths. Listeners are served in
+ * the order they first asked for the stream, up to the fan-out limit.
+ * Beyond it the stream escalates to its multicast (MAAP) address only
+ * where escalation is allowed (SET_LITE_CONFIG, off by default): the
+ * declaration shows the multicast address first and the frames move
+ * JoinTime later; going back, the frames move first and the zero
+ * address is declared after. Committed egress stays within 75% of the
+ * link, each unicast copy counted: copies are admitted across all
+ * streams in the order their listeners first asked, and an admitted
+ * copy keeps its place. A listener the talker cannot serve gets a
+ * unicast Talker Failed, failure code 2 beyond the fan-out limit with
+ * escalation off, 1 past the egress budget (§6 items 5 and 10).
+ * Published count 0 means multicast, which the TX paths resolve to
+ * their template DA. On a Wi-Fi egress port group addressing cannot
+ * carry even one Class B stream, so escalation never applies there.
+ * Called every main loop tick; publishes (and logs) only on change. */
+/* Per-listener idle limit for AVB Lite: 16 s, the CVU registration
+ * age-out in mrp.c. */
+#define AVB_LITE_LISTENER_IDLE_US (16 * 1000 * 1000)
+/* JoinTime: escalated frames follow the multicast declaration by this. */
+#define AVB_LITE_JOIN_TIME_US (200 * 1000)
+/* A listener whose refusal was just withdrawn keeps its place in line
+ * this long while its Ready declaration arrives. */
+#define AVB_LITE_SLOT_HOLD_US (3 * 1000 * 1000)
+/* Stream starts are retried no more often than this. */
+#define AVB_LITE_START_RETRY_US (1000 * 1000)
+
+typedef __typeof__(((avb_talker_stream_s *)0)->connected_listeners[0])
+    avb_lite_listener_row_t;
+
+/* Per-stream working set of one transport pass. */
+typedef struct {
+  bool lite;
+  int candidates;
+  int ready_candidates;
+  int order[AVB_MAX_NUM_CONNECTED_LISTENERS];
+  bool escalation_allowed;
+  uint64_t copy_bps;
+  bool declaration_changed;
+} avb_lite_plan_s;
+
+/* Age out silent listeners, order the ones asking for the stream and
+ * run the escalation sequence. */
+static void avb_lite_plan_stream(avb_state_s *state, uint16_t index,
+                                 int64_t now, uint32_t *order_seq,
+                                 avb_lite_plan_s *plan) {
+  avb_talker_stream_s *s = &state->output_streams[index];
+  uint16_t count = octets_to_uint(s->connection_count, 2);
+  if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
+    count = AVB_MAX_NUM_CONNECTED_LISTENERS;
+  /* Age out listeners that stopped refreshing. The MRP listener
+   * registrar is shared per stream_id, so with several listeners on one
+   * stream the survivors keep it alive forever, a vanished listener is
+   * only detectable per-row, and its unicast copy would otherwise flood
+   * as unknown-unicast indefinitely. Reverse walk: removal compacts the
+   * tail. */
+  for (int j = (int)count - 1; j >= 0; j--) {
+    int64_t seen = s->connected_listeners[j].last_seen_us;
+    if (seen == 0) { /* legacy/ACMP-only row: arm the clock */
+      s->connected_listeners[j].last_seen_us = now;
+      continue;
+    }
+    if (now - seen > AVB_LITE_LISTENER_IDLE_US) {
+      avbwarn("Stream out %d: listener %02x:%02x:%02x:%02x:%02x:%02x aged out "
+              "(idle > %ds)",
+              index, s->connected_listeners[j].mac_addr[0],
+              s->connected_listeners[j].mac_addr[1],
+              s->connected_listeners[j].mac_addr[2],
+              s->connected_listeners[j].mac_addr[3],
+              s->connected_listeners[j].mac_addr[4],
+              s->connected_listeners[j].mac_addr[5],
+              (int)(AVB_LITE_LISTENER_IDLE_US / 1000000));
+      avb_remove_talker_listener_by_index(s, j);
+    }
+  }
+  count = octets_to_uint(s->connection_count, 2);
+  if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
+    count = AVB_MAX_NUM_CONNECTED_LISTENERS;
+
+  /* Candidates: listeners asking for the stream (ready, refused, or
+   * holding their place after a refusal was withdrawn), in the order
+   * they first asked. ACMP-created rows carry no MAC until the
+   * listener's CVU declaration merges it; they can't receive a unicast
+   * copy and take no place. */
+  static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
+  plan->lite = true;
+  plan->candidates = 0;
+  plan->ready_candidates = 0;
+  for (int j = 0; j < count; j++) {
+    avb_lite_listener_row_t *row = &s->connected_listeners[j];
+    bool ready = row->msrp_ready || row->acmp_connected;
+    bool holding = row->lite_hold_until_us != 0 && now < row->lite_hold_until_us;
+    if (memcmp(row->mac_addr, zero_mac, ETH_ADDR_LEN) == 0 ||
+        !(ready || row->lite_refused || holding)) {
+      row->lite_order = 0;
+      row->lite_refused = false;
+      row->lite_admitted = false;
+      row->lite_hold_until_us = 0;
+      continue;
+    }
+    if (row->lite_order == 0)
+      row->lite_order = ++*order_seq;
+    int pos = plan->candidates++;
+    while (pos > 0 && s->connected_listeners[plan->order[pos - 1]].lite_order >
+                          row->lite_order) {
+      plan->order[pos] = plan->order[pos - 1];
+      pos--;
+    }
+    plan->order[pos] = j;
+    if (ready)
+      plan->ready_candidates++;
+  }
+
+  plan->escalation_allowed =
+      (state->lite_config_flags & LITE_CONFIG_FLAG_ESCALATION_ALLOWED) &&
+      state->port[0].medium != avb_port_medium_wifi_ftm &&
+      memcmp(s->stream_dest_addr, zero_mac, ETH_ADDR_LEN) != 0;
+  bool want_multicast = plan->escalation_allowed &&
+                        plan->ready_candidates > CONFIG_ESP_AVB_LITE_UNICAST_FANOUT;
+  plan->declaration_changed = false;
+  if (want_multicast && !s->lite_declared_multicast) {
+    s->lite_declared_multicast = true;
+    s->lite_multicast_tx_at_us = now + AVB_LITE_JOIN_TIME_US;
+    plan->declaration_changed = true;
+  } else if (!want_multicast && s->lite_declared_multicast) {
+    /* Frames return to unicast in this pass, the zero address is
+     * declared after they are published. */
+    s->lite_declared_multicast = false;
+    s->lite_tx_multicast = false;
+    plan->declaration_changed = true;
+  }
+  if (s->lite_declared_multicast && !s->lite_tx_multicast &&
+      now >= s->lite_multicast_tx_at_us)
+    s->lite_tx_multicast = true;
+
+  /* One kind of copy at a time holds a place in the budget. */
+  if (s->lite_tx_multicast) {
+    for (int k = 0; k < plan->candidates; k++)
+      s->connected_listeners[plan->order[k]].lite_admitted = false;
+  } else {
+    s->lite_multicast_admitted = false;
+    for (int k = CONFIG_ESP_AVB_LITE_UNICAST_FANOUT; k < plan->candidates; k++)
+      s->connected_listeners[plan->order[k]].lite_admitted = false;
+  }
+  plan->copy_bps = avb_stream_out_copy_bps(state, index);
+}
+
+/* Order of the earliest candidate of a stream, which a multicast copy
+ * is admitted by. */
+static uint32_t avb_lite_plan_first_order(avb_talker_stream_s *s,
+                                          const avb_lite_plan_s *plan) {
+  return plan->candidates > 0 ? s->connected_listeners[plan->order[0]].lite_order
+                              : UINT32_MAX;
+}
+
+/* Share out the egress budget: copies already admitted keep their
+ * place unless the budget shrank (link speed or format change), then
+ * the newest go first; waiting copies are admitted in the order their
+ * listeners first asked. */
+static void avb_lite_admit_copies(avb_state_s *state, avb_lite_plan_s *plans) {
+  uint64_t budget_bps =
+      (uint64_t)state->port[0].link_speed_mbps * 1000000u * 3u / 4u;
+  uint64_t committed_bps = 0;
+  for (int i = 0; i < state->num_output_streams; i++) {
+    if (!plans[i].lite)
+      continue;
+    avb_talker_stream_s *s = &state->output_streams[i];
+    if (s->lite_tx_multicast) {
+      if (s->lite_multicast_admitted)
+        committed_bps += plans[i].copy_bps;
+      continue;
+    }
+    for (int k = 0; k < plans[i].candidates && k < CONFIG_ESP_AVB_LITE_UNICAST_FANOUT; k++) {
+      if (s->connected_listeners[plans[i].order[k]].lite_admitted)
+        committed_bps += plans[i].copy_bps;
+    }
+  }
+  /* Over budget: release the most recently admitted copies. */
+  while (committed_bps > budget_bps) {
+    uint32_t newest = 0;
+    int newest_stream = -1, newest_row = -1;
+    for (int i = 0; i < state->num_output_streams; i++) {
+      if (!plans[i].lite)
+        continue;
+      avb_talker_stream_s *s = &state->output_streams[i];
+      if (s->lite_tx_multicast) {
+        uint32_t order = avb_lite_plan_first_order(s, &plans[i]);
+        if (s->lite_multicast_admitted && order != UINT32_MAX && order >= newest) {
+          newest = order;
+          newest_stream = i;
+          newest_row = -1;
+        }
+        continue;
+      }
+      for (int k = 0; k < plans[i].candidates && k < CONFIG_ESP_AVB_LITE_UNICAST_FANOUT; k++) {
+        avb_lite_listener_row_t *row = &s->connected_listeners[plans[i].order[k]];
+        if (row->lite_admitted && row->lite_order >= newest) {
+          newest = row->lite_order;
+          newest_stream = i;
+          newest_row = plans[i].order[k];
+        }
+      }
+    }
+    if (newest_stream < 0)
+      break;
+    avb_talker_stream_s *s = &state->output_streams[newest_stream];
+    if (newest_row < 0)
+      s->lite_multicast_admitted = false;
+    else
+      s->connected_listeners[newest_row].lite_admitted = false;
+    committed_bps -= plans[newest_stream].copy_bps;
+  }
+  /* Admit waiting copies, earliest listener first. */
+  for (;;) {
+    uint32_t earliest = UINT32_MAX;
+    int earliest_stream = -1, earliest_row = -1;
+    for (int i = 0; i < state->num_output_streams; i++) {
+      if (!plans[i].lite)
+        continue;
+      avb_talker_stream_s *s = &state->output_streams[i];
+      if (s->lite_tx_multicast) {
+        uint32_t order = avb_lite_plan_first_order(s, &plans[i]);
+        if (!s->lite_multicast_admitted && plans[i].ready_candidates > 0 &&
+            order < earliest && committed_bps + plans[i].copy_bps <= budget_bps) {
+          earliest = order;
+          earliest_stream = i;
+          earliest_row = -1;
+        }
+        continue;
+      }
+      for (int k = 0; k < plans[i].candidates && k < CONFIG_ESP_AVB_LITE_UNICAST_FANOUT; k++) {
+        avb_lite_listener_row_t *row = &s->connected_listeners[plans[i].order[k]];
+        if (!row->lite_admitted && row->lite_order < earliest &&
+            committed_bps + plans[i].copy_bps <= budget_bps) {
+          earliest = row->lite_order;
+          earliest_stream = i;
+          earliest_row = plans[i].order[k];
+        }
+      }
+    }
+    if (earliest_stream < 0)
+      break;
+    avb_talker_stream_s *s = &state->output_streams[earliest_stream];
+    if (earliest_row < 0)
+      s->lite_multicast_admitted = true;
+    else
+      s->connected_listeners[earliest_row].lite_admitted = true;
+    committed_bps += plans[earliest_stream].copy_bps;
+  }
+}
+
+static void avb_lite_publish_tx_addrs(avb_talker_stream_s *s,
+                                      const eth_addr_t *das, int n) {
+  s->tx_da_seq++; /* odd: write in progress */
+  __sync_synchronize();
+  memcpy(s->tx_da, das, (size_t)n * sizeof(eth_addr_t));
+  s->tx_da_count = (uint8_t)n;
+  __sync_synchronize();
+  s->tx_da_seq++; /* even: stable */
+}
 
 void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
   if (!state->config.talker)
     return;
+  static uint32_t s_lite_order_seq;
+  int64_t now = esp_timer_get_time();
+  avb_lite_plan_s plans[AVB_MAX_NUM_OUTPUT_STREAMS];
+  memset(plans, 0, sizeof(plans));
+  bool wifi_port = false;
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+  wifi_port = state->port[0].medium == avb_port_medium_wifi_ftm;
+#endif
+  if (state->avb_lite && !wifi_port) {
+    for (int i = 0; i < state->num_output_streams; i++)
+      avb_lite_plan_stream(state, i, now, &s_lite_order_seq, &plans[i]);
+    avb_lite_admit_copies(state, plans);
+  }
+
   for (int i = 0; i < state->num_output_streams; i++) {
     avb_talker_stream_s *s = &state->output_streams[i];
     eth_addr_t das[CONFIG_ESP_AVB_LITE_UNICAST_FANOUT];
     int n = 0;
-    bool escalate = false;
-    bool wifi_capped = false;
+    bool publish = true;
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
-    if (state->port[0].medium == avb_port_medium_wifi_ftm) {
+    if (wifi_port) {
       /* AVB Wireless profile 3.3: a wireless talker advertises its
        * MAAP destination in SRP/ATDECC but transmits stream frames
        * individually addressed to the BSSID, the AVB Wireless bridge
@@ -297,94 +653,87 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
       }
     } else
 #endif
-    if (state->avb_lite) {
-      uint16_t count = octets_to_uint(s->connection_count, 2);
-      if (count > AVB_MAX_NUM_CONNECTED_LISTENERS)
-        count = AVB_MAX_NUM_CONNECTED_LISTENERS;
-      /* Age out listeners that stopped refreshing. The MRP listener
-       * registrar is shared per stream_id, so with several listeners
-       * on one stream the survivors keep it alive forever — a
-       * vanished listener is only detectable per-row, and its
-       * unicast copy would otherwise flood as unknown-unicast
-       * indefinitely. Reverse walk: removal compacts the tail. */
-      int64_t now = esp_timer_get_time();
-      for (int j = (int)count - 1; j >= 0; j--) {
-        int64_t seen = s->connected_listeners[j].last_seen_us;
-        if (seen == 0) { /* legacy/ACMP-only row: arm the clock */
-          s->connected_listeners[j].last_seen_us = now;
+    if (plans[i].lite) {
+      avb_lite_plan_s *plan = &plans[i];
+      eth_addr_t refused[AVB_MAX_NUM_CONNECTED_LISTENERS];
+      uint8_t refusal_codes[AVB_MAX_NUM_CONNECTED_LISTENERS];
+      int refused_count = 0;
+      bool serving = false;
+      for (int k = 0; k < plan->candidates; k++) {
+        avb_lite_listener_row_t *row = &s->connected_listeners[plan->order[k]];
+        bool ready = row->msrp_ready || row->acmp_connected;
+        uint8_t code = no_failure;
+        if (s->lite_tx_multicast) {
+          if (!s->lite_multicast_admitted)
+            code = insufficient_bandwidth;
+        } else if (k >= CONFIG_ESP_AVB_LITE_UNICAST_FANOUT) {
+          if (!plan->escalation_allowed)
+            code = insufficient_bridge_resources;
+        } else if (!row->lite_admitted) {
+          code = insufficient_bandwidth;
+        }
+        if (code != no_failure) {
+          row->lite_refused = true;
+          row->lite_hold_until_us = 0;
+          memcpy(&refused[refused_count], row->mac_addr, ETH_ADDR_LEN);
+          refusal_codes[refused_count++] = code;
           continue;
         }
-        if (now - seen > AVB_LITE_LISTENER_IDLE_US) {
-          avbwarn("Stream out %d: listener "
-                  "%02x:%02x:%02x:%02x:%02x:%02x aged out (idle > %ds)",
-                  i, s->connected_listeners[j].mac_addr[0],
-                  s->connected_listeners[j].mac_addr[1],
-                  s->connected_listeners[j].mac_addr[2],
-                  s->connected_listeners[j].mac_addr[3],
-                  s->connected_listeners[j].mac_addr[4],
-                  s->connected_listeners[j].mac_addr[5],
-                  (int)(AVB_LITE_LISTENER_IDLE_US / 1000000));
-          avb_remove_talker_listener_by_index(s, j);
-        }
+        if (row->lite_refused)
+          row->lite_hold_until_us = now + AVB_LITE_SLOT_HOLD_US;
+        row->lite_refused = false;
+        /* Beyond the fan-out limit a listener waits for the escalation
+         * to move the frames. */
+        if (!s->lite_tx_multicast && k < CONFIG_ESP_AVB_LITE_UNICAST_FANOUT &&
+            ready)
+          memcpy(&das[n++], row->mac_addr, ETH_ADDR_LEN);
       }
-      count = octets_to_uint(s->connection_count, 2);
-      if (count == 0 && s->streaming) {
+      if (s->lite_tx_multicast)
+        serving = s->lite_multicast_admitted && plan->ready_candidates > 0;
+      else
+        serving = n > 0;
+      mrp_lite_sync_refusals(state, &s->stream_id, refused, refusal_codes,
+                             refused_count, avb_declared_dest_addr(state, s),
+                             s->vlan_id,
+                             avb_compute_tspec_max_frame_size(state, i),
+                             s->stream_info_flags.class_b);
+      if (!serving && s->streaming) {
         avb_stop_stream_out(state, i);
+      } else if (serving && !s->streaming && now >= s->lite_start_retry_us) {
+        s->lite_start_retry_us = now + AVB_LITE_START_RETRY_US;
+        /* Published before the task starts, so its first frame already
+         * goes to the listeners. */
+        avb_lite_publish_tx_addrs(s, das, s->lite_tx_multicast ? 0 : n);
+        avb_start_stream_out(state, i);
       }
-      static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
-      for (int j = 0; j < count; j++) {
-        if (!s->connected_listeners[j].msrp_ready &&
-            !s->connected_listeners[j].acmp_connected)
-          continue;
-        /* ACMP-created rows carry no MAC until the listener's CVU
-         * declaration merges it. They can't receive a unicast copy,
-         * so they must not consume fan-out (a transient zero-MAC
-         * duplicate otherwise escalates the stream to multicast);
-         * the liveness aging reaps them if the merge never comes. */
-        if (memcmp(s->connected_listeners[j].mac_addr, zero_mac,
-                   ETH_ADDR_LEN) == 0)
-          continue;
-        if (n == CONFIG_ESP_AVB_LITE_UNICAST_FANOUT) {
-          escalate = true;
-          break;
-        }
-        memcpy(&das[n++], s->connected_listeners[j].mac_addr, ETH_ADDR_LEN);
-      }
-      if (escalate &&
-          state->port[0].medium == avb_port_medium_wifi_ftm) {
-        /* Wi-Fi egress: never escalate to the MAAP group address.
-         * 802.11 buffers group addressed frames to the DTIM cycle and
-         * neither acknowledges nor retries them (IEEE 802.11 10.3.6);
-         * measured on this hardware at ~397 pps against ~8342 pps for
-         * the same frames individually addressed. That is below even
-         * one Class B stream's 4000 pps, so escalating would serve
-         * every listener badly instead of serving the first N well.
-         * Cap the fan-out and keep unicasting. */
-        escalate = false;
-        wifi_capped = true;
-      }
-      if (escalate)
+      if (s->lite_tx_multicast)
         n = 0;
+      /* A unicast stream that serves nobody is stopped, keep its last
+       * addresses so frames still in flight never go multicast. */
+      else if (n == 0)
+        publish = false;
     }
-    if (n == s->tx_da_count &&
-        (n == 0 || memcmp(das, s->tx_da, (size_t)n * sizeof(eth_addr_t)) == 0))
-      continue;
-    s->tx_da_seq++; /* odd: write in progress */
-    __sync_synchronize();
-    memcpy(s->tx_da, das, (size_t)n * sizeof(eth_addr_t));
-    s->tx_da_count = (uint8_t)n;
-    __sync_synchronize();
-    s->tx_da_seq++; /* even: stable */
-    if (n > 0) {
-      avbinfo("Stream out %d transport: unicast x%d "
-              "(%02x:%02x:%02x:%02x:%02x:%02x%s)%s",
-              i, n, das[0][0], das[0][1], das[0][2], das[0][3], das[0][4],
-              das[0][5], n > 1 ? ", ..." : "",
-              wifi_capped ? " [Wi-Fi: fan-out capped, "
-                            "further listeners not served]" : "");
-    } else {
-      avbinfo("Stream out %d transport: multicast%s", i,
-              escalate ? " (unicast fan-out exceeded)" : "");
+    if (publish &&
+        (n != s->tx_da_count ||
+         (n != 0 && memcmp(das, s->tx_da, (size_t)n * sizeof(eth_addr_t)) != 0))) {
+      avb_lite_publish_tx_addrs(s, das, n);
+      if (n > 0) {
+        avbinfo("Stream out %d transport: unicast x%d "
+                "(%02x:%02x:%02x:%02x:%02x:%02x%s)",
+                i, n, das[0][0], das[0][1], das[0][2], das[0][3], das[0][4],
+                das[0][5], n > 1 ? ", ..." : "");
+      } else {
+        avbinfo("Stream out %d transport: multicast%s", i,
+                s->lite_tx_multicast ? " (escalated)" : "");
+      }
+    }
+    /* The zero address is declared only once frames are unicast again;
+     * the multicast address is declared before frames move to it. */
+    if (plans[i].declaration_changed) {
+      avbinfo("Stream out %d declares %s", i,
+              s->lite_declared_multicast ? "its multicast address (escalating)"
+                                         : "unicast (zero address)");
+      avb_declare_output_stream(state, i);
     }
   }
 }
@@ -981,6 +1330,55 @@ avb_input_stream_decl_event(const avb_listener_stream_s *s) {
   return msrp_listener_event_asking_failed;
 }
 
+/* Listener declaration with the AVB Lite rules on top
+ * (profiles/avb_lite.md §6 items 6 and 10): a talker's unicast Talker
+ * Failed refusing this listener is answered with Asking Failed, and
+ * Ready is declared only while the streams this listener is Ready for,
+ * each counted by its talker's TSpec, stay within 75% of its link.
+ * Lower-numbered inputs keep their place. */
+msrp_listener_event_t avb_listener_decl_event(avb_state_s *state,
+                                              uint16_t index) {
+  static bool s_admission_refused[AVB_MAX_NUM_INPUT_STREAMS];
+  avb_listener_stream_s *stream = &state->input_streams[index];
+  msrp_listener_event_t decl = avb_input_stream_decl_event(stream);
+  if (!state->avb_lite)
+    return decl;
+  if (decl == msrp_listener_event_ready_failed)
+    return msrp_listener_event_asking_failed;
+  if (decl != msrp_listener_event_ready)
+    return decl;
+  uint64_t budget_bps =
+      (uint64_t)state->port[0].link_speed_mbps * 1000000u * 3u / 4u;
+  uint64_t ready_bps = 0;
+  for (uint16_t j = 0; j <= index && j < state->num_input_streams; j++) {
+    avb_listener_stream_s *other = &state->input_streams[j];
+    if (j != index &&
+        avb_listener_decl_event(state, j) != msrp_listener_event_ready)
+      continue;
+    uint16_t max_frame_size = 0, max_interval_frames = 0;
+    if (!mrp_talker_advertise_tspec(0, &other->stream_id, &max_frame_size,
+                                    &max_interval_frames))
+      continue;
+    ready_bps += avb_tspec_copy_bps(max_frame_size,
+                                    max_interval_frames ? max_interval_frames
+                                                        : 1,
+                                    other->stream_info_flags.class_b,
+                                    AVB_TSPEC_OVERHEAD_OCTETS);
+  }
+  bool refused = ready_bps > budget_bps;
+  if (index < AVB_MAX_NUM_INPUT_STREAMS &&
+      refused != s_admission_refused[index]) {
+    s_admission_refused[index] = refused;
+    if (refused)
+      avbwarn("Stream in %u: %llu bps of Ready streams exceed 75%% of the "
+              "link, declaring Asking Failed",
+              index, (unsigned long long)ready_bps);
+    else
+      avbinfo("Stream in %u: back within 75%% of the link", index);
+  }
+  return refused ? msrp_listener_event_asking_failed : decl;
+}
+
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
 /* True when NVS restored a listener binding that fast-connect (and
  * superfast connect) will act on right after init. */
@@ -1043,7 +1441,8 @@ static int avb_periodic_send(avb_state_s *state) {
    * switch — declares membership in the SR VLAN. */
   timespecsub(&time_now, &state->port[0].last_transmitted_mvrp_vlan_id,
                           &delta);
-  if (timespec_to_ms(&delta) > MVRP_VLAN_ID_INTERVAL_MSEC) {
+  /* AVB Lite has no bridges to register VLANs with. */
+  if (timespec_to_ms(&delta) > MVRP_VLAN_ID_INTERVAL_MSEC && !state->avb_lite) {
     state->port[0].last_transmitted_mvrp_vlan_id = time_now;
     /* Declare each SR class's VLAN separately. Class A and Class B
      * may share a VID or use separate ones (see msrp_mappings init);
@@ -1089,11 +1488,13 @@ static int avb_periodic_send(avb_state_s *state) {
     for (int i = 0; i < state->num_output_streams; i++) {
       /* Skip Talker Advertise until MAAP has acquired a dest — sending
        * with Stream DA = 0 makes the switch cache a useless registration
-       * that blocks forwarding even after MAAP later updates our state. */
-      if (memcmp(state->output_streams[i].stream_dest_addr, zero_mac,
+       * that blocks forwarding even after MAAP later updates our state.
+       * AVB Lite declares the zero address while the stream goes
+       * unicast, so it needs no MAAP address for that. */
+      if (!state->avb_lite &&
+          memcmp(state->output_streams[i].stream_dest_addr, zero_mac,
                  ETH_ADDR_LEN) == 0)
         continue;
-      uint16_t mfs = avb_compute_tspec_max_frame_size(state, i);
       /* MSRP talker — SM-driven; the SM resolves JoinIn vs JoinMt
        * at TX time. Keep the declaration alive at a steady cadence. */
       int interval = (octets_to_uint(state->output_streams[i].connection_count,
@@ -1102,11 +1503,7 @@ static int avb_periodic_send(avb_state_s *state) {
                          : MSRP_TALKER_IDLE_INTERVAL_MSEC;
       if (timespec_to_ms(&delta) > interval) {
         state->port[0].last_transmitted_msrp_talker_adv = time_now;
-        mrp_declare_talker_advertise(
-            state, 0, &state->output_streams[i].stream_id,
-            &state->output_streams[i].stream_dest_addr,
-            state->output_streams[i].vlan_id, mfs,
-            state->output_streams[i].stream_info_flags.class_b);
+        avb_declare_output_stream(state, i);
       }
     }
     avb_maap_tick(state);
@@ -1133,7 +1530,7 @@ static int avb_periodic_send(avb_state_s *state) {
          * is FAILED upstream; AskingFailed if we haven't heard the
          * talker's ADVERTISE yet. */
         mrp_declare_listener(state, 0, &state->input_streams[i].stream_id,
-                             avb_input_stream_decl_event(&state->input_streams[i]));
+                             avb_listener_decl_event(state, i));
       }
     }
   }
@@ -1403,6 +1800,10 @@ static void avb_task(void *task_param) {
 
   // Load persistent data from NVS — must be after codec init so
   // persisted volume/gain override the codec defaults
+#ifdef CONFIG_ESP_AVB_LITE_ESCALATION_ALLOWED
+  /* Operator default until a controller sets it (profile §2.4). */
+  state->lite_config_flags = LITE_CONFIG_FLAG_ESCALATION_ALLOWED;
+#endif
   avb_persist_load(state);
 
   /* Codec clock-plan check: arithmetic plus one log line per candidate,
@@ -2413,6 +2814,7 @@ static void avb_persist_gather(avb_state_s *state) {
   p->pll_trim_ppm_q16 = state->media_clock.pll_converged_trim_q16;
   memcpy(p->pll_trim_btc_id, state->media_clock.pll_trim_btc_id,
          sizeof(p->pll_trim_btc_id));
+  p->lite_config_flags = state->lite_config_flags;
 }
 
 /* Apply loaded persist data to current state */
@@ -2538,6 +2940,11 @@ static void avb_persist_apply(avb_state_s *state) {
            sizeof(state->media_clock.pll_trim_btc_id));
     avb_pll_preload_trim(state, p->pll_trim_ppm_q16);
   }
+
+  /* v6: AVB Lite configuration as a controller last set it; older blobs
+   * keep the build default. */
+  if (p->version >= 6)
+    state->lite_config_flags = p->lite_config_flags & LITE_CONFIG_FLAGS_KNOWN;
 }
 
 /* Load persistent data from NVS */

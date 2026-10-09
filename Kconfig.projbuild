@@ -199,7 +199,38 @@ menu "AVB Configuration"
             multicast streams to every port, so AVB Lite talkers default
             to one unicast copy per listener. Beyond this many listeners
             the talker escalates the stream to its MAAP multicast
-            address. Each copy costs egress bandwidth and TX CPU.
+            address where a controller allowed escalation with
+            SET_LITE_CONFIG (off by default), and otherwise refuses each
+            further listener with a unicast Talker Failed, failure code
+            2. Each copy costs egress bandwidth and TX CPU.
+
+    config ESP_AVB_LITE_ESCALATION_ALLOWED
+        bool "AVB Lite: allow multicast escalation by default"
+        default n
+        depends on ESP_AVB_AVB_LITE_COMPLIANT
+        help
+            Lets talkers escalate a stream to its multicast address
+            beyond the unicast fan-out limit before any controller has
+            configured the interface (avb_lite.md section 2.4). A
+            controller's SET_LITE_CONFIG, persisted in NVS, overrides
+            it. A non-AVB switch floods an escalated stream to every
+            port in the domain, so allow it only where the media VLAN
+            is confined.
+
+    config ESP_AVB_LITE_MEDIA_VLAN_ID
+        int "AVB Lite media VLAN ID"
+        default 2
+        range 0 4094
+        depends on ESP_AVB_AVB_LITE_COMPLIANT
+        help
+            VLAN that AVB Lite media streams and CVU SRP messages are
+            tagged in, at 802.1p priority 5 (avb_lite.md section 7).
+            Every AVB Lite device in a system uses the same one. 2, as
+            in AVB, passes unmanaged switches unchanged but needs VLAN 2
+            on the media ports of managed switches. 0 sends a priority
+            tag only, which works on any switch without VLAN
+            configuration but shares the untagged VLAN with other
+            traffic.
 
     config ESP_AVB_AM824_CIP_SYT
         bool "Stamp CIP SYT field in AM824 packets"
