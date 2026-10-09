@@ -183,6 +183,12 @@ extern "C" {
  */
 int avb_start(avb_config_s *config);
 
+/* Endpoint link policy (AVB Lite §6 item 9): advertise neither EEE nor
+ * PAUSE, and do not act on PAUSE. Call between esp_eth_driver_install
+ * and esp_eth_start; restart renegotiates at once if the advertisement
+ * had to change. Returns true when it changed. */
+bool avb_eth_apply_link_policy(esp_eth_handle_t eth_handle, bool restart);
+
 /* @brief Query status from a running AVB task
  *
  * @param status Pointer to status storage structure

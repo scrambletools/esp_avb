@@ -344,6 +344,17 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
   /* Read ethertype at offset 12-13 (big-endian) */
   uint16_t ethertype = (buf[12] << 8) | buf[13];
 
+  /* AVB Lite PTP may arrive priority-tagged, VLAN 0 at PCP 7, and must
+   * be accepted tagged or untagged (avb_lite.md §5). Drop the tag so
+   * the frame takes the PTP path below with its hardware timestamp,
+   * which the info argument carries separately. */
+  if (ethertype == 0x8100 && len >= ETH_HEADER_LEN + 4 && buf[16] == 0x88 &&
+      buf[17] == 0xf7) {
+    memmove(buf + 12, buf + 16, len - 16);
+    len -= 4;
+    ethertype = 0x88f7;
+  }
+
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
   /* Hot-path fast-cut for VLAN-tagged AVTP from EMAC → Wi-Fi.
    *
@@ -816,6 +827,75 @@ static int avb_net_init_port_l2tap(avb_state_s *state, int port_index) {
  * When NUM_PORTS > 1, port 1 is the second medium (typically wifi
  * for the bridge's SoftAP).
  */
+/* Clause 22 access to a Clause 45 MMD register (IEEE 802.3 22.2.4.3.11,
+ * registers 13 and 14). */
+static esp_err_t avb_phy_mmd_access(esp_eth_handle_t eth_handle, uint8_t devad,
+                                    uint16_t mmd_reg, uint32_t *value,
+                                    bool write) {
+  uint32_t control = devad;
+  uint32_t address = mmd_reg;
+  esp_eth_phy_reg_rw_data_t control_rw = {.reg_addr = 13,
+                                          .reg_value_p = &control};
+  esp_eth_phy_reg_rw_data_t data_rw = {.reg_addr = 14, .reg_value_p = &address};
+  esp_err_t err = esp_eth_ioctl(eth_handle, ETH_CMD_WRITE_PHY_REG, &control_rw);
+  if (err == ESP_OK)
+    err = esp_eth_ioctl(eth_handle, ETH_CMD_WRITE_PHY_REG, &data_rw);
+  control = 0x4000u | devad; /* data, no post increment */
+  if (err == ESP_OK)
+    err = esp_eth_ioctl(eth_handle, ETH_CMD_WRITE_PHY_REG, &control_rw);
+  data_rw.reg_value_p = value;
+  if (err == ESP_OK)
+    err = esp_eth_ioctl(eth_handle,
+                        write ? ETH_CMD_WRITE_PHY_REG : ETH_CMD_READ_PHY_REG,
+                        &data_rw);
+  return err;
+}
+
+/* Endpoint link policy (avb_lite.md §6 item 9): advertise neither
+ * Energy-Efficient Ethernet nor PAUSE, and do not act on PAUSE. Called
+ * between esp_eth_driver_install and esp_eth_start the first
+ * negotiation already uses it. With restart set, a changed
+ * advertisement is renegotiated at once. */
+bool avb_eth_apply_link_policy(esp_eth_handle_t eth_handle, bool restart) {
+  if (eth_handle == NULL)
+    return false;
+  bool changed = false;
+  uint32_t anar = 0;
+  esp_eth_phy_reg_rw_data_t anar_rw = {.reg_addr = 4, .reg_value_p = &anar};
+  bool pause_advertised =
+      esp_eth_ioctl(eth_handle, ETH_CMD_READ_PHY_REG, &anar_rw) == ESP_OK &&
+      (anar & 0x0C00u) != 0;
+  /* Turns MAC flow control off and clears the PAUSE bits in ANAR. */
+  uint32_t flow_ctrl = 0;
+  esp_eth_ioctl(eth_handle, ETH_CMD_S_FLOW_CTRL, &flow_ctrl);
+  changed |= pause_advertised;
+  /* EEE advertisement, MMD 7 register 60: bit 1 100BASE-TX, bit 2
+   * 1000BASE-T. All ones means the PHY has no such register. */
+  uint32_t eee_adv = 0;
+  bool eee_read = avb_phy_mmd_access(eth_handle, 7, 60, &eee_adv, false) ==
+                  ESP_OK;
+  bool eee_advertised =
+      eee_read && eee_adv != 0xFFFFu && (eee_adv & 0x0006u) != 0;
+  if (eee_advertised) {
+    uint32_t cleared = eee_adv & ~0x0006u;
+    avb_phy_mmd_access(eth_handle, 7, 60, &cleared, true);
+    changed = true;
+  }
+  ESP_LOGI(TAG, "Link policy: PAUSE %s, EEE advertisement %s0x%04x%s",
+           pause_advertised ? "was advertised, cleared" : "not advertised",
+           eee_read ? "" : "unreadable ", (unsigned)eee_adv,
+           eee_advertised ? ", cleared" : "");
+  if (changed && restart) {
+    esp_eth_phy_t *phy = NULL;
+    if (esp_eth_get_phy_instance(eth_handle, &phy) == ESP_OK && phy) {
+      bool autonego_enabled = true;
+      phy->autonego_ctrl(phy, ESP_ETH_PHY_AUTONEGO_RESTART, &autonego_enabled);
+      ESP_LOGW(TAG, "Link policy applied after start, renegotiating");
+    }
+  }
+  return changed;
+}
+
 int avb_net_init(avb_state_s *state) {
   /* Cache RX port indices by medium so the unified RX callback can
    * tag ingress without knowing the bridge/endpoint topology. */
@@ -842,6 +922,11 @@ int avb_net_init(avb_state_s *state) {
     }
     esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR,
                   &state->port[0].internal_mac_addr);
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+    /* Applications should apply the endpoint link policy before
+     * esp_eth_start; this catches the ones that do not. */
+    avb_eth_apply_link_policy(eth_handle, true);
+#endif
   } else if (state->port[0].medium == avb_port_medium_wifi_ftm) {
     /* Wi-Fi endpoint or AP. No L2TAP — esp_vfs_l2tap is Ethernet-only
      * in IDF. The data-plane RX/TX is wired further down via
