@@ -1015,6 +1015,7 @@ static int avb_periodic_send(avb_state_s *state) {
   /* Track listener churn into the per-stream unicast DA mailboxes
    * (AVB Lite unicast transport; no-op outside Lite mode). */
   avb_lite_update_stream_tx_addrs(state);
+  avb_persist_journal_tick(state);
 
   // PTP snapshot for the stream out PLL is no longer needed here — the
   // stream out task now reads the PTP clock directly on Core 1 with a
@@ -2194,16 +2195,100 @@ static esp_err_t avb_persist_append_stream_record(bool input, uint16_t index,
   return err;
 }
 
-esp_err_t avb_persist_append_input_stream(avb_state_s *state, uint16_t index) {
-  avb_persist_input_stream_journal_s rec = {0};
-  avb_persist_fill_input_stream_record(state, index, &rec.stream);
-  return avb_persist_append_stream_record(true, index, &rec, sizeof(rec));
+/* A flash write disables the cache for milliseconds. Under heavy ingress
+ * (a stream still arriving at 8000 frames/s) the P4 EMAC's 256-octet RX
+ * FIFO can overflow in that window and latch dead, and ESP-IDF has no
+ * recovery for it: reception stops for good while TX carries on. The
+ * classic trigger is a disconnect, whose journal record used to be
+ * written while the talker was still sending. Journal records and the
+ * deferred snapshot therefore wait until ingress has calmed (the talker
+ * stops within a few hundred ms of our Lv), and are written anyway after
+ * AVB_PERSIST_QUIET_MAX_US. */
+#define AVB_PERSIST_BUSY_FRAMES_PER_S 1000u
+#define AVB_PERSIST_QUIET_US (300 * 1000)
+#define AVB_PERSIST_QUIET_MAX_US (3 * 1000 * 1000)
+#define AVB_PERSIST_INGRESS_SAMPLE_US (50 * 1000)
+static volatile bool s_ingress_quiet = true;
+static int64_t s_ingress_busy_until_us;
+static int64_t s_ingress_sample_us;
+static uint32_t s_ingress_sample_count;
+static bool s_journal_pending[2][AVB_PERSIST_MAX_INPUT_STREAMS];
+static int64_t s_journal_pending_since_us;
+
+/* Sampled from the AVB main loop; the persist task only reads the flag. */
+static void avb_persist_sample_ingress(int64_t now) {
+  if (now - s_ingress_sample_us < AVB_PERSIST_INGRESS_SAMPLE_US)
+    return;
+  uint32_t total = 0;
+  avb_net_rx_breakdown(&total, NULL, NULL, NULL, NULL, NULL);
+  uint64_t frames = (uint32_t)(total - s_ingress_sample_count);
+  int64_t elapsed_us = now - s_ingress_sample_us;
+  if (s_ingress_sample_us != 0 &&
+      frames * 1000000u > (uint64_t)AVB_PERSIST_BUSY_FRAMES_PER_S * elapsed_us)
+    s_ingress_busy_until_us = now + AVB_PERSIST_QUIET_US;
+  s_ingress_sample_us = now;
+  s_ingress_sample_count = total;
+  s_ingress_quiet = now >= s_ingress_busy_until_us;
 }
 
-esp_err_t avb_persist_append_output_stream(avb_state_s *state, uint16_t index) {
+static esp_err_t avb_persist_write_journal(avb_state_s *state, bool input,
+                                           uint16_t index) {
+  if (input) {
+    avb_persist_input_stream_journal_s rec = {0};
+    avb_persist_fill_input_stream_record(state, index, &rec.stream);
+    return avb_persist_append_stream_record(true, index, &rec, sizeof(rec));
+  }
   avb_persist_output_stream_journal_s rec;
   avb_persist_fill_output_stream_record(state, index, &rec);
   return avb_persist_append_stream_record(false, index, &rec, sizeof(rec));
+}
+
+static esp_err_t avb_persist_append_stream(avb_state_s *state, bool input,
+                                           uint16_t index) {
+  if (index >= AVB_PERSIST_MAX_INPUT_STREAMS)
+    return ESP_ERR_INVALID_ARG;
+  int64_t now = esp_timer_get_time();
+  avb_persist_sample_ingress(now);
+  if (s_ingress_quiet)
+    return avb_persist_write_journal(state, input, index);
+  /* The record is built when it is written, so it holds the latest state. */
+  if (s_journal_pending_since_us == 0)
+    s_journal_pending_since_us = now;
+  s_journal_pending[input ? 1 : 0][index] = true;
+  avbinfo("NVS: %s stream %u journal deferred until ingress calms",
+          input ? "input" : "output", index);
+  return ESP_OK;
+}
+
+void avb_persist_journal_tick(avb_state_s *state) {
+  int64_t now = esp_timer_get_time();
+  avb_persist_sample_ingress(now);
+  if (s_journal_pending_since_us == 0)
+    return;
+  bool overdue = now - s_journal_pending_since_us > AVB_PERSIST_QUIET_MAX_US;
+  if (!s_ingress_quiet && !overdue)
+    return;
+  if (overdue && !s_ingress_quiet)
+    avbwarn("NVS: writing stream journal during heavy ingress");
+  s_journal_pending_since_us = 0;
+  for (int direction = 0; direction < 2; direction++) {
+    for (uint16_t index = 0; index < AVB_PERSIST_MAX_INPUT_STREAMS; index++) {
+      if (!s_journal_pending[direction][index])
+        continue;
+      s_journal_pending[direction][index] = false;
+      avb_persist_write_journal(state, direction == 1, index);
+    }
+  }
+}
+
+bool avb_persist_ingress_quiet(void) { return s_ingress_quiet; }
+
+esp_err_t avb_persist_append_input_stream(avb_state_s *state, uint16_t index) {
+  return avb_persist_append_stream(state, true, index);
+}
+
+esp_err_t avb_persist_append_output_stream(avb_state_s *state, uint16_t index) {
+  return avb_persist_append_stream(state, false, index);
 }
 
 static void avb_persist_apply(avb_state_s *state);
@@ -2627,6 +2712,10 @@ void avb_persist_task(void *arg) {
       }
     }
     bool streaming = state->stream_in_active || out_streaming;
+    /* Heavy ingress counts as streaming (a talker still sending after a
+     * disconnect, or a stream flooded to this port): a flash write then
+     * can latch the EMAC RX FIFO, see AVB_PERSIST_QUIET_US. */
+    streaming = streaming || !avb_persist_ingress_quiet();
     if (streaming) {
       TickType_t age = xTaskGetTickCount() - state->persist_dirty_since_tick;
       if (age < pdMS_TO_TICKS(AVB_PERSIST_FORCED_FLUSH_MSEC)) {

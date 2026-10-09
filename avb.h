@@ -1166,6 +1166,11 @@ int64_t avb_stream_in_last_rx_us(avb_state_s *state, uint16_t index);
  * fan-out exceeded → MAAP escalation). */
 void avb_lite_update_stream_tx_addrs(avb_state_s *state);
 
+/* Writes stream journal records deferred while ingress was heavy (a
+ * flash write then can latch the EMAC RX FIFO). Main loop, every pass. */
+void avb_persist_journal_tick(avb_state_s *state);
+bool avb_persist_ingress_quiet(void);
+
 /* Lock-free TX-side snapshot of a stream's published unicast DAs.
  * Safe from the stream-out task / CRF timer while the control plane
  * updates concurrently. Returns the number of DAs copied into out[]
