@@ -1063,7 +1063,10 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
   avb_sr_class_e new_cls =
       (new_priority == 3) ? AVB_SR_CLASS_A : AVB_SR_CLASS_B;
   uint32_t new_intervals = (new_cls == AVB_SR_CLASS_A) ? 8000u : 4000u;
-  uint32_t new_bps = (uint32_t)mfs * (uint32_t)mfi * new_intervals * 8u;
+  /* TSpec frames plus the 42 octets of framing MaxFrameSize leaves out
+   * (IEEE 802.1Q-2022 34.4). */
+  uint32_t new_bps =
+      ((uint32_t)mfs + 42u) * (uint32_t)mfi * new_intervals * 8u;
   bool is_failed = (attr_type == msrp_attr_type_talker_failed);
 
   /* Look up the ingress-side entry so we can track and update the
@@ -2841,11 +2844,13 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
   int interval_us = class_b ? 250 : 125;
   int channels, bytes_per_sample, sample_rate, avtp_hdr;
   uint8_t subtype = fmt->aaf_pcm.subtype;
+  /* MaxFrameSize is the AVTPDU alone: IEEE 802.1Q-2022 35.2.2.8.4
+   * excludes the media framing (preamble, header, tag, FCS, interframe
+   * gap), which readers add as 42 octets per frame. */
   if (subtype == avtp_subtype_crf) {
-    /* CRF: ETH + VLAN + AVTP CRF header + 6 64-bit timestamps (Milan
-     * 300 ts/s cadence, see avb_crf_format_for_rate). */
-    return (uint16_t)(14 /*ETH*/ + 4 /*VLAN*/ +
-                      (20 + AVB_CRF_TS_PER_PDU * 8) /*CRF AVTPDU*/);
+    /* CRF: AVTP CRF header + 6 64-bit timestamps (Milan 300 ts/s
+     * cadence, see avb_crf_format_for_rate). */
+    return (uint16_t)(20 + AVB_CRF_TS_PER_PDU * 8);
   }
   if (subtype == avtp_subtype_61883) {
     channels = fmt->am824.dbs;
@@ -2864,7 +2869,7 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
     return 0;
   int samples_per_packet = sample_rate / (1000000 / interval_us);
   int payload = samples_per_packet * channels * bytes_per_sample;
-  return (uint16_t)(14 /*ETH*/ + 4 /*VLAN*/ + avtp_hdr + payload);
+  return (uint16_t)(avtp_hdr + payload);
 }
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
