@@ -138,6 +138,8 @@ typedef struct {
 
 int avb_srp_admission_init(avb_state_s *state);
 void avb_srp_admission_stop(avb_state_s *state);
+/* Rescale a port's admission cap after the PHY negotiated a new speed. */
+void avb_srp_admission_set_link_speed(int port_index, uint32_t link_mbps);
 
 /* Try to admit a talker advertisement. Returns 0 on success (and
  * updates admitted_bps), -ENOSPC when the request would exceed the

@@ -37,8 +37,16 @@ static uint8_t avb_msrp_priority_for_stream(avb_state_s *state,
   /* SR class A → mapping index 0, SR class B → mapping index 1. */
   uint16_t mapping_index =
       state->output_streams[stream_index].stream_info_flags.class_b ? 1 : 0;
+  if (state->avb_lite)
+    return AVB_LITE_PCP;
   return state->msrp_mappings[mapping_index].priority;
 }
+
+/* Monotonic stream-out counters that outlive the TX context, which is
+ * freed on every stop (Milan counters must not reset with the stream). */
+static volatile uint32_t s_tx_frames_total;
+static volatile uint32_t s_tx_starts;
+static volatile uint32_t s_tx_stops;
 
 /* Stream-out diagnostic context — mirrors stream_rx_ctx_t pattern.
  * Writer is avb_stream_out_task (core 1 TX task), reader is AVB-STATS
@@ -621,6 +629,7 @@ static void avb_stream_out_task(void *task_param) {
     }
     tx_ctx->active = true;
     s_stream_tx_ctx = tx_ctx;
+    s_tx_starts++;
   }
   avbinfo("Starting stream out task");
 
@@ -1633,6 +1642,8 @@ static void avb_stream_out_task(void *task_param) {
     stream_tx_ctx_t *tx_to_free = s_stream_tx_ctx;
     tx_to_free->active = false;
     s_stream_tx_ctx = NULL;
+    s_tx_frames_total += tx_to_free->pkt_count;
+    s_tx_stops++;
     free(tx_to_free);
   }
   esp_log_level_set("*", ESP_LOG_INFO);
@@ -2873,6 +2884,26 @@ void avb_stream_in_sample_drift(avb_state_s *state) {
 }
 
 /* Fill stream input counters for GET_COUNTERS response (Milan Table 5.13) */
+void avb_get_stream_out_counters(aem_stream_out_counters_val_s *valid,
+                                 aem_stream_out_counters_s *counters) {
+  memset(valid, 0, sizeof(*valid));
+  memset(counters, 0, sizeof(*counters));
+  /* Milan Table 5.14 mandatory counters; media_reset and ts_uncertain
+   * never toggle on this talker, so they stay at zero. */
+  valid->stream_start = true;
+  valid->stream_stop = true;
+  valid->media_reset = true;
+  valid->ts_uncertain = true;
+  valid->frames_tx = true;
+  stream_tx_ctx_t *ctx = s_stream_tx_ctx;
+  uint32_t frames = s_tx_frames_total + (ctx ? ctx->pkt_count : 0);
+  uint32_t starts = s_tx_starts;
+  uint32_t stops = s_tx_stops;
+  int_to_octets(&frames, counters->frames_tx, 4);
+  int_to_octets(&starts, counters->stream_start, 4);
+  int_to_octets(&stops, counters->stream_stop, 4);
+}
+
 void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
                                 aem_stream_in_counters_s *counters) {
   memset(valid, 0, sizeof(*valid));

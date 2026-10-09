@@ -2049,7 +2049,8 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
   uint16_t mapping_index = class_b ? 1 : 0;
   if (mapping_index >= state->msrp_mappings_count)
     mapping_index = 0;
-  info->priority = state->msrp_mappings[mapping_index].priority;
+  info->priority = state->avb_lite ? AVB_LITE_PCP
+                                   : state->msrp_mappings[mapping_index].priority;
   info->rank = 1;
   int accumulated_latency = 15000;
   int_to_octets(&accumulated_latency, info->accumulated_latency, 4);
@@ -3167,6 +3168,18 @@ int avb_srp_admission_init(avb_state_s *state) {
 }
 
 void avb_srp_admission_stop(avb_state_s *state) { (void)state; }
+
+void avb_srp_admission_set_link_speed(int port_index, uint32_t link_mbps) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS)
+    return;
+  uint32_t link_rate = link_mbps * 1000000u;
+  for (int c = 0; c < AVB_SR_CLASS_COUNT; c++) {
+    s_admission[port_index][c].link_rate_bps = link_rate;
+    s_admission[port_index][c].cap_bps = link_rate * 3u / 4u;
+  }
+  ESP_LOGI("avb_srp", "admission port%d: link=%u Mbps cap=%u bps", port_index,
+           (unsigned)link_mbps, (unsigned)(link_rate * 3u / 4u));
+}
 
 int avb_srp_admission_try_admit(int port_index, avb_sr_class_e cls,
                                 uint32_t request_bps) {

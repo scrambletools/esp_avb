@@ -978,6 +978,8 @@ void avb_create_eth_frame(uint8_t *eth_frame, eth_addr_t *dest_addr,
       }
     }
   }
+  if (state->avb_lite)
+    prio = AVB_LITE_PCP;
   struct eth_vlan_hdr eth_vlan_hdr = {.prio_vid =
                                           htons((prio << 13) | (vid & 0x0FFF)),
                                       .tpid = htons(ethertype_avtp)};
@@ -1097,7 +1099,7 @@ int avb_net_send(avb_state_s *state, ethertype_t ethertype, void *msg,
     if (subtype == avtp_subtype_maap) {
       memcpy(&dest_addr, &MAAP_MCAST_MAC_ADDR, ETH_ADDR_LEN);
     } else {
-      memcpy(&dest_addr, &BCAST_MAC_ADDR, ETH_ADDR_LEN);
+      memcpy(&dest_addr, &ADP_ACMP_MCAST_MAC_ADDR, ETH_ADDR_LEN);
     }
     break;
   case ethertype_msrp:
@@ -1157,7 +1159,7 @@ int avb_net_send_on(avb_state_s *state, int port_index,
     if (subtype == avtp_subtype_maap) {
       memcpy(&dest_addr, &MAAP_MCAST_MAC_ADDR, ETH_ADDR_LEN);
     } else {
-      memcpy(&dest_addr, &BCAST_MAC_ADDR, ETH_ADDR_LEN);
+      memcpy(&dest_addr, &ADP_ACMP_MCAST_MAC_ADDR, ETH_ADDR_LEN);
     }
     break;
   }

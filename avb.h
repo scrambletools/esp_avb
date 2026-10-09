@@ -123,8 +123,13 @@
 #define AVB_PERSIST_FORCED_FLUSH_MSEC (10 * 60 * 1000)
 
 // Commonly used mac addresses
-#define BCAST_MAC_ADDR                                                         \
+/* AVB Lite tags CVU SRP and media frames at 802.1p priority 5
+ * (profiles/avb_lite.md section 7), regardless of SR class. */
+#define AVB_LITE_PCP 5
+#define ADP_ACMP_MCAST_MAC_ADDR                                                \
   (uint8_t[6]){0x91, 0xe0, 0xf0, 0x01, 0x00, 0x00} // adp,acmp
+#define ETH_BCAST_MAC_ADDR                                                     \
+  (uint8_t[6]){0xff, 0xff, 0xff, 0xff, 0xff, 0xff} // cvu srp talker decl
 #define MAAP_MCAST_MAC_ADDR                                                    \
   (uint8_t[6]){0x91, 0xe0, 0xf0, 0x00, 0xff, 0x00} // maap
 #define SPANTREE_MAC_ADDR                                                      \
@@ -1135,6 +1140,8 @@ void avb_pll_reseed(void);
  * logs stats (including the drift sums maintained by the RX handlers),
  * and applies any due MCLK correction. */
 void avb_pll_tick(avb_state_s *state);
+void avb_get_stream_out_counters(aem_stream_out_counters_val_s *valid,
+                                 aem_stream_out_counters_s *counters);
 void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
                                 aem_stream_in_counters_s *counters);
 uint32_t aaf_code_to_sample_rate(uint8_t code);

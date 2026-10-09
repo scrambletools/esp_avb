@@ -1644,7 +1644,7 @@ int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
   if (dest != NULL) {
     memcpy(&dest_addr, dest, ETH_ADDR_LEN);
   } else {
-    memcpy(&dest_addr, &BCAST_MAC_ADDR, ETH_ADDR_LEN);
+    memcpy(&dest_addr, &ETH_BCAST_MAC_ADDR, ETH_ADDR_LEN);
   }
   /* VLAN-tagged in the media VLAN: CVU declarations are each Lite
    * endpoint's only periodic tagged TX, and VLAN-aware switches with
@@ -2047,8 +2047,12 @@ static void avb_lite_status_fill(avb_state_s *state, uint8_t *body) {
   body[6] = state->config.talker ? CONFIG_ESP_AVB_LITE_UNICAST_FANOUT : 0;
   avb_put_be32(&body[8], state->port[0].link_speed_mbps);
   avb_put_be32(&body[12], avb_lite_committed_egress_kbps(state));
+  /* Grandmaster followed, or this clock's own identity when it is the
+   * grandmaster (matches GET_AVB_INFO). */
   if (ptp->clock_source_selected)
     memcpy(&body[16], ptp->clock_source_info.btc_id, 8);
+  else
+    memcpy(&body[16], ptp->own_identity_info.id, 8);
   int64_t offset = ptp->last_delta_ns;
   if (offset > INT32_MAX)
     offset = INT32_MAX;
@@ -2849,11 +2853,15 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
 
   aecp_get_counters_rsp_s response;
   memset(&response, 0, sizeof(aecp_get_counters_rsp_s));
-  memcpy(&response, msg, sizeof(aecp_get_counters_rsp_s));
+  /* Copy the command only; copying the full response size pulled stale
+   * RX buffer bytes into the counters block. */
+  memcpy(&response, msg, sizeof(aecp_get_counters_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
+  uint16_t descriptor_type = octets_to_uint(msg->get_counters.descriptor_type, 2);
+  uint16_t descriptor_index = octets_to_uint(msg->get_counters.descriptor_index, 2);
 
   // check if the descriptor type is supported
-  switch (octets_to_uint(msg->get_counters.descriptor_type, 2)) {
+  switch (descriptor_type) {
   case aem_desc_type_entity:
     // create entity counters valid flags
     aem_entity_counters_val_s entity_counters_val;
@@ -2866,19 +2874,18 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
   case aem_desc_type_stream_input:
     avb_get_stream_in_counters(&response.counters_valid.stream_in_counters_val,
                                &response.counters_block.stream_in_counters);
+    /* Only stream input 0 carries AVTPDU counters; CRF and other inputs
+     * report their valid flags with zero counts. */
+    if (descriptor_index != 0)
+      memset(&response.counters_block, 0, sizeof(response.counters_block));
     break;
-  case aem_desc_type_stream_output: {
-    /* Set valid flags for Milan mandatory counters (Table 5.14) */
-    aem_stream_out_counters_val_s *out_valid =
-        &response.counters_valid.stream_out_counters_val;
-    out_valid->stream_start = true;
-    out_valid->stream_stop = true;
-    out_valid->media_reset = true;
-    out_valid->ts_uncertain = true;
-    out_valid->frames_tx = true;
-    /* Counter values are zero-initialized from memset above */
+  case aem_desc_type_stream_output:
+    avb_get_stream_out_counters(
+        &response.counters_valid.stream_out_counters_val,
+        &response.counters_block.stream_out_counters);
+    if (descriptor_index != 0)
+      memset(&response.counters_block, 0, sizeof(response.counters_block));
     break;
-  }
   case aem_desc_type_avb_interface: {
     /* Set valid flags for Milan mandatory counters (Table 5.10) */
     aem_avb_interface_counters_val_s *iface_valid =

@@ -29,6 +29,7 @@ avb_state_s *s_state;
 #if AVB_AUDIO_TEST_BOOT_RATE_HZ > 0
 static void avb_audio_test_run(avb_state_s *state);
 #endif
+static void avb_refresh_link_speed(avb_state_s *state);
 
 // logo.png
 extern const char logo_png_start[] asm("_binary_logo_png_start");
@@ -527,6 +528,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * Class A → Wi-Fi) returns -ENOSPC and the bridge emits
    * TalkerFailed for every well-formed Talker Advertise. */
   avb_srp_admission_init(state);
+  avb_refresh_link_speed(state);
   /* Mirror the Class-A-over-Wi-Fi opt-in onto the L2 forwarder so
    * the MAP layer and the data plane stay aligned. Off by default;
    * see avb_config_s comment. */
@@ -914,6 +916,29 @@ static int avb_destroy_state(avb_state_s *state) {
     }
   }
   return OK;
+}
+
+/* Replace the configured nominal link speed of the wired port with the
+ * speed the PHY negotiated. The EMAC on the P4 is 100 Mb/s while the
+ * default configuration says 1000, so the reported link_speed and the
+ * 75 % admission cap would otherwise be ten times the real link. */
+static void avb_refresh_link_speed(avb_state_s *state) {
+  if (state->port[0].medium != avb_port_medium_eth_hwts ||
+      state->config.eth_handle == NULL)
+    return;
+  eth_speed_t speed;
+  if (esp_eth_ioctl(state->config.eth_handle, ETH_CMD_G_SPEED, &speed) != ESP_OK)
+    return;
+  uint32_t mbps = speed == ETH_SPEED_1000M ? 1000u
+                  : speed == ETH_SPEED_100M ? 100u : 10u;
+  if (mbps == state->port[0].link_speed_mbps)
+    return;
+  avbinfo("port 0 link speed %u Mbps (configured %u)", (unsigned)mbps,
+           (unsigned)state->port[0].link_speed_mbps);
+  state->port[0].link_speed_mbps = mbps;
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  avb_srp_admission_set_link_speed(0, mbps);
+#endif
 }
 
 /* Refresh the AVB_INTERFACE / clock_source descriptor sources from
@@ -1470,6 +1495,7 @@ static void avb_task(void *task_param) {
     timespecsub(&time_now, &state->last_ptp_status_update, &delta);
     if (timespec_to_ms(&delta) > PTP_STATUS_UPDATE_INTERVAL_MSEC) {
       state->last_ptp_status_update = time_now;
+      avb_refresh_link_speed(state);
       avb_update_ptp_status(state);
 #ifdef CONFIG_ESP_AVB_ATDECC
       avb_lite_status_tick(state);
