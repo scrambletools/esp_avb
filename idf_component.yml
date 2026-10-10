@@ -4,7 +4,7 @@ url: "https://github.com/scrambletoolsllc/esp_avb"
 license: "MIT"
 dependencies:
   idf: ^6.0
-  scrambletoolsllc/esp_ptp: "*"
+  scrambletools/esp_ptp: "*"
   espressif/esp_codec_dev: "*"
 targets:
   - esp32p4
