@@ -6,8 +6,8 @@ endpoint, or as an Ethernet ↔ Wi-Fi bridge depending on per-port
 configuration.
 
 For a demo on how to use it, see the endpoint app on Github
-(scrambletools/ESP-AVB-Endpoint). For the bridge counterpart, see
-scrambletools/ESP-AVB-Bridge.
+(scrambletoolsllc/ESP-AVB-Endpoint). For the bridge counterpart, see
+scrambletoolsllc/ESP-AVB-Bridge.
 
 This component is available via the ESP Component Registry
 (<https://components.espressif.com>).

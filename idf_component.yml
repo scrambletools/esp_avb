@@ -1,10 +1,10 @@
 version: "2.20.0"
 description: "AVB implementation for ESP-IDF"
-url: "https://github.com/scrambletools/esp_avb"
+url: "https://github.com/scrambletoolsllc/esp_avb"
 license: "MIT"
 dependencies:
   idf: ^6.0
-  scrambletools/esp_ptp: "*"
+  scrambletoolsllc/esp_ptp: "*"
   espressif/esp_codec_dev: "*"
 targets:
   - esp32p4
