@@ -953,6 +953,9 @@ typedef struct avb_state_s {
   bool lite_status_sent_valid;
   bool lite_offset_alarm;       // |offset| above the §9 50 us threshold
   uint8_t lite_config_flags;    // SET_LITE_CONFIG flags, persisted
+  uint8_t wireless_status_sent[66]; // last AVB Wireless status sent
+  bool wireless_status_sent_valid;
+  int64_t wireless_status_tick_us;
 
   /* Deferred NVS persist.
    *  persist_dirty  — set by any writer that wants the current state
@@ -1108,6 +1111,7 @@ uint32_t avb_bridge_forward_stats_restored(void);
 /* dest = NULL broadcasts (talker declarations); listener declarations
  * pass the talker's MAC per avb_lite.md §6 item 2. */
 void avb_lite_status_tick(avb_state_s *state);
+void avb_wireless_status_tick(avb_state_s *state);
 int avb_send_cvu_srp_attr(avb_state_s *state, void *attr, int attr_list_len,
                           const char *label, const eth_addr_t *dest);
 

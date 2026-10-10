@@ -11,6 +11,9 @@
 
 #include "avb.h"
 #include "ptp_status_path.h"
+#ifdef CONFIG_ESP_AVB_ROLE_ENDPOINT_WIRELESS
+#include "esp_wifi.h"
+#endif
 _Static_assert(AECP_MAX_AS_PATH_COUNT >= PTP_PATH_TRACE_MAX_CLOCKS + 1,
                "AS path response must hold the received path plus this clock");
 #include "esp_timer.h" /* connected-listener liveness stamps */
@@ -2189,6 +2192,256 @@ void avb_lite_status_tick(avb_state_s *state) {
   }
 }
 
+/* AVB Wireless (profiles/avb_wireless.md §5). A station answers for its
+ * Wi-Fi interface; a wired interface answers NOT_SUPPORTED. */
+static bool avb_wireless_station(const avb_state_s *state) {
+  return state->port[0].medium == avb_port_medium_wifi_ftm &&
+         state->port[0].wifi_mode == avb_port_wifi_mode_sta;
+}
+
+static void avb_put_be16(uint8_t *out, uint16_t value) {
+  out[0] = (uint8_t)(value >> 8);
+  out[1] = (uint8_t)value;
+}
+
+#ifdef CONFIG_ESP_AVB_ROLE_ENDPOINT_WIRELESS
+/* Link fields at body offsets 2..8 and the BSSID. esp_wifi_sta_get_ap_info
+ * fails transiently under RX load, so the last answer stands until the
+ * station is known to be disassociated. */
+static void avb_wireless_link_fill(uint8_t *body) {
+  static wifi_ap_record_t s_ap;
+  static bool s_ap_known;
+  wifi_ap_record_t ap;
+  esp_err_t result = esp_wifi_sta_get_ap_info(&ap);
+  if (result == ESP_OK) {
+    s_ap = ap;
+    s_ap_known = true;
+  } else if (result == ESP_ERR_WIFI_NOT_CONNECT) {
+    s_ap_known = false;
+  }
+  body[7] = 0x7F; // rssi not known
+  if (!s_ap_known)
+    return;
+  body[2] = s_ap.primary <= 14 ? 1 : 2; // band: 2.4 GHz, else 5 GHz
+  body[3] = s_ap.primary;
+  uint16_t width_mhz = 0;
+  uint8_t generation = 0;
+  wifi_phy_mode_t phy_mode;
+  if (esp_wifi_sta_get_negotiated_phymode(&phy_mode) == ESP_OK) {
+    switch (phy_mode) {
+    case WIFI_PHY_MODE_11B:
+    case WIFI_PHY_MODE_11G:
+    case WIFI_PHY_MODE_11A:
+      generation = 3;
+      width_mhz = 20;
+      break;
+    case WIFI_PHY_MODE_HT20:
+      generation = 4;
+      width_mhz = 20;
+      break;
+    case WIFI_PHY_MODE_HT40:
+      generation = 4;
+      width_mhz = 40;
+      break;
+    case WIFI_PHY_MODE_VHT20:
+      generation = 5;
+      width_mhz = 20;
+      break;
+    case WIFI_PHY_MODE_HE20:
+      generation = 6;
+      width_mhz = 20;
+      break;
+    default: // LR is not an IEEE PHY
+      break;
+    }
+  }
+  avb_put_be16(&body[4], width_mhz);
+  body[6] = generation;
+  body[7] = (uint8_t)s_ap.rssi;
+  /* phy_rate (body[8..9]) stays 0: the SDK does not report the current
+   * transmit rate. */
+  memcpy(&body[32], s_ap.bssid, 6);
+}
+#endif
+
+/* The station's status from profile offset 4. listeners_unserved, the
+ * downlink and uplink counters and station_count are an access point's
+ * and stay 0. */
+static void avb_wireless_status_fill(avb_state_s *state, uint8_t *body) {
+  memset(body, 0, WIRELESS_STATUS_BODY_LEN);
+  ptpd_wifi_sta_status_t sta;
+  if (ptpd_wifi_sta_status(0, &sta) != 0) {
+    memset(&sta, 0, sizeof(sta));
+    sta.time_mode = ptp_wifi_time_mode_none;
+    sta.ftm_success = PTP_WIFI_STATUS_UNKNOWN;
+    sta.ftm_burst_frames = PTP_WIFI_STATUS_UNKNOWN;
+    sta.ftm_burst_duration = PTP_WIFI_STATUS_UNKNOWN;
+    sta.ftm_min_delta = PTP_WIFI_STATUS_UNKNOWN;
+    sta.time_age_ms = PTP_WIFI_STATUS_AGE_NONE;
+  }
+  uint8_t flags = 0;
+  if (sta.locked)
+    flags |= WIRELESS_FLAG_LOCKED;
+  if (sta.holdover)
+    flags |= WIRELESS_FLAG_HOLDOVER;
+  if (sta.servo_error_valid)
+    flags |= WIRELESS_FLAG_SERVO_ERROR_VALID;
+  if (sta.rtt_valid)
+    flags |= WIRELESS_FLAG_RTT_VALID;
+  body[0] = flags;
+  body[1] = (uint8_t)sta.time_mode;
+#ifdef CONFIG_ESP_AVB_ROLE_ENDPOINT_WIRELESS
+  avb_wireless_link_fill(body);
+#else
+  body[7] = 0x7F;
+#endif
+  body[10] = sta.ftm_success;
+  body[11] = sta.as_capable_reason;
+  body[12] = sta.ftm_burst_frames;
+  body[14] = sta.ftm_burst_duration;
+  body[15] = sta.ftm_min_delta;
+  avb_put_be32(&body[16], sta.rtt_valid ? (uint32_t)sta.rtt_ns : 0);
+  avb_put_be32(&body[20],
+               sta.servo_error_valid ? (uint32_t)sta.servo_error_ns : 0);
+  avb_put_be32(&body[24], sta.association_age_s);
+  avb_put_be16(&body[28], sta.time_age_ms);
+  avb_put_be16(&body[30], sta.ap_resets);
+  memcpy(&body[38], sta.ap_port_identity, 10);
+}
+
+static int avb_wireless_send(avb_state_s *state, void *rsp, uint16_t msg_len,
+                             uint8_t status, eth_addr_t *dest_addr) {
+  aecp_common_s *common = rsp;
+  struct timespec ts;
+  common->header.subtype = avtp_subtype_aecp;
+  common->header.msg_type = aecp_msg_type_vendor_unique_response;
+  common->header.status_valtime = status;
+  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
+  common->header.control_data_len_h = (cdl >> 8) & 0x07;
+  common->header.control_data_len = cdl & 0xFF;
+  int ret =
+      avb_net_send_to(state, ethertype_avtp, rsp, msg_len, &ts, dest_addr);
+  if (ret < 0)
+    avberr("send AVB Wireless response failed: %d", errno);
+  return ret;
+}
+
+/* SET_WIRELESS_CONFIG: CLASS_A_ALLOWED is an access point's setting, so a
+ * station accepts only all flags clear. */
+static int avb_process_aecp_cmd_wireless_config(avb_state_s *state,
+                                                aecp_message_u *msg,
+                                                eth_addr_t *src_addr) {
+  aecp_wireless_config_s rsp;
+  const uint16_t echo_len = offsetof(aecp_wireless_config_s, config_flags);
+  memset(&rsp, 0, sizeof(rsp));
+  memcpy(&rsp, msg, echo_len);
+  uint16_t index = octets_to_uint(rsp.avb_interface_index, 2);
+  aecp_status_t status = aecp_status_success;
+  if (index != 0) {
+    status = aecp_status_no_such_descriptor;
+  } else if (!avb_wireless_station(state)) {
+    status = aecp_status_not_supported;
+  } else if (avb_aecp_msg_len(msg) < sizeof(aecp_wireless_config_s)) {
+    status = aecp_status_bad_arguments;
+  } else {
+    const aecp_wireless_config_s *cmd = (const aecp_wireless_config_s *)msg;
+    if (state->locked &&
+        memcmp(state->locked_by, rsp.common.controller_entity_id,
+               UNIQUE_ID_LEN) != 0) {
+      status = aecp_status_entity_locked;
+    } else if (state->acquired &&
+               memcmp(state->acquired_by, rsp.common.controller_entity_id,
+                      UNIQUE_ID_LEN) != 0) {
+      status = aecp_status_entity_acquired;
+    } else if (cmd->config_flags || cmd->reserved[0] || cmd->reserved[1] ||
+               cmd->reserved[2]) {
+      status = aecp_status_bad_arguments;
+    }
+  }
+  return avb_wireless_send(state, &rsp, sizeof(rsp), status, src_addr);
+}
+
+static int avb_process_aecp_cmd_wireless_status(avb_state_s *state,
+                                                aecp_message_u *msg,
+                                                eth_addr_t *src_addr) {
+  aecp_wireless_status_s rsp;
+  const uint16_t echo_len = offsetof(aecp_wireless_status_s, body);
+  memset(&rsp, 0, sizeof(rsp));
+  memcpy(&rsp, msg, echo_len);
+  uint16_t command_type = octets_to_uint(rsp.command_type, 2) & 0x7FFF;
+  uint16_t index = octets_to_uint(rsp.avb_interface_index, 2);
+  if (command_type == WIRELESS_CMD_SET_CONFIG)
+    return avb_process_aecp_cmd_wireless_config(state, msg, src_addr);
+  if (command_type != WIRELESS_CMD_GET_STATUS) {
+    return avb_wireless_send(state, &rsp, echo_len,
+                             aecp_status_not_implemented, src_addr);
+  }
+  if (index != 0) {
+    return avb_wireless_send(state, &rsp, echo_len,
+                             aecp_status_no_such_descriptor, src_addr);
+  }
+  if (!avb_wireless_station(state)) {
+    return avb_wireless_send(state, &rsp, echo_len, aecp_status_not_supported,
+                             src_addr);
+  }
+  avb_wireless_status_fill(state, rsp.body);
+  return avb_wireless_send(state, &rsp, sizeof(rsp), aecp_status_success,
+                           src_addr);
+}
+
+/* Body ranges whose change the profile reports unsolicited: flags through
+ * phy_generation, as_capable_reason through ftm_min_delta (the granted
+ * burst and listeners_unserved), bssid and ap_port_identity, and
+ * station_count. RSSI, the measurements and the counters are polled. */
+static bool avb_wireless_status_changed(const uint8_t *body,
+                                        const uint8_t *sent) {
+  return memcmp(&body[0], &sent[0], 7) != 0 ||
+         memcmp(&body[11], &sent[11], 5) != 0 ||
+         memcmp(&body[32], &sent[32], 16) != 0 ||
+         memcmp(&body[64], &sent[64], 2) != 0;
+}
+
+/* Runs from the main loop; checks for a change once a second. */
+void avb_wireless_status_tick(avb_state_s *state) {
+  if (!avb_wireless_station(state))
+    return;
+  int64_t now_us = esp_timer_get_time();
+  if (state->wireless_status_tick_us &&
+      now_us - state->wireless_status_tick_us < 1000000)
+    return;
+  state->wireless_status_tick_us = now_us;
+  uint8_t body[WIRELESS_STATUS_BODY_LEN];
+  avb_wireless_status_fill(state, body);
+  bool changed = !state->wireless_status_sent_valid ||
+                 avb_wireless_status_changed(body,
+                                             state->wireless_status_sent);
+  if (!changed)
+    return;
+  memcpy(state->wireless_status_sent, body, WIRELESS_STATUS_BODY_LEN);
+  state->wireless_status_sent_valid = true;
+
+  uint8_t protocol_id[] = WIRELESS_STATUS_PROTOCOL_ID;
+  for (size_t i = 0; i < state->num_controllers; i++) {
+    avb_controller_s *controller = &state->controllers[i];
+    if (!controller->unsol_registered)
+      continue;
+    aecp_wireless_status_s rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
+           UNIQUE_ID_LEN);
+    memcpy(rsp.common.controller_entity_id, controller->entity_id,
+           UNIQUE_ID_LEN);
+    uint16_t seq_id = state->unsol_seq_id++;
+    rsp.common.seq_id[0] = (uint8_t)(seq_id >> 8);
+    rsp.common.seq_id[1] = (uint8_t)seq_id;
+    memcpy(rsp.protocol_id, protocol_id, sizeof(rsp.protocol_id));
+    rsp.command_type[0] = 0x80; // u = 1, GET_WIRELESS_STATUS
+    memcpy(rsp.body, body, WIRELESS_STATUS_BODY_LEN);
+    avb_wireless_send(state, &rsp, sizeof(rsp), aecp_status_success,
+                      &controller->mac_addr);
+  }
+}
+
 /* Process AECP command register unsolicited notification.
  * Response body is target + controller + seq + u+cmd_type + flags = 24
  * bytes, so cdl = 24 and the on-wire frame is 28 bytes (4-byte AVTP
@@ -3065,6 +3318,10 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     uint8_t lite_status_pid[] = LITE_STATUS_PROTOCOL_ID;
     if (memcmp(cvu->protocol_id, lite_status_pid, 6) == 0) {
       return avb_process_aecp_cmd_lite_status(state, msg, src_addr);
+    }
+    uint8_t wireless_pid[] = WIRELESS_STATUS_PROTOCOL_ID;
+    if (memcmp(cvu->protocol_id, wireless_pid, 6) == 0) {
+      return avb_process_aecp_cmd_wireless_status(state, msg, src_addr);
     }
 
     /* Validate MVU protocol ID */

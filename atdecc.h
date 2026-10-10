@@ -1470,6 +1470,41 @@ typedef struct {
   uint8_t reserved[3];
 } aecp_lite_config_s; // 36 bytes, control_data_length 24
 
+/* AVB Wireless status query, profiles/avb_wireless.md §5: the AVB Lite
+ * MA-S with sub-protocol 0x005. The response appends the status from
+ * profile offset 4 (flags) through 69 (station_count); an access point's
+ * station entries would follow. */
+#define WIRELESS_STATUS_PROTOCOL_ID {0x8C, 0x1F, 0x64, 0x36, 0xC0, 0x05}
+#define WIRELESS_CMD_GET_STATUS 0x0000
+#define WIRELESS_CMD_SET_CONFIG 0x0001
+#define WIRELESS_STATUS_BODY_LEN 66
+#define WIRELESS_FLAG_ACCESS_POINT 0x01
+#define WIRELESS_FLAG_LOCKED 0x02
+#define WIRELESS_FLAG_HOLDOVER 0x04
+#define WIRELESS_FLAG_SERVO_ERROR_VALID 0x08
+#define WIRELESS_FLAG_RTT_VALID 0x10
+#define WIRELESS_FLAG_CLASS_A_ALLOWED 0x20
+#define WIRELESS_CONFIG_FLAG_CLASS_A_ALLOWED 0x01
+
+typedef struct {
+  aecp_common_s common;
+  uint8_t protocol_id[6];
+  uint8_t command_type[2];        // u (bit 15) | command_type
+  uint8_t avb_interface_index[2];
+  uint8_t body[WIRELESS_STATUS_BODY_LEN];
+} aecp_wireless_status_s; // 98 bytes, control_data_length 86
+
+/* SET_WIRELESS_CONFIG (profile §5.2): the response carries the
+ * configuration the interface has after the command. */
+typedef struct {
+  aecp_common_s common;
+  uint8_t protocol_id[6];
+  uint8_t command_type[2];        // u (bit 15) | command_type
+  uint8_t avb_interface_index[2];
+  uint8_t config_flags;           // WIRELESS_CONFIG_FLAG_*
+  uint8_t reserved[3];
+} aecp_wireless_config_s; // 36 bytes, control_data_length 24
+
 /* AVB Lite CVU SRP talker message */
 typedef struct {
   aecp_cvu_common_s cvu;             // CVU common header

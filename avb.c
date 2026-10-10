@@ -1907,6 +1907,9 @@ static void avb_task(void *task_param) {
 
     // Send periodic messages such as announcing entity available, etc
     avb_periodic_send(state);
+#ifdef CONFIG_ESP_AVB_ATDECC
+    avb_wireless_status_tick(state);
+#endif
 
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
     /* Deferred codec clock-plan check (see the gate after persist load). */
