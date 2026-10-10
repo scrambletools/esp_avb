@@ -9,8 +9,18 @@ For a demo on how to use it, see the endpoint app on Github
 (scrambletoolsllc/ESP-AVB-Endpoint). For the bridge counterpart, see
 scrambletoolsllc/ESP-AVB-Bridge.
 
-This component is available via the ESP Component Registry
-(<https://components.espressif.com>).
+The source lives at <https://github.com/scrambletoolsllc/esp_avb>.
+The component is published in the ESP Component Registry
+(<https://components.espressif.com>) under the **scrambletools**
+namespace, so depend on it as:
+
+```yaml
+dependencies:
+  scrambletools/esp_avb: "*"
+```
+
+Old github.com/scrambletools/... links redirect to the
+scrambletoolsllc repos.
 
 ## Terminology
 
