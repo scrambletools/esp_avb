@@ -179,7 +179,7 @@ static const avb_locale_strings_s AVB_LOCALIZED_STRINGS[] = {
                     "Volume",              /* 19: Speaker Volume Value Name */
                     "Gain",                /* 20: Mic Gain Value Name */
                     "Identify",            /* 21: Identify Value Name */
-                    "",
+                    "Wi-Fi",               /* 22: Wi-Fi AVB Interface Name */
                 },
             },
     },

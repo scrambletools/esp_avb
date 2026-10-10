@@ -568,7 +568,8 @@ int avb_send_aecp_rsp_read_descr_avb_interface(avb_state_s *state,
   aem_avb_interface_desc_s descriptor = state->avb_interface;
 
   // set localized description string reference
-  uint16_t localized_description = 6;
+  uint16_t localized_description =
+      state->port[0].medium == avb_port_medium_wifi_ftm ? 22 : 6;
   int_to_octets(&localized_description, descriptor.localized_description, 2);
 
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_avb_interface_desc_s));
