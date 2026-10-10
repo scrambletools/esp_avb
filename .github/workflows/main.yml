@@ -3,6 +3,7 @@ on:
   push:
 jobs:
   upload_components:
+    api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
     permissions:
       id-token: write # IMPORTANT: Required to generate an OIDC Token
     runs-on: ubuntu-latest
