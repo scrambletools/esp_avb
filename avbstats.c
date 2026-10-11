@@ -161,11 +161,19 @@ static bool is_idle_task(const char *name) {
          name[3] == 'E';
 }
 
+/* The task snapshot and the largest-block query feed debug output only.
+ * uxTaskGetSystemState suspends the scheduler while it scans every task
+ * stack and the query walks the heap under its lock: on a bridge the tick
+ * held off emac_rx for about 11 ms, longer than the RX ring lasts under a
+ * Class B stream. */
+#define AVB_STATS_DEBUG (LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG)
+
 static void avb_cpu_stats_tick(void) {
   TaskStatus_t cur[AVB_STATS_MAX_TASKS];
-  uint32_t cur_total;
-  UBaseType_t cur_n =
-      uxTaskGetSystemState(cur, AVB_STATS_MAX_TASKS, &cur_total);
+  uint32_t cur_total = 0;
+  UBaseType_t cur_n = AVB_STATS_DEBUG
+      ? uxTaskGetSystemState(cur, AVB_STATS_MAX_TASKS, &cur_total)
+      : 0;
   int64_t now = esp_timer_get_time();
   int64_t window_us = now - s_prev_at_us;
 
@@ -341,7 +349,9 @@ static void avb_cpu_stats_tick(void) {
    * RX path mallocs per-frame at ~1500 B; when the largest contiguous
    * block falls below that, RX stops cold. */
   size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
-  size_t heap_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+  size_t heap_largest =
+      AVB_STATS_DEBUG ? heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT)
+                      : 0;
   size_t heap_min_ever = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
   avbdebug("  ====> HEAP free=%u largest=%u min_ever=%u",
           (unsigned)heap_free, (unsigned)heap_largest, (unsigned)heap_min_ever);

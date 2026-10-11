@@ -65,6 +65,10 @@ static volatile uint32_t s_fwd_wifi_ok, s_fwd_wifi_fail, s_fwd_wifi_oom;
  * can be in very different states for the first minute or so after a cold
  * boot. Hot path adds 1 branch + 1 store. */
 static volatile uint32_t s_fwd_wifi_ok_ucast, s_fwd_wifi_ok_mcast;
+/* Free entries in the hosted data queue to the coprocessor, absent when
+ * Wi-Fi is not hosted, and the entries a stream leaves to control frames. */
+extern int esp_hosted_data_tx_queue_space(void) __attribute__((weak));
+#define AVB_WIFI_CONTROL_RESERVE 4
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
 /* Stream frames whose destination was re-addressed for the Wi-Fi hop,
  * and those left alone because no Listener declaration resolved. */
@@ -424,6 +428,15 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
       s_fwd_wifi_no_mapping++;
     }
 #endif
+    /* Stream frames leave the last few hosted queue entries to control
+     * frames (PTP, MSRP, ATDECC), which would otherwise be dropped behind
+     * an over-admitted stream. */
+    if (esp_hosted_data_tx_queue_space &&
+        esp_hosted_data_tx_queue_space() <= AVB_WIFI_CONTROL_RESERVE) {
+      s_fwd_wifi_bp_drop++;
+      free(buf);
+      return ESP_OK;
+    }
     /* NOT tx_by_ref: on esp_wifi_remote that entry point is a WEAK stub
      * that forwards to the copying esp_wifi_internal_tx and silently
      * discards the netstack_buf, the ref/free callbacks registered by
