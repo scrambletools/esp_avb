@@ -223,45 +223,73 @@ static void avb_update_avb_lite_from_ptp(avb_state_s *state) {
   state->avb_lite = avb_lite;
 }
 
-/* Emits exactly AVB_FORMATS_PER_RATE formats per supported rate, in a
- * fixed family order (am824, aaf32, aaf24), rates in sample_rates[]
- * order — avb_persist_normalize_stream_format indexes on this layout. */
-#define AVB_FORMATS_PER_RATE 3
+/* Class B's own cadence, one frame each 250 us: rate/4000 samples a
+ * frame, for the 48 kHz family (profiles/avb_wireless.md §4). */
+static uint16_t avb_class_b_samples_per_frame(uint32_t hz) {
+  switch (hz) {
+  case 48000:
+    return 12;
+  case 96000:
+    return 24;
+  case 192000:
+    return 48;
+  default:
+    return 0;
+  }
+}
+
+/* Largest AAF payload one Ethernet frame carries after the 24-octet
+ * AVTPDU header. */
+#define AVB_AAF_MAX_PAYLOAD (1500 - 24)
+
+static void avb_add_aaf_format(avtp_stream_format_s *formats,
+                               size_t max_formats, size_t *count,
+                               uint8_t bit_depth, uint32_t hz,
+                               uint8_t channels, uint16_t samples_per_frame) {
+  /* Both depths travel in 32-bit containers. */
+  if (samples_per_frame == 0 || *count >= max_formats ||
+      (uint32_t)samples_per_frame * channels * 4 > AVB_AAF_MAX_PAYLOAD)
+    return;
+  avtp_stream_format_aaf_pcm_s aaf = AVB_DEFAULT_FORMAT_AAF(
+      bit_depth, avb_aaf_rate_from_hz(hz), channels, false);
+  /* The wire field is 10 bits split 6+4. */
+  aaf.samples_per_frame_h = (samples_per_frame >> 4) & 0x3F;
+  aaf.samples_per_frame = samples_per_frame & 0x0F;
+  formats[(*count)++].aaf_pcm = aaf;
+}
+
+/* Per supported rate, in sample_rates[] order: AM824; AAF at Milan's
+ * cadence (one Class A interval a frame, rate/8000 samples) and at Class
+ * B's own (rate/4000), each 32-bit (Milan Base, Milan v1.3 §6.2: our
+ * 24-bit codec pads the low byte as a talker and truncates as a
+ * listener) and 24-in-32 (what macOS advertises natively), at the full
+ * channel count and at 2 channels (AVB Wireless §4). Formats that do not
+ * fit one Ethernet frame are left out. */
 static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
                                       size_t max_formats,
                                       const uint32_t *sample_rates,
                                       size_t sample_rate_count,
                                       uint8_t channels_per_stream) {
   size_t n = 0;
-  for (size_t i = 0;
-       i < sample_rate_count && n + AVB_FORMATS_PER_RATE <= max_formats;
-       i++) {
+  for (size_t i = 0; i < sample_rate_count && n < max_formats; i++) {
     uint32_t hz = sample_rates[i];
-    avtp_stream_format_am824_s am824 =
-        AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
-                                 channels_per_stream);
-    /* Milan-canonical packetization for both AAF variants:
-     * samples_per_frame = one Class A interval (rate/8000). The wire
-     * field is 10 bits split 6+4 across the struct's _h / low-nibble
-     * members. */
-    uint16_t spf = avb_samples_per_frame_from_hz(hz);
-    /* Milan Base format (Milan v1.3 §6.2): 32-bit integer, bit_depth
-     * 32. Our 24-bit codec pads the low byte as a talker and truncates
-     * as a listener — both legal for this format. */
-    avtp_stream_format_aaf_pcm_s aaf32 =
-        AVB_DEFAULT_FORMAT_AAF(32, avb_aaf_rate_from_hz(hz),
-                               channels_per_stream, false);
-    aaf32.samples_per_frame_h = (spf >> 4) & 0x3F;
-    aaf32.samples_per_frame = spf & 0x0F;
-    /* 24-significant-bit variant — what macOS advertises natively. */
-    avtp_stream_format_aaf_pcm_s aaf24 =
-        AVB_DEFAULT_FORMAT_AAF(24, avb_aaf_rate_from_hz(hz),
-                               channels_per_stream, false);
-    aaf24.samples_per_frame_h = (spf >> 4) & 0x3F;
-    aaf24.samples_per_frame = spf & 0x0F;
-    formats[n++].am824 = am824;
-    formats[n++].aaf_pcm = aaf32;
-    formats[n++].aaf_pcm = aaf24;
+    formats[n++].am824 = (avtp_stream_format_am824_s)AVB_DEFAULT_FORMAT_AM824(
+        avb_cip_sfc_from_hz(hz), channels_per_stream);
+    uint16_t cadences[2] = {avb_samples_per_frame_from_hz(hz),
+                            avb_class_b_samples_per_frame(hz)};
+    uint8_t channel_counts[2] = {channels_per_stream,
+                                 channels_per_stream > 2 ? 2 : 0};
+    for (int channel_idx = 0; channel_idx < 2; channel_idx++) {
+      uint8_t channels = channel_counts[channel_idx];
+      if (channels == 0)
+        continue;
+      for (int cadence_idx = 0; cadence_idx < 2; cadence_idx++) {
+        avb_add_aaf_format(formats, max_formats, &n, 32, hz, channels,
+                           cadences[cadence_idx]);
+        avb_add_aaf_format(formats, max_formats, &n, 24, hz, channels,
+                           cadences[cadence_idx]);
+      }
+    }
   }
   return n;
 }
@@ -301,7 +329,8 @@ uint64_t avb_tspec_copy_bps(uint16_t max_frame_size,
 
 uint64_t avb_stream_out_copy_bps(avb_state_s *state, uint16_t index) {
   return avb_tspec_copy_bps(
-      avb_compute_tspec_max_frame_size(state, index), 1,
+      avb_compute_tspec_max_frame_size(state, index),
+      avb_compute_tspec_max_interval_frames(state, index),
       state->output_streams[index].stream_info_flags.class_b,
       AVB_TSPEC_OVERHEAD_OCTETS);
 }
@@ -321,11 +350,11 @@ static const eth_addr_t *avb_declared_dest_addr(avb_state_s *state,
 /* Declare (or keep declaring) an output stream's Talker Advertise. */
 static void avb_declare_output_stream(avb_state_s *state, uint16_t index) {
   avb_talker_stream_s *stream = &state->output_streams[index];
-  mrp_declare_talker_advertise(state, 0, &stream->stream_id,
-                               avb_declared_dest_addr(state, stream),
-                               stream->vlan_id,
-                               avb_compute_tspec_max_frame_size(state, index),
-                               stream->stream_info_flags.class_b);
+  mrp_declare_talker_advertise(
+      state, 0, &stream->stream_id, avb_declared_dest_addr(state, stream),
+      stream->vlan_id, avb_compute_tspec_max_frame_size(state, index),
+      avb_compute_tspec_max_interval_frames(state, index),
+      stream->stream_info_flags.class_b);
 }
 
 /* AVB Lite unicast transport (profiles/avb_lite.md §6, "Stream transport
@@ -696,6 +725,7 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
                              refused_count, avb_declared_dest_addr(state, s),
                              s->vlan_id,
                              avb_compute_tspec_max_frame_size(state, i),
+                             avb_compute_tspec_max_interval_frames(state, i),
                              s->stream_info_flags.class_b);
       if (!serving && s->streaming) {
         avb_stop_stream_out(state, i);
@@ -881,6 +911,17 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   /* Mirror the Class-A-over-Wi-Fi opt-in onto the L2 forwarder so
    * the MAP layer and the data plane stay aligned. Off by default;
    * see avb_config_s comment. */
+#ifdef CONFIG_ESP_AVB_WIFI_DELIVERABLE_FRAMES
+  /* AVB Wireless §5.2: CLASS_A_ALLOWED takes effect only where the access
+   * point delivers at least 12000 frames a second. */
+  if (state->config.allow_class_a_over_wifi &&
+      CONFIG_ESP_AVB_WIFI_DELIVERABLE_FRAMES < 12000) {
+    avbwarn("Class A over Wi-Fi needs 12000 deliverable frames a second, "
+            "this bridge delivers %d: not allowed",
+            CONFIG_ESP_AVB_WIFI_DELIVERABLE_FRAMES);
+    state->config.allow_class_a_over_wifi = false;
+  }
+#endif
   avb_bridge_set_allow_class_a_over_wifi(state->config.allow_class_a_over_wifi);
   /* Override IDF's netstack-buf callbacks with a chained pair so the
    * Wi-Fi-egress hot path can hand the EMAC RX buffer over by
@@ -1135,6 +1176,12 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
    * default of 6 only matches at 48 kHz). 10-bit field split 6+4. */
   uint16_t default_spf =
       avb_samples_per_frame_from_hz(state->config.default_sample_rate);
+  /* Streams on a Wi-Fi port are Class B (below) and default to Class B's
+   * own cadence, half the frames over the hop (AVB Wireless §4). */
+  uint16_t class_b_spf =
+      avb_class_b_samples_per_frame(state->config.default_sample_rate);
+  if (state->port[0].medium == avb_port_medium_wifi_ftm && class_b_spf)
+    default_spf = class_b_spf;
   format.samples_per_frame_h = (default_spf >> 4) & 0x3F;
   format.samples_per_frame = default_spf & 0x0F;
 #endif
@@ -2318,6 +2365,48 @@ static bool avb_persist_stream_format_supported(avb_state_s *state,
   return false;
 }
 
+/* Sample rate of an AM824 or AAF format word, 0 for any other. */
+static uint32_t avb_stream_format_rate_hz(const uint8_t format[8]) {
+  avtp_stream_format_s word = {0};
+  memcpy(&word, format, 8);
+  if (word.aaf_pcm.subtype == avtp_subtype_61883)
+    return cip_sfc_to_sample_rate(word.am824.fdf_sfc);
+  if (word.aaf_pcm.subtype == avtp_subtype_aaf)
+    return aaf_code_to_sample_rate(word.aaf_pcm.sample_rate);
+  return 0;
+}
+
+/* Two formats of one family differ only in rate: AM824 at the same
+ * channel count, or AAF in the same sample format, depth, channel count
+ * and cadence (Milan's or Class B's own). */
+static bool avb_stream_formats_same_family(const uint8_t first[8],
+                                           const uint8_t second[8]) {
+  avtp_stream_format_s one = {0}, other = {0};
+  memcpy(&one, first, 8);
+  memcpy(&other, second, 8);
+  if (one.aaf_pcm.subtype != other.aaf_pcm.subtype)
+    return false;
+  if (one.aaf_pcm.subtype == avtp_subtype_61883)
+    return one.am824.dbs == other.am824.dbs;
+  if (one.aaf_pcm.subtype != avtp_subtype_aaf)
+    return false;
+  uint16_t one_spf = (one.aaf_pcm.samples_per_frame_h << 4) |
+                     one.aaf_pcm.samples_per_frame;
+  uint16_t other_spf = (other.aaf_pcm.samples_per_frame_h << 4) |
+                       other.aaf_pcm.samples_per_frame;
+  bool one_class_b =
+      one_spf == avb_class_b_samples_per_frame(
+                     aaf_code_to_sample_rate(one.aaf_pcm.sample_rate));
+  bool other_class_b =
+      other_spf == avb_class_b_samples_per_frame(
+                       aaf_code_to_sample_rate(other.aaf_pcm.sample_rate));
+  return one.aaf_pcm.format == other.aaf_pcm.format &&
+         one.aaf_pcm.bit_depth == other.aaf_pcm.bit_depth &&
+         one.aaf_pcm.chan_per_frame_h == other.aaf_pcm.chan_per_frame_h &&
+         one.aaf_pcm.chan_per_frame == other.aaf_pcm.chan_per_frame &&
+         one_class_b == other_class_b;
+}
+
 /* Milan requires SET_STREAM_FORMAT to persist across power cycles, but a
  * stream format must also stay coherent with the entity's operating
  * sampling rate — which at boot comes from config, not from the persisted
@@ -2326,10 +2415,9 @@ static bool avb_persist_stream_format_supported(avb_state_s *state,
  * talker's MSRP TSpec, advertising tens of Mbps of phantom Class A per
  * port — enough to break admission control on 100 Mbps ports (observed
  * as a bridge TALKER_FAILED code=1 flap). Preserve the persisted format
- * FAMILY (subtype/bit depth) but coerce its rate to the operating rate.
- * Relies on avb_build_audio_formats emitting a fixed family order per
- * rate, in supported_sample_rates order. Returns false if the format is
- * unusable; on success `format` holds the (possibly rewritten) word. */
+ * FAMILY (subtype, depth, channels, cadence) but coerce its rate to the
+ * operating rate. Returns false if the format is unusable; on success
+ * `format` holds the (possibly rewritten) word. */
 static bool avb_persist_normalize_stream_format(avb_state_s *state,
                                                 bool is_output, uint16_t index,
                                                 uint8_t format[8]) {
@@ -2347,41 +2435,30 @@ static bool avb_persist_normalize_stream_format(avb_state_s *state,
                                               : state->supported_formats_in;
   size_t num_supported = is_output ? state->num_supported_formats_out
                                    : state->num_supported_formats_in;
-  size_t format_idx = num_supported;
-  for (size_t i = 0; i < num_supported; i++) {
-    if (memcmp(format, &supported[i], 8) == 0) {
-      format_idx = i;
-      break;
-    }
-  }
-  if (format_idx == num_supported)
-    return false; /* unreachable: _supported() above already matched */
-
-  int op_rate_slot = -1;
-  for (uint8_t i = 0; i < state->supported_sample_rates.num_rates; i++) {
-    if (state->supported_sample_rates.sample_rates[i] ==
-        state->config.default_sample_rate) {
-      op_rate_slot = i;
-      break;
-    }
-  }
-  if (op_rate_slot < 0)
-    return true; /* operating rate not enumerable; leave format as-is */
-
-  size_t family = format_idx % AVB_FORMATS_PER_RATE;
-  size_t rate_slot = format_idx / AVB_FORMATS_PER_RATE;
-  if ((int)rate_slot == op_rate_slot)
+  uint32_t persisted_hz = avb_stream_format_rate_hz(format);
+  if (persisted_hz == state->config.default_sample_rate)
     return true;
-
-  size_t replacement = (size_t)op_rate_slot * AVB_FORMATS_PER_RATE + family;
-  if (replacement >= num_supported)
-    return false;
-  avbwarn("NVS: stream_%s %d persisted format rate slot %u != operating "
-          "%lu Hz; coercing rate, keeping format family",
-          is_output ? "output" : "input", index, (unsigned)rate_slot,
-          (unsigned long)state->config.default_sample_rate);
-  memcpy(format, &supported[replacement], 8);
-  return true;
+  bool rate_enumerable = false;
+  for (size_t i = 0; i < num_supported; i++) {
+    const uint8_t *candidate = (const uint8_t *)&supported[i];
+    if (avb_stream_format_rate_hz(candidate) !=
+        state->config.default_sample_rate)
+      continue;
+    rate_enumerable = true;
+    if (!avb_stream_formats_same_family(format, candidate))
+      continue;
+    avbwarn("NVS: stream_%s %d persisted format at %lu Hz != operating "
+            "%lu Hz; coercing rate, keeping format family",
+            is_output ? "output" : "input", index,
+            (unsigned long)persisted_hz,
+            (unsigned long)state->config.default_sample_rate);
+    memcpy(format, candidate, 8);
+    return true;
+  }
+  /* The family has no format at the operating rate (Class B's cadence
+   * outside the 48 kHz family): unusable. An operating rate that is not
+   * enumerable at all leaves the format as it is. */
+  return !rate_enumerable;
 }
 
 /* Populate the persist struct from current state */

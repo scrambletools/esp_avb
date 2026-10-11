@@ -377,6 +377,10 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port);
 const uint8_t *msrp_wifi_ucast_lookup_da(const uint8_t *da);
 const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id);
 void msrp_wifi_ucast_refresh(int wifi_port);
+/* Bridge Wi-Fi port admission (profiles/avb_wireless.md §4): the frame
+ * budget and the frames a second admitted streams take. */
+uint32_t msrp_wifi_frame_budget(void);
+uint32_t msrp_wifi_frames_committed(void);
 #endif
 
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
@@ -391,6 +395,7 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
                                   uint16_t max_frame_size,
+                                  uint16_t max_interval_frames,
                                   bool class_b);
 /* src_bridge_id: 8 bytes of the bridge that originally detected the
  * failure (preserved on multi-bridge propagation per §35.2.4 cascade
@@ -401,8 +406,9 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const unique_id_t *stream_id,
                                const eth_addr_t *stream_dest_addr,
                                const uint8_t *vlan_id,
-                               uint16_t max_frame_size, uint8_t failure_code,
-                               bool class_b,
+                               uint16_t max_frame_size,
+                               uint16_t max_interval_frames,
+                               uint8_t failure_code, bool class_b,
                                const uint8_t *src_bridge_id);
 void mrp_declare_listener(avb_state_s *state, int port,
                           const unique_id_t *stream_id,
@@ -427,7 +433,7 @@ void mrp_lite_sync_refusals(avb_state_s *state, const unique_id_t *stream_id,
                             const uint8_t *failure_codes, int refused_count,
                             const eth_addr_t *declared_da,
                             const uint8_t *vlan_id, uint16_t max_frame_size,
-                            bool class_b);
+                            uint16_t max_interval_frames, bool class_b);
 /* TSpec of the registered Talker Advertise for a stream, false when
  * none is registered. */
 bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,
@@ -443,6 +449,8 @@ bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,
  * ATDECC section — same MSRP payload, different envelope. */
 
 uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index);
+uint16_t avb_compute_tspec_max_interval_frames(avb_state_s *state,
+                                               uint16_t index);
 
 /* Query the current Registrar state of an upstream MSRP TALKER
  * attribute. Returns true iff the matching SM is currently IN (i.e.

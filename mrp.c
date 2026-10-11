@@ -844,6 +844,25 @@ extern int avb_srp_admission_try_admit(int port_index, avb_sr_class_e cls,
                                        uint32_t request_bps);
 extern void avb_srp_admission_release(int port_index, avb_sr_class_e cls,
                                       uint32_t request_bps);
+extern uint32_t avb_srp_admission_link_rate_bps(int port_index);
+
+/* Class A goes toward the Wi-Fi port only where the access point
+ * delivers at least 12000 frames a second, one Class A stream with a
+ * quarter left to best effort, and only with the opt-in set. */
+static bool msrp_wifi_class_a_allowed(const avb_state_s *state) {
+#ifdef CONFIG_ESP_AVB_WIFI_DELIVERABLE_FRAMES
+  return state->config.allow_class_a_over_wifi &&
+         CONFIG_ESP_AVB_WIFI_DELIVERABLE_FRAMES >= 12000;
+#else
+  (void)state;
+  return false;
+#endif
+}
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+static bool msrp_wifi_admission_refused(const unique_id_t *stream_id);
+/* The Wi-Fi port admission runs on, -1 before its first update. */
+static int s_wifi_admission_port = -1;
+#endif
 
 static void msrp_release_admission(msrp_talker_entry_t *entry, int port) {
   if (!entry || !entry->admitted_bps[port])
@@ -1176,7 +1195,7 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
        * §35.2.4 cascade semantics require us to preserve the upstream
        * bridge's failure_bridge_id rather than overwrite it with our
        * own. */
-      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
+      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs, mfi,
                                 wire->talker_failed.failure_code,
                                 propagate_class_b,
                                 wire->talker_failed.failure_bridge_id);
@@ -1193,17 +1212,15 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
      * (a silent skip would let ACMP/MSRP report SUCCESS on a path
      * that can never carry audio).
      *
-     * Bench-experiment escape hatch: allow_class_a_over_wifi lets a
-     * deployment opt into propagating Class A onto Wi-Fi anyway, at
-     * the cost of giving up the Milan §5.6 latency guarantee. The
-     * audio will glitch / underrun under load but the SRP state
-     * machine completes, which is enough to validate the rest of
-     * the data plane end-to-end. */
+     * AVB Wireless §4 and §5.2 admit Class A toward the hop only where
+     * the access point delivers at least 12000 frames a second and
+     * allow_class_a_over_wifi is set; it then faces the frame budget
+     * like Class B. */
     if (state->port[y].medium == avb_port_medium_wifi_ftm &&
-        new_cls == AVB_SR_CLASS_A && !state->config.allow_class_a_over_wifi) {
+        new_cls == AVB_SR_CLASS_A && !msrp_wifi_class_a_allowed(state)) {
       msrp_release_admission(ingress, y);
       avbwarn("MAP: Class A blocked on Wi-Fi egress port %d (opt-in off)", y);
-      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
+      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs, mfi,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
       mrp_patch_egress_accumulated_latency(
@@ -1211,16 +1228,36 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
       continue;
     }
 
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+    /* The Wi-Fi port admits when a listener station declares
+     * (msrp_wifi_admission_update), so a stream no station wants takes
+     * nothing from it. Until then, keep any refusal already made. */
+    if (state->port[y].medium == avb_port_medium_wifi_ftm) {
+      if (msrp_wifi_admission_refused(stream_id)) {
+        mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs, mfi,
+                                  insufficient_bandwidth, propagate_class_b,
+                                  NULL);
+        mrp_patch_egress_accumulated_latency(
+            y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
+      } else {
+        mrp_declare_talker_advertise(state, y, stream_id, dest, vlan, mfs,
+                                     mfi, propagate_class_b);
+        mrp_patch_egress_accumulated_latency(
+            y, stream_id, msrp_attr_type_talker_advertise, egress_lat_ns);
+      }
+      continue;
+    }
+#endif
     int adm = msrp_update_admission(ingress, y, new_cls, new_bps);
     if (adm == 0) {
-      mrp_declare_talker_advertise(state, y, stream_id, dest, vlan, mfs,
+      mrp_declare_talker_advertise(state, y, stream_id, dest, vlan, mfs, mfi,
                                    propagate_class_b);
       mrp_patch_egress_accumulated_latency(
           y, stream_id, msrp_attr_type_talker_advertise, egress_lat_ns);
     } else {
       avbwarn("MAP: admission reject port=%d cls=%d req=%u bps (rc=%d)", y,
               (int)new_cls, (unsigned)new_bps, adm);
-      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs,
+      mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs, mfi,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
       mrp_patch_egress_accumulated_latency(
@@ -1276,7 +1313,15 @@ static bool msrp_merge_listener_decls(int exclude_port,
       continue;
     if (e->sm.registrar != mrp_registrar_in)
       continue;
-    switch (e->peer_decl) {
+    msrp_listener_event_t decl = e->peer_decl;
+#ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
+    /* The bridge refused the stream toward the Wi-Fi port, so its
+     * listener stations cannot be served whatever they declare. */
+    if (p == s_wifi_admission_port && decl != msrp_listener_event_ignore &&
+        msrp_wifi_admission_refused(stream_id))
+      decl = msrp_listener_event_asking_failed;
+#endif
+    switch (decl) {
     case msrp_listener_event_ready:
       any_ready = true;
       break;
@@ -1300,6 +1345,36 @@ static bool msrp_merge_listener_decls(int exclude_port,
     *out = msrp_listener_event_asking_failed;
   }
   return true;
+}
+#endif
+
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+/* Re-declare a stream's merged listener declaration on every bridged
+ * port other than `port`, where it changed. */
+static void msrp_propagate_listener(avb_state_s *state, int port,
+                                    const unique_id_t *stream_id) {
+  for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
+    if (y == port)
+      continue;
+    if (state->port[y].type != avb_port_type_bridged)
+      continue;
+
+    msrp_listener_event_t merged;
+    bool has_merged = msrp_merge_listener_decls(y, stream_id, &merged);
+    msrp_listener_entry_t *egress = msrp_listener_find(y, stream_id);
+    bool currently_declaring =
+        (egress != NULL && egress->sm.applicant != mrp_applicant_vo);
+
+    if (!has_merged) {
+      if (currently_declaring) {
+        mrp_withdraw_listener(state, y, stream_id);
+      }
+    } else {
+      if (!currently_declaring || egress->decl_event != merged) {
+        mrp_declare_listener(state, y, stream_id, merged);
+      }
+    }
+  }
 }
 #endif
 
@@ -1493,29 +1568,7 @@ static void mrp_on_listener_registrar_change(
   if (state->port[port].type != avb_port_type_bridged)
     return;
 
-  const unique_id_t *stream_id = (const unique_id_t *)&wire->stream_id;
-  for (int y = 0; y < CONFIG_ESP_AVB_NUM_PORTS; y++) {
-    if (y == port)
-      continue;
-    if (state->port[y].type != avb_port_type_bridged)
-      continue;
-
-    msrp_listener_event_t merged;
-    bool has_merged = msrp_merge_listener_decls(y, stream_id, &merged);
-    msrp_listener_entry_t *egress = msrp_listener_find(y, stream_id);
-    bool currently_declaring =
-        (egress != NULL && egress->sm.applicant != mrp_applicant_vo);
-
-    if (!has_merged) {
-      if (currently_declaring) {
-        mrp_withdraw_listener(state, y, stream_id);
-      }
-    } else {
-      if (!currently_declaring || egress->decl_event != merged) {
-        mrp_declare_listener(state, y, stream_id, merged);
-      }
-    }
-  }
+  msrp_propagate_listener(state, port, (const unique_id_t *)&wire->stream_id);
 #else
   (void)port;
   (void)tr;
@@ -1799,6 +1852,11 @@ void msrp_wifi_ucast_refresh(int wifi_port) {
     /* Only Ready / Ready Failed mean the peer actually wants the stream. */
     if (le->peer_decl != msrp_listener_event_ready &&
         le->peer_decl != msrp_listener_event_ready_failed) continue;
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+    /* Nor is a stream the Wi-Fi admission refused served. */
+    if (msrp_wifi_admission_refused((const unique_id_t *)&le->wire.stream_id))
+      continue;
+#endif
     /* A declarer with no recorded source MAC cannot be targeted. */
     static const eth_addr_t zero_mac = {0};
     if (memcmp(le->peer_mac, zero_mac, ETH_ADDR_LEN) == 0) continue;
@@ -1841,6 +1899,222 @@ static int msrp_wifi_port_of(const avb_state_s *state) {
     if (state->port[i].medium == avb_port_medium_wifi_ftm) return i;
   }
   return -1;
+}
+#endif
+
+#if defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && \
+    defined(CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS)
+/* ---- Wi-Fi port admission (profiles/avb_wireless.md §4) --------------
+ *
+ * 802.11 charges every frame airtime to contend for the medium and to be
+ * acknowledged, whatever its size, so the Wi-Fi port admits by frames a
+ * second as well as by bandwidth. A stream is admitted when a listener
+ * station first declares for it: its frames a second (MaxIntervalFrames
+ * times its class's intervals) must stay within the frame budget, and
+ * its bandwidth within 75 % of the link, both summed over every admitted
+ * stream. One that does not fit gets Talker Failed with
+ * insufficient_bandwidth toward the Wi-Fi port until room frees. The data
+ * plane re-addresses each stream to one station, so each admitted stream
+ * counts one copy; the merged MSRP registration on the port does not tell
+ * further stations apart. */
+#define AVB_WIFI_ADMISSION_SIZE MSRP_LISTENER_TABLE_SIZE
+
+typedef struct {
+  bool valid;
+  bool wanted;
+  bool refused;
+  bool refusal_declared; /* our Talker Failed is on the Wi-Fi port */
+  unique_id_t stream_id;
+  uint32_t frames_per_s;
+  uint32_t bps;
+} avb_wifi_admission_t;
+
+static avb_wifi_admission_t s_wifi_admission[AVB_WIFI_ADMISSION_SIZE];
+static uint32_t s_wifi_frames_committed;
+
+static bool msrp_wifi_admission_refused(const unique_id_t *stream_id) {
+  for (int i = 0; i < AVB_WIFI_ADMISSION_SIZE; i++) {
+    const avb_wifi_admission_t *admission = &s_wifi_admission[i];
+    if (admission->valid && admission->refused &&
+        memcmp(admission->stream_id, stream_id, UNIQUE_ID_LEN) == 0)
+      return true;
+  }
+  return false;
+}
+
+uint32_t msrp_wifi_frame_budget(void) {
+  return (uint32_t)CONFIG_ESP_AVB_WIFI_DELIVERABLE_FRAMES * 3u / 4u;
+}
+
+uint32_t msrp_wifi_frames_committed(void) { return s_wifi_frames_committed; }
+
+/* The registered Talker Advertise for a stream on a port other than the
+ * Wi-Fi one, or NULL. */
+static const msrp_talker_entry_t *
+msrp_wifi_upstream_talker(int wifi_port, const unique_id_t *stream_id) {
+  for (int p = 0; p < CONFIG_ESP_AVB_NUM_PORTS; p++) {
+    if (p != wifi_port && mrp_talker_advertise_active(p, stream_id))
+      return msrp_talker_find(p, stream_id, msrp_attr_type_talker_advertise);
+  }
+  return NULL;
+}
+
+/* Declare a stream toward the Wi-Fi port from its upstream Talker
+ * Advertise, as Talker Failed when refused. */
+static void msrp_wifi_admission_declare(avb_state_s *state, int wifi_port,
+                                        const msrp_talker_entry_t *talker,
+                                        bool refused) {
+  const talker_adv_info_s *info = &talker->wire.talker.info;
+  const unique_id_t *stream_id = (const unique_id_t *)&info->stream_id;
+  uint16_t mfs = (uint16_t)octets_to_uint(info->tspec_max_frame_size, 2);
+  uint16_t mfi = (uint16_t)octets_to_uint(info->tspec_max_frame_interval, 2);
+  bool class_b = info->priority != 3;
+  uint32_t latency_ns = (uint32_t)octets_to_uint(info->accumulated_latency, 4) +
+                        avb_port_forwarding_latency_ns(&state->port[wifi_port]);
+  mrp_withdraw_talker(state, wifi_port, stream_id);
+  if (refused) {
+    mrp_declare_talker_failed(state, wifi_port, stream_id,
+                              &info->stream_dest_addr, info->vlan_id, mfs, mfi,
+                              insufficient_bandwidth, class_b, NULL);
+    mrp_patch_egress_accumulated_latency(
+        wifi_port, stream_id, msrp_attr_type_talker_failed, latency_ns);
+  } else {
+    mrp_declare_talker_advertise(state, wifi_port, stream_id,
+                                 &info->stream_dest_addr, info->vlan_id, mfs,
+                                 mfi, class_b);
+    mrp_patch_egress_accumulated_latency(
+        wifi_port, stream_id, msrp_attr_type_talker_advertise, latency_ns);
+  }
+}
+
+static void msrp_wifi_admission_update(avb_state_s *state, int wifi_port) {
+  if (state == NULL || wifi_port < 0)
+    return;
+  s_wifi_admission_port = wifi_port;
+  bool decided = false;
+  for (int i = 0; i < AVB_WIFI_ADMISSION_SIZE; i++)
+    s_wifi_admission[i].wanted = false;
+
+  /* The streams listener stations declare for, with their cost. */
+  for (int li = 0; li < MSRP_LISTENER_TABLE_SIZE; li++) {
+    const msrp_listener_entry_t *le = &s_msrp_listeners[wifi_port][li];
+    if (!le->valid || le->peer_decl == msrp_listener_event_ignore ||
+        (le->sm.registrar != mrp_registrar_in &&
+         le->sm.registrar != mrp_registrar_lv))
+      continue;
+    const unique_id_t *stream_id = (const unique_id_t *)&le->wire.stream_id;
+    const msrp_talker_entry_t *talker =
+        msrp_wifi_upstream_talker(wifi_port, stream_id);
+    if (talker == NULL)
+      continue;
+    const talker_adv_info_s *info = &talker->wire.talker.info;
+    bool class_a = info->priority == 3;
+    if (class_a && !msrp_wifi_class_a_allowed(state))
+      continue; /* refused for its class when propagated */
+    uint32_t mfs = octets_to_uint(info->tspec_max_frame_size, 2);
+    uint32_t mfi = octets_to_uint(info->tspec_max_frame_interval, 2);
+    if (mfi == 0)
+      mfi = 1;
+    uint32_t intervals = class_a ? 8000u : 4000u;
+    avb_wifi_admission_t *slot = NULL, *spare = NULL;
+    for (int i = 0; i < AVB_WIFI_ADMISSION_SIZE; i++) {
+      avb_wifi_admission_t *admission = &s_wifi_admission[i];
+      if (admission->valid &&
+          memcmp(admission->stream_id, stream_id, UNIQUE_ID_LEN) == 0) {
+        slot = admission;
+        break;
+      }
+      if (!admission->valid && spare == NULL)
+        spare = admission;
+    }
+    if (slot == NULL) {
+      if (spare == NULL)
+        continue;
+      slot = spare;
+      memset(slot, 0, sizeof(*slot));
+      memcpy(slot->stream_id, stream_id, UNIQUE_ID_LEN);
+      slot->valid = true;
+      slot->refused = true; /* not admitted yet */
+    }
+    slot->wanted = true;
+    slot->frames_per_s = mfi * intervals;
+    slot->bps = (mfs + 42u) * mfi * intervals * 8u; /* framing, 34.4 */
+  }
+
+  /* Admitted streams keep their place; the rest are admitted in table
+   * order while they fit. */
+  uint32_t budget = msrp_wifi_frame_budget();
+  uint64_t cap_bps =
+      (uint64_t)avb_srp_admission_link_rate_bps(wifi_port) * 3u / 4u;
+  uint32_t frames = 0;
+  uint64_t bps = 0;
+  for (int i = 0; i < AVB_WIFI_ADMISSION_SIZE; i++) {
+    const avb_wifi_admission_t *admission = &s_wifi_admission[i];
+    if (admission->valid && admission->wanted && !admission->refused) {
+      frames += admission->frames_per_s;
+      bps += admission->bps;
+    }
+  }
+  for (int i = 0; i < AVB_WIFI_ADMISSION_SIZE; i++) {
+    avb_wifi_admission_t *admission = &s_wifi_admission[i];
+    const uint8_t *sid = admission->stream_id;
+    if (!admission->valid)
+      continue;
+    const msrp_talker_entry_t *talker =
+        msrp_wifi_upstream_talker(wifi_port, (const unique_id_t *)sid);
+    if (!admission->wanted) {
+      /* No station wants it any more: release it, and lift a refusal so
+       * a later station can try again. */
+      if (admission->refusal_declared && talker != NULL)
+        msrp_wifi_admission_declare(state, wifi_port, talker, false);
+      if (!admission->refused)
+        avbinfo("Wi-Fi admission: released stream "
+                "%02x%02x%02x%02x%02x%02x%02x%02x, %u frames/s",
+                sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6],
+                sid[7], (unsigned)admission->frames_per_s);
+      admission->valid = false;
+      continue;
+    }
+    if (!admission->refused || talker == NULL)
+      continue;
+    bool fits = frames + admission->frames_per_s <= budget &&
+                bps + admission->bps <= cap_bps;
+    if (fits) {
+      admission->refused = false;
+      frames += admission->frames_per_s;
+      bps += admission->bps;
+      avbinfo("Wi-Fi admission: admitted stream "
+              "%02x%02x%02x%02x%02x%02x%02x%02x, %u frames/s (%u of %u), "
+              "%u kbit/s (%u of %u)",
+              sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
+              (unsigned)admission->frames_per_s, (unsigned)frames,
+              (unsigned)budget,
+              (unsigned)(admission->bps / 1000), (unsigned)(bps / 1000),
+              (unsigned)(cap_bps / 1000));
+      if (admission->refusal_declared)
+        msrp_wifi_admission_declare(state, wifi_port, talker, false);
+      admission->refusal_declared = false;
+      msrp_propagate_listener(state, wifi_port, (const unique_id_t *)sid);
+      decided = true;
+    } else if (!admission->refusal_declared) {
+      avbwarn("Wi-Fi admission: refused stream "
+              "%02x%02x%02x%02x%02x%02x%02x%02x, insufficient_bandwidth: "
+              "%u frames/s on %u of %u, %u kbit/s on %u of %u",
+              sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
+              (unsigned)admission->frames_per_s, (unsigned)frames,
+              (unsigned)budget,
+              (unsigned)(admission->bps / 1000), (unsigned)(bps / 1000),
+              (unsigned)(cap_bps / 1000));
+      msrp_wifi_admission_declare(state, wifi_port, talker, true);
+      admission->refusal_declared = true;
+      /* Its listener stations now count as Asking Failed upstream. */
+      msrp_propagate_listener(state, wifi_port, (const unique_id_t *)sid);
+      decided = true;
+    }
+  }
+  s_wifi_frames_committed = frames;
+  if (decided)
+    msrp_wifi_ucast_refresh(wifi_port);
 }
 #endif
 
@@ -2046,6 +2320,9 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
           /* A Talker Advertise supplies the stream's MAAP destination,
            * one half of the re-addressing join. */
           msrp_wifi_ucast_refresh(msrp_wifi_port_of(state));
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+          msrp_wifi_admission_update(state, msrp_wifi_port_of(state));
+#endif
 #endif
           break;
         }
@@ -2071,6 +2348,9 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
           /* A Listener declaration supplies the other half: which STA
            * wants the stream. */
           msrp_wifi_ucast_refresh(msrp_wifi_port_of(state));
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+          msrp_wifi_admission_update(state, msrp_wifi_port_of(state));
+#endif
 #endif
           break;
         }
@@ -2148,13 +2428,14 @@ static void mrp_build_talker_info(avb_state_s *state, talker_adv_info_s *info,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size, bool class_b) {
+                                  uint16_t max_frame_size,
+                                  uint16_t max_interval_frames, bool class_b) {
   memcpy(info->stream_id, stream_id, UNIQUE_ID_LEN);
   memcpy(info->stream_dest_addr, stream_dest_addr, ETH_ADDR_LEN);
   memcpy(info->vlan_id, vlan_id, 2);
   int tspec_mfs = max_frame_size;
   int_to_octets(&tspec_mfs, info->tspec_max_frame_size, 2);
-  int tspec_mfi = 1;
+  int tspec_mfi = max_interval_frames ? max_interval_frames : 1;
   int_to_octets(&tspec_mfi, info->tspec_max_frame_interval, 2);
   /* SR-class mapping: index 0 = Class A (priority 3), index 1 =
    * Class B (priority 2) per §35.2.2.8.2.3 defaults. Caller passes
@@ -2232,7 +2513,8 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
                                   const uint8_t *vlan_id,
-                                  uint16_t max_frame_size, bool class_b) {
+                                  uint16_t max_frame_size,
+                                  uint16_t max_interval_frames, bool class_b) {
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
   {
     const uint8_t *sid = (const uint8_t *)stream_id;
@@ -2251,7 +2533,8 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
   msrp_talker_message_u fresh;
   memset(&fresh, 0, sizeof(fresh));
   mrp_build_talker_info(state, &fresh.talker.info, stream_id,
-                        stream_dest_addr, vlan_id, max_frame_size, class_b);
+                        stream_dest_addr, vlan_id, max_frame_size,
+                        max_interval_frames, class_b);
   /* accumulated_latency is owned by mrp_patch_egress_accumulated_latency,
    * which edits the stored entry after every MAP declare. Carrying the
    * stored value into the candidate keeps a latency-only difference from
@@ -2313,6 +2596,7 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
                                const unique_id_t *stream_id,
                                const eth_addr_t *stream_dest_addr,
                                const uint8_t *vlan_id, uint16_t max_frame_size,
+                               uint16_t max_interval_frames,
                                uint8_t failure_code, bool class_b,
                                const uint8_t *src_bridge_id) {
   msrp_talker_entry_t *e =
@@ -2323,7 +2607,8 @@ void mrp_declare_talker_failed(avb_state_s *state, int port,
   mrp_applicant_state_e applicant_before = e->sm.applicant;
   memset(&e->wire, 0, sizeof(e->wire));
   mrp_build_talker_info(state, &e->wire.talker_failed.info, stream_id,
-                        stream_dest_addr, vlan_id, max_frame_size, class_b);
+                        stream_dest_addr, vlan_id, max_frame_size,
+                        max_interval_frames, class_b);
   e->wire.talker_failed.failure_code = failure_code;
   /* §35.2.2.8.5 failure_bridge_id: 8-byte EUI-64 of the bridge that
    * originally detected the failure. On propagation through a
@@ -2780,7 +3065,7 @@ void mrp_lite_sync_refusals(avb_state_s *state, const unique_id_t *stream_id,
                             const uint8_t *failure_codes, int refused_count,
                             const eth_addr_t *declared_da,
                             const uint8_t *vlan_id, uint16_t max_frame_size,
-                            bool class_b) {
+                            uint16_t max_interval_frames, bool class_b) {
   int64_t now = esp_timer_get_time();
   /* Withdraw, with one Lv, every refusal of this stream that is no
    * longer wanted: the talker can serve that listener now, or the
@@ -2814,7 +3099,8 @@ void mrp_lite_sync_refusals(avb_state_s *state, const unique_id_t *stream_id,
     msrp_talker_message_u candidate;
     memset(&candidate, 0, sizeof(candidate));
     mrp_build_talker_info(state, &candidate.talker_failed.info, stream_id,
-                          declared_da, vlan_id, max_frame_size, class_b);
+                          declared_da, vlan_id, max_frame_size,
+                          max_interval_frames, class_b);
     candidate.talker_failed.failure_code = failure_codes[k];
     mrp_own_failure_bridge_id(state, candidate.talker_failed.failure_bridge_id);
     msrp_lite_refusal_entry_t *refusal =
@@ -3272,9 +3558,35 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
   }
   if (channels <= 0 || sample_rate <= 0)
     return 0;
+  /* AAF frames carry the format's samples; AM824 one class interval's. */
   int samples_per_packet = sample_rate / (1000000 / interval_us);
+  if (subtype != avtp_subtype_61883) {
+    int format_spf = (fmt->aaf_pcm.samples_per_frame_h << 4) |
+                     fmt->aaf_pcm.samples_per_frame;
+    if (format_spf > 0)
+      samples_per_packet = format_spf;
+  }
   int payload = samples_per_packet * channels * bytes_per_sample;
   return (uint16_t)(avtp_hdr + payload);
+}
+
+/* MSRP TSpec MaxIntervalFrames for an output stream: the frames its format
+ * sends each interval of its class, two for Milan's cadence in Class B. */
+uint16_t avb_compute_tspec_max_interval_frames(avb_state_s *state,
+                                               uint16_t index) {
+  avtp_stream_format_s *fmt = &state->output_streams[index].stream_format;
+  if (fmt->aaf_pcm.subtype != avtp_subtype_aaf)
+    return 1;
+  uint32_t sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
+  uint32_t format_spf = (fmt->aaf_pcm.samples_per_frame_h << 4) |
+                        fmt->aaf_pcm.samples_per_frame;
+  if (sample_rate == 0 || format_spf == 0)
+    return 1;
+  uint32_t interval_us =
+      state->output_streams[index].stream_info_flags.class_b ? 250 : 125;
+  uint32_t class_samples = sample_rate * interval_us / 1000000;
+  uint32_t frames = (class_samples + format_spf - 1) / format_spf;
+  return frames ? (uint16_t)frames : 1;
 }
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,
@@ -3578,6 +3890,12 @@ int avb_srp_admission_init(avb_state_s *state) {
 }
 
 void avb_srp_admission_stop(avb_state_s *state) { (void)state; }
+
+uint32_t avb_srp_admission_link_rate_bps(int port_index) {
+  if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS)
+    return 0;
+  return s_admission[port_index][0].link_rate_bps;
+}
 
 void avb_srp_admission_set_link_speed(int port_index, uint32_t link_mbps) {
   if (port_index < 0 || port_index >= CONFIG_ESP_AVB_NUM_PORTS)

@@ -156,6 +156,25 @@ menu "AVB Configuration"
             Turn off to send streams over Wi-Fi exactly as received,
             which is standards-plain but ~20x slower.
 
+    config ESP_AVB_WIFI_DELIVERABLE_FRAMES
+        int "Wi-Fi port deliverable frames a second"
+        default 7000
+        range 1000 30000
+        depends on ESP_AVB_ROLE_BRIDGE && ESP_AVB_WIFI_UNICAST_STREAMS
+        help
+            Individually addressed frames a second the bridge delivers
+            in its BSS. Its frame budget is 75 % of this, the rest left
+            to best effort (profiles/avb_wireless.md section 4): a
+            stream whose first listener station would take the admitted
+            streams past the budget, or past 75 % of the link rate,
+            gets Talker Failed with insufficient_bandwidth. Class A is
+            admitted toward the Wi-Fi port only from 12000 frames a
+            second, and only with allow_class_a_over_wifi set.
+
+            This bridge forwarded about 7100 to 7450 frames a second
+            under a single 8000 frame/s stream, so the default gives a
+            budget of 5250: one 4000 frame/s Class B stream fits.
+
     config ESP_AVB_AVB_LITE_COMPLIANT
         bool "Advertise AVB Lite compliance"
         default y

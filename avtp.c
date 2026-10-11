@@ -3489,10 +3489,19 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   params->sine_freq = 1000.0f;
 #endif
 
-  // Calculate samples per packet based on stream class
-  // Class A: 125us (8000 packets/sec), Class B: 250us (4000 packets/sec)
+  // Packet interval: AM824 sends one frame each interval of its class,
+  // Class A 125 us (8000 packets/sec), Class B 250 us (4000 packets/sec).
+  // AAF follows its format: a frame each 125 us at Milan's cadence, each
+  // 250 us at Class B's own, so its TSpec and its packets agree.
   bool class_b = state->output_streams[index].stream_info_flags.class_b;
   params->interval = class_b ? 250 : 125; // microseconds
+  if (params->format_subtype == avtp_subtype_aaf) {
+    uint32_t format_spf = (fmt->aaf_pcm.samples_per_frame_h << 4) |
+                          fmt->aaf_pcm.samples_per_frame;
+    uint32_t milan_spf = (params->sample_rate + 7999) / 8000;
+    if (format_spf)
+      params->interval = format_spf > milan_spf ? 250 : 125;
+  }
   params->samples_per_packet =
       params->sample_rate / (1000000 / params->interval);
 

@@ -1472,12 +1472,13 @@ typedef struct {
 
 /* AVB Wireless status query, profiles/avb_wireless.md §5: the AVB Lite
  * MA-S with sub-protocol 0x005. The response appends the status from
- * profile offset 4 (flags) through 69 (station_count); an access point's
- * station entries would follow. */
+ * profile offset 4 (flags) through 77 (station_count, after frame_budget
+ * and frames_committed); an access point's station entries would
+ * follow. */
 #define WIRELESS_STATUS_PROTOCOL_ID {0x8C, 0x1F, 0x64, 0x36, 0xC0, 0x05}
 #define WIRELESS_CMD_GET_STATUS 0x0000
 #define WIRELESS_CMD_SET_CONFIG 0x0001
-#define WIRELESS_STATUS_BODY_LEN 66
+#define WIRELESS_STATUS_BODY_LEN 74
 #define WIRELESS_FLAG_ACCESS_POINT 0x01
 #define WIRELESS_FLAG_LOCKED 0x02
 #define WIRELESS_FLAG_HOLDOVER 0x04
@@ -1492,7 +1493,7 @@ typedef struct {
   uint8_t command_type[2];        // u (bit 15) | command_type
   uint8_t avb_interface_index[2];
   uint8_t body[WIRELESS_STATUS_BODY_LEN];
-} aecp_wireless_status_s; // 98 bytes, control_data_length 86
+} aecp_wireless_status_s; // 106 bytes, control_data_length 94
 
 /* SET_WIRELESS_CONFIG (profile §5.2): the response carries the
  * configuration the interface has after the command. */

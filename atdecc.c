@@ -2265,9 +2265,13 @@ static void avb_wireless_link_fill(uint8_t *body) {
 }
 #endif
 
+_Static_assert(sizeof(((avb_state_s *)0)->wireless_status_sent) ==
+                   WIRELESS_STATUS_BODY_LEN,
+               "the sent copy holds one status body");
+
 /* The station's status from profile offset 4. listeners_unserved, the
- * downlink and uplink counters and station_count are an access point's
- * and stay 0. */
+ * downlink and uplink counters, frame_budget, frames_committed and
+ * station_count are an access point's and stay 0. */
 static void avb_wireless_status_fill(avb_state_s *state, uint8_t *body) {
   memset(body, 0, WIRELESS_STATUS_BODY_LEN);
   ptpd_wifi_sta_status_t sta;
@@ -2393,13 +2397,14 @@ static int avb_process_aecp_cmd_wireless_status(avb_state_s *state,
 /* Body ranges whose change the profile reports unsolicited: flags through
  * phy_generation, as_capable_reason through ftm_min_delta (the granted
  * burst and listeners_unserved), bssid and ap_port_identity, and
- * station_count. RSSI, the measurements and the counters are polled. */
+ * frame_budget through station_count. RSSI, the measurements and the
+ * counters are polled. */
 static bool avb_wireless_status_changed(const uint8_t *body,
                                         const uint8_t *sent) {
   return memcmp(&body[0], &sent[0], 7) != 0 ||
          memcmp(&body[11], &sent[11], 5) != 0 ||
          memcmp(&body[32], &sent[32], 16) != 0 ||
-         memcmp(&body[64], &sent[64], 2) != 0;
+         memcmp(&body[64], &sent[64], 10) != 0;
 }
 
 /* Runs from the main loop; checks for a change once a second. */
