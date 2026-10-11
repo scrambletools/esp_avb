@@ -248,6 +248,113 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
     return;
   }
 }
+
+/* AVB Wireless §3.5: a group addressed frame toward a station is neither
+ * acknowledged nor retried, so ACMP toward the Wi-Fi port also goes,
+ * individually addressed, to the station that runs the entity it is for.
+ * Which station runs an entity comes from the source address of its ADP
+ * advertisements on the Wi-Fi port. */
+#define AVB_WIFI_ENTITY_TABLE_SIZE 16
+
+typedef struct {
+  unique_id_t entity_id;
+  eth_addr_t station;
+  int64_t expires_us; /* 0 for a free slot */
+} avb_wifi_entity_t;
+
+static avb_wifi_entity_t s_wifi_entities[AVB_WIFI_ENTITY_TABLE_SIZE];
+static portMUX_TYPE s_wifi_entities_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_fwd_wifi_acmp_copies;
+
+uint32_t avb_bridge_forward_stats_acmp_copies(void) {
+  return s_fwd_wifi_acmp_copies;
+}
+
+static void avb_wifi_entity_learn(const uint8_t *frame, uint32_t len) {
+  if (len < ETH_HEADER_LEN + 12)
+    return;
+  const atdecc_header_s *header =
+      (const atdecc_header_s *)(frame + ETH_HEADER_LEN);
+  const uint8_t *entity_id = frame + ETH_HEADER_LEN + 4;
+  bool departing = header->msg_type == adp_msg_type_entity_departing;
+  if (header->msg_type != adp_msg_type_entity_available && !departing)
+    return;
+  static const unique_id_t zero_id = {0};
+  if (memcmp(entity_id, zero_id, UNIQUE_ID_LEN) == 0)
+    return;
+  int64_t now_us = esp_timer_get_time();
+  /* valid_time counts 2 s units. */
+  int64_t expires_us = now_us + (int64_t)header->status_valtime * 2000000;
+  portENTER_CRITICAL(&s_wifi_entities_lock);
+  avb_wifi_entity_t *slot = NULL;
+  avb_wifi_entity_t *oldest = &s_wifi_entities[0];
+  for (int i = 0; i < AVB_WIFI_ENTITY_TABLE_SIZE; i++) {
+    avb_wifi_entity_t *entity = &s_wifi_entities[i];
+    if (entity->expires_us != 0 &&
+        memcmp(entity->entity_id, entity_id, UNIQUE_ID_LEN) == 0) {
+      slot = entity;
+      break;
+    }
+    if (entity->expires_us < oldest->expires_us)
+      oldest = entity;
+  }
+  if (departing) {
+    if (slot != NULL)
+      slot->expires_us = 0;
+  } else {
+    if (slot == NULL)
+      slot = oldest;
+    memcpy(slot->entity_id, entity_id, UNIQUE_ID_LEN);
+    memcpy(slot->station, frame + ETH_ADDR_LEN, ETH_ADDR_LEN);
+    slot->expires_us = expires_us;
+  }
+  portEXIT_CRITICAL(&s_wifi_entities_lock);
+}
+
+static bool avb_wifi_entity_station(const uint8_t *entity_id,
+                                    uint8_t *station) {
+  int64_t now_us = esp_timer_get_time();
+  bool found = false;
+  portENTER_CRITICAL(&s_wifi_entities_lock);
+  for (int i = 0; i < AVB_WIFI_ENTITY_TABLE_SIZE; i++) {
+    const avb_wifi_entity_t *entity = &s_wifi_entities[i];
+    if (entity->expires_us > now_us &&
+        memcmp(entity->entity_id, entity_id, UNIQUE_ID_LEN) == 0) {
+      memcpy(station, entity->station, ETH_ADDR_LEN);
+      found = true;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&s_wifi_entities_lock);
+  return found;
+}
+
+/* After the group addressed frame went out: learn from ADP that came in
+ * on the Wi-Fi port, and copy ACMP that went out on it to its station.
+ * The frame is the caller's to free, and its destination is rewritten. */
+static void avb_bridge_wifi_control(int ingress_port, int egress_port,
+                                    uint8_t *frame, uint32_t len) {
+  if (len <= ETH_HEADER_LEN)
+    return;
+  uint8_t subtype = frame[ETH_HEADER_LEN];
+  if (subtype == avtp_subtype_adp && ingress_port == s_wifi_port_idx) {
+    avb_wifi_entity_learn(frame, len);
+    return;
+  }
+  if (subtype != avtp_subtype_acmp || egress_port != s_wifi_port_idx ||
+      len < ETH_HEADER_LEN + sizeof(acmp_message_s) || !(frame[0] & 0x01))
+    return;
+  const uint8_t *entity_id = acmp_target_entity_id(
+      (const acmp_message_s *)(frame + ETH_HEADER_LEN));
+  uint8_t station[ETH_ADDR_LEN];
+  if (entity_id == NULL || !avb_wifi_entity_station(entity_id, station))
+    return;
+  memcpy(frame, station, ETH_ADDR_LEN);
+  if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, frame, len) == ESP_OK)
+    s_fwd_wifi_acmp_copies++;
+  else
+    s_fwd_wifi_fail++;
+}
 #endif /* CONFIG_ESP_AVB_ROLE_BRIDGE */
 
 /* Drop counter no longer used (inline handler has no queue to overflow),
@@ -525,6 +632,8 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
       return ESP_OK;
     case AVB_BRIDGE_BRIDGE:
       avb_bridge_forward(d.egress_port, ethertype, buf, len);
+      if (ethertype == 0x22f0)
+        avb_bridge_wifi_control(ingress_port, d.egress_port, buf, len);
       free(buf);
       return ESP_OK;
     case AVB_BRIDGE_TERMINATE:

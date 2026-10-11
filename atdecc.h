@@ -1676,6 +1676,34 @@ typedef struct {
   uint8_t conn_listeners_entries[2]; // connection listeners entries
 } acmp_message_s;                    // 56 bytes
 
+/* The entity an ACMP message is for: the talker for a command to a
+ * talker, the listener for a command to a listener and for a talker's
+ * response, and the controller for any other response. */
+static inline const uint8_t *
+acmp_target_entity_id(const acmp_message_s *acmp) {
+  switch (acmp->header.msg_type) {
+  case acmp_msg_type_connect_tx_command:
+  case acmp_msg_type_disconnect_tx_command:
+  case acmp_msg_type_get_tx_state_command:
+  case acmp_msg_type_get_tx_connection_command:
+    return acmp->talker_entity_id;
+  case acmp_msg_type_connect_rx_command:
+  case acmp_msg_type_disconnect_rx_command:
+  case acmp_msg_type_get_rx_state_command:
+  case acmp_msg_type_connect_tx_response:
+  case acmp_msg_type_disconnect_tx_response:
+    return acmp->listener_entity_id;
+  case acmp_msg_type_get_tx_state_response:
+  case acmp_msg_type_connect_rx_response:
+  case acmp_msg_type_disconnect_rx_response:
+  case acmp_msg_type_get_rx_state_response:
+  case acmp_msg_type_get_tx_connection_response:
+    return acmp->controller_entity_id;
+  default:
+    return NULL;
+  }
+}
+
 /* ACMP Message Extended */
 typedef struct {
   acmp_message_s base;

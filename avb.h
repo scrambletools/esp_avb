@@ -1103,6 +1103,9 @@ uint32_t avb_bridge_forward_stats_bp_drop(void);
  * advertised MAAP destination on wired egress (AVB Wireless 3.3). */
 uint32_t avb_bridge_forward_stats_restored(void);
 #endif
+/* ACMP frames also sent individually addressed to the station of the
+ * entity they are for (AVB Wireless 3.5). */
+uint32_t avb_bridge_forward_stats_acmp_copies(void);
 
 /* AVB send functions */
 

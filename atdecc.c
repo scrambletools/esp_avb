@@ -3476,7 +3476,50 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
   }
 }
 
+#ifdef CONFIG_ESP_AVB_ROLE_ENDPOINT_WIRELESS
+/* AVB Wireless §3.5: the access point sends a station each ACMP frame
+ * group addressed and again individually addressed, and the station
+ * answers once. The copies arrive milliseconds apart; a controller's
+ * retry, the same message again, only after the command's timeout, at
+ * least 200 ms, so a retry is still answered. */
+#define ACMP_COPY_WINDOW_US 100000
+#define ACMP_RECENT_COUNT 8
+
+static bool avb_acmp_received_twice(const acmp_message_s *msg) {
+  static acmp_message_s s_recent[ACMP_RECENT_COUNT];
+  static int64_t s_recent_us[ACMP_RECENT_COUNT];
+  static int s_next_recent;
+  int64_t now_us = esp_timer_get_time();
+  for (int i = 0; i < ACMP_RECENT_COUNT; i++) {
+    if (s_recent_us[i] != 0 &&
+        now_us - s_recent_us[i] < ACMP_COPY_WINDOW_US &&
+        memcmp(&s_recent[i], msg, sizeof(*msg)) == 0)
+      return true;
+  }
+  s_recent[s_next_recent] = *msg;
+  s_recent_us[s_next_recent] = now_us;
+  s_next_recent = (s_next_recent + 1) % ACMP_RECENT_COUNT;
+  return false;
+}
+#endif
+
 int avb_process_acmp(avb_state_s *state, acmp_message_s *msg) {
+#ifdef CONFIG_ESP_AVB_ROLE_ENDPOINT_WIRELESS
+  const uint8_t *target = acmp_target_entity_id(msg);
+  if (target != NULL &&
+      memcmp(target, state->own_entity.summary.entity_id, UNIQUE_ID_LEN) ==
+          0 &&
+      avb_acmp_received_twice(msg)) {
+    static bool s_copy_seen;
+    if (!s_copy_seen) {
+      avbinfo("ACMP arrives twice from the access point, answering once");
+      s_copy_seen = true;
+    }
+    avbdebug("%s received twice",
+             get_acmp_message_type_name(msg->header.msg_type));
+    return OK;
+  }
+#endif
 
   switch (msg->header.msg_type) {
   case acmp_msg_type_connect_rx_command:
