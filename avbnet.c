@@ -1464,27 +1464,10 @@ esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle,
   if (eth_handle != NULL) {
     return esp_eth_transmit(eth_handle, (void *)frame, frame_len);
   }
-  /* Wi-Fi path: esp_wifi_internal_tx synchronously enqueues the buffer
-   * to the Wi-Fi MAC's TX descriptor ring. Some IDF builds reference
-   * the caller's buffer until tx_done — passing a stack buffer (as
-   * avb_net_send_to does for control frames) is a use-after-stack-pop
-   * footgun. Copy into the heap so the buffer outlives the caller's
-   * stack frame; the wifi driver will free or we let it leak per its
-   * ownership model. To stay safe, malloc + esp_wifi_internal_tx +
-   * free on error path; if tx succeeds, the wifi driver currently
-   * copies internally so freeing here is OK. */
-  /* Wi-Fi path: esp_wifi_internal_tx synchronously enqueues to the
-   * wifi MAC's TX descriptors. Some IDF builds reference the caller's
-   * buffer until tx_done — copy into heap so the buffer outlives the
-   * caller's stack frame. */
-  void *buf = malloc(frame_len);
-  if (!buf) {
-    return ESP_ERR_NO_MEM;
-  }
-  memcpy(buf, frame, frame_len);
-  esp_err_t r = esp_wifi_internal_tx(0 /* WIFI_IF_STA */, buf, frame_len);
-  free(buf);
-  return r;
+  /* Wi-Fi path: esp_wifi_internal_tx copies the frame into one of the
+   * driver's dynamic TX buffers before returning, so the caller's buffer
+   * is free again at once; no copy of its own is needed. */
+  return esp_wifi_internal_tx(0 /* WIFI_IF_STA */, (void *)frame, frame_len);
 }
 
 /* Register stream RX handler. Invoked inline from the EMAC RX callback

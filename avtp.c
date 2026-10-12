@@ -825,6 +825,7 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t overrun_count = 0;
   int64_t overrun_max = 0;
   uint32_t send_fail_count = 0;
+  esp_err_t last_send_error = ESP_OK;
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
   uint32_t ring_underruns = 0;    /* packets sent zero-filled, ring empty */
@@ -1576,18 +1577,22 @@ static void avb_stream_out_task(void *task_param) {
     }
     for (int copy = 0; copy < nda; copy++) {
       memcpy(tx_frame, &das[copy], ETH_ADDR_LEN);
-      if (avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len) !=
-          ESP_OK) {
-        /* One immediate retry. Per-listener duplication raises TX-ring
-         * pressure enough that the once-per-second control-plane burst
-         * (CVU declarations, beacons) collides with a stream slot —
+      esp_err_t sent =
+          avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len);
+      if (sent != ESP_OK && params->eth_handle != NULL) {
+        /* One immediate retry on Ethernet. Per-listener duplication raises
+         * TX-ring pressure enough that the once-per-second control-plane
+         * burst (CVU declarations, beacons) collides with a stream slot —
          * measured exactly ~1 failed copy/s at fan-out 3, gone with a
          * retry. The failed frame has already drained by re-entry
-         * (~3.5 µs per 426 B at 1 Gbps). */
-        if (avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len) !=
-            ESP_OK) {
-          send_fail_count++;
-        }
+         * (~3.5 µs per 426 B at 1 Gbps). On Wi-Fi a full TX queue drains
+         * at air rate, so a retry only adds pressure. */
+        sent = avb_net_transmit_raw(params->eth_handle, tx_frame,
+                                    this_frame_len);
+      }
+      if (sent != ESP_OK) {
+        send_fail_count++;
+        last_send_error = sent;
       }
     }
 
@@ -1616,10 +1621,12 @@ static void avb_stream_out_task(void *task_param) {
     free(tx_to_free);
   }
   esp_log_level_set("*", ESP_LOG_INFO);
-  avbinfo("Stream out stopped: %lu pkts, %lu fails, %lu overruns (max %lldus), "
-          "i2s: %lu zero_reads, %lu nonzero_audio, %lu ring underruns",
-          loop_count, send_fail_count, overrun_count, overrun_max,
-          i2s_zero_reads, i2s_nonzero_audio, ring_underruns);
+  avbinfo("Stream out stopped: %lu pkts, %lu fails (last %s), %lu overruns "
+          "(max %lldus), i2s: %lu zero_reads, %lu nonzero_audio, %lu ring "
+          "underruns",
+          loop_count, send_fail_count, esp_err_to_name(last_send_error),
+          overrun_count, overrun_max, i2s_zero_reads, i2s_nonzero_audio,
+          ring_underruns);
   avbinfo("PLL: %lu measures, %lu skipped, offset [%ldns, %ldns]",
           pll_measure_count, pll_skip_count, (long)pll_offset_min,
           (long)pll_offset_max);
