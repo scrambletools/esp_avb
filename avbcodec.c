@@ -11,6 +11,7 @@
 
 #include "avb.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "es8311_codec.h"
 #include "es8388_codec.h"
@@ -460,6 +461,22 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    * avtp.c and the clock-row programming below). */
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_tx_handle, &std_cfg));
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_rx_handle, &std_cfg));
+#if SOC_WIFI_SUPPORTED
+  /* The I2S clock and data edges radiate into this chip's own Wi-Fi
+   * radio: on a C6 with an onboard ES8311, MCLK and BCLK harmonics land
+   * in the 2.4 GHz channel and held a station talker's uplink to about
+   * 1900 of its 4000 frames/s. The weakest pad drive slows the edges
+   * that carry those harmonics. */
+  const int i2s_output_pins[] = {
+      state->config.codec_pins.mclk, state->config.codec_pins.bclk,
+      state->config.codec_pins.ws, state->config.codec_pins.dout};
+  for (size_t i = 0; i < sizeof(i2s_output_pins) / sizeof(i2s_output_pins[0]);
+       i++) {
+    if (i2s_output_pins[i] >= 0) {
+      gpio_set_drive_capability(i2s_output_pins[i], GPIO_DRIVE_CAP_0);
+    }
+  }
+#endif
 
   /* Media-clock sensor: count bytes the DAC actually consumed via the
    * TX DMA on_sent callback. This ticks at the true local playout rate
