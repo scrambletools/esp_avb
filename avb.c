@@ -1460,7 +1460,9 @@ static int avb_periodic_send(avb_state_s *state) {
   /* Track listener churn into the per-stream unicast DA mailboxes
    * (AVB Lite unicast transport; no-op outside Lite mode). */
   avb_lite_update_stream_tx_addrs(state);
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   avb_persist_journal_tick(state);
+#endif
   avb_emac_rx_unwedge_tick();
 
   // PTP snapshot for the stream out PLL is no longer needed here — the
@@ -1852,7 +1854,10 @@ static void avb_task(void *task_param) {
   /* Operator default until a controller sets it (profile §2.4). */
   state->lite_config_flags = LITE_CONFIG_FLAG_ESCALATION_ALLOWED;
 #endif
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+  /* A bridge has no stream formats, bindings or levels to keep. */
   avb_persist_load(state);
+#endif
 
   /* Codec clock-plan check: arithmetic plus one log line per candidate,
    * so its only cost is console time. A persisted binding means
@@ -1907,6 +1912,7 @@ static void avb_task(void *task_param) {
    * take the lock path. Task priority sits well below AVB main (21)
    * and AVB-OUT (configMAX_PRIORITIES-1) so flash I/O never preempts
    * time-critical work; pin to core 0 so CPU1 stays free for AVB-OUT. */
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   state->persist_mutex = xSemaphoreCreateMutex();
   if (state->persist_mutex == NULL) {
     avberr("Failed to create persist mutex; NVS saves disabled");
@@ -1914,6 +1920,7 @@ static void avb_task(void *task_param) {
     xTaskCreatePinnedToCore(avb_persist_task, "AVB-NVS", 4096, state, 3, NULL,
                             0);
   }
+#endif
 
   // Main AVB loop — receive control frames from EMAC RX dispatcher queue,
   // process them, and handle periodic tasks. VLAN stream data is handled
