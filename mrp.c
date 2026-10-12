@@ -2890,6 +2890,15 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
   bool leaveall = p->mrp_leaveall_tx_pending;
   /* AVB Lite sends talker and listener declarations from mrp_lite_flush. */
   bool lite = state->avb_lite;
+  /* Each declaration goes out in its own MRPDU, and a receiver applies
+   * a LeaveAll to every attribute of its type, so only the first MRPDU
+   * of each type may carry it. Repeating it on every MRPDU put the
+   * type's earlier declarations back into leaving with each one, and a
+   * peer whose LeaveTimer expired before the next periodic declaration
+   * deregistered all but the last (observed: a switch withdrawing every
+   * talker it learned through the bridge, and with them the listeners,
+   * every few LeaveAll cycles). Bit n is attribute type n. */
+  uint8_t leaveall_types = leaveall ? 0xFF : 0;
 
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE && !lite; i++) {
     msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
@@ -2897,7 +2906,9 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
       continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
-      mrp_tx_flush_talker(state, port, e, leaveall);
+      uint8_t type_bit = (uint8_t)(1u << e->attr_type);
+      mrp_tx_flush_talker(state, port, e, (leaveall_types & type_bit) != 0);
+      leaveall_types &= (uint8_t)~type_bit;
       e->sm.pending_tx = mrp_tx_none;
     }
   }
@@ -2907,7 +2918,9 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
       continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
-      mrp_tx_flush_listener(state, port, e, leaveall);
+      uint8_t type_bit = (uint8_t)(1u << msrp_attr_type_listener);
+      mrp_tx_flush_listener(state, port, e, (leaveall_types & type_bit) != 0);
+      leaveall_types &= (uint8_t)~type_bit;
       e->sm.pending_tx = mrp_tx_none;
     }
   }
@@ -2917,7 +2930,9 @@ void mrp_tx_flush_port(avb_state_s *state, int port) {
       continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
-      mrp_tx_flush_domain(state, port, e, leaveall);
+      uint8_t type_bit = (uint8_t)(1u << msrp_attr_type_domain);
+      mrp_tx_flush_domain(state, port, e, (leaveall_types & type_bit) != 0);
+      leaveall_types &= (uint8_t)~type_bit;
       e->sm.pending_tx = mrp_tx_none;
     }
   }
@@ -3567,7 +3582,10 @@ static void mrp_tx_flush_mvrp(avb_state_s *state, int port, bool leaveall,
       continue;
     mrp_applicant_step(&e->sm, tx_ev);
     if (e->sm.pending_tx != mrp_tx_none) {
+      /* One VLAN per MRPDU: only the first may carry the LeaveAll, as
+       * in mrp_tx_flush_port. */
       mvrp_tx_emit(state, port, e, leaveall);
+      leaveall = false;
       e->sm.pending_tx = mrp_tx_none;
     }
   }
