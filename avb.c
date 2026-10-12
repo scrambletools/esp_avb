@@ -359,6 +359,7 @@ static void avb_declare_output_stream(avb_state_s *state, uint16_t index) {
       stream->vlan_id, avb_compute_tspec_max_frame_size(state, index),
       avb_compute_tspec_max_interval_frames(state, index),
       stream->stream_info_flags.class_b);
+  mrp_set_talker_latency(state, 0, &stream->stream_id);
 }
 
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)

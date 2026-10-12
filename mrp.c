@@ -1031,6 +1031,20 @@ static void mrp_patch_egress_accumulated_latency(int port,
   int_to_octets(&total_ns, field, 4);
 }
 
+/* A talker's own Talker Advertise starts accumulated_latency at its
+ * egress port's contribution (IEEE 802.1Q-2022 35.2.2.8.6); across a
+ * Wi-Fi hop that is the hop's estimate, which the access point does not
+ * add to an uplink stream. */
+void mrp_set_talker_latency(avb_state_s *state, int port,
+                            const unique_id_t *stream_id) {
+  uint32_t latency_ns =
+      state->port[port].medium == avb_port_medium_wifi_ftm
+          ? avb_port_forwarding_latency_ns(&state->port[port])
+          : 15000u;
+  mrp_patch_egress_accumulated_latency(
+      port, stream_id, msrp_attr_type_talker_advertise, latency_ns);
+}
+
 static bool any_listener_ready(avb_talker_stream_s *stream) {
   uint16_t count = octets_to_uint(stream->connection_count, 2);
   for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {

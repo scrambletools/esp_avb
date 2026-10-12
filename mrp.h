@@ -449,6 +449,10 @@ bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,
  * ATDECC section — same MSRP payload, different envelope. */
 
 uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index);
+/* Set a talker's own Talker Advertise latency to its egress port's
+ * contribution, after declaring it. */
+void mrp_set_talker_latency(avb_state_s *state, int port,
+                            const unique_id_t *stream_id);
 uint16_t avb_compute_tspec_max_interval_frames(avb_state_s *state,
                                                uint16_t index);
 
