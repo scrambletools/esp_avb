@@ -3947,6 +3947,12 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
      * the class — they're "interested but not committed". */
     uint16_t cmd_flags = octets_to_uint(msg->flags, 2);
     bool req_class_b = (cmd_flags & 0x0001) != 0;
+    /* Behind a Wi-Fi hop a stream is Class B (AVB Wireless §4) whatever
+     * the connect asks; the response's CLASS_B flag tells the listener. */
+    if (state->port[0].medium == avb_port_medium_wifi_ftm && !req_class_b) {
+      avbinfo("ACMP: stream %d stays Class B behind Wi-Fi", talker_uid);
+      req_class_b = true;
+    }
     uint16_t conn_count = octets_to_uint(stream->connection_count, 2);
     int acmp_locked = 0;
     for (int i = 0; i < conn_count && i < AVB_MAX_NUM_CONNECTED_LISTENERS;
