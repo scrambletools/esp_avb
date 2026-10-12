@@ -80,6 +80,8 @@ typedef struct {
   volatile int32_t remaining_ns_min; /* narrowest gPTP-vs-target gap this window */
   volatile int32_t remaining_ns_max; /* widest gPTP-vs-target gap this window */
   volatile uint32_t gptp_resync_count; /* sanity-branch re-seeds (gPTP jumps) */
+  volatile uint32_t ts_reanchors;      /* timestamp re-anchored to gPTP (tu) */
+  volatile int32_t ts_err_ns;          /* stamp error vs gPTP schedule */
 } stream_tx_ctx_t;
 
 static stream_tx_ctx_t *s_stream_tx_ctx = NULL;
@@ -829,6 +831,8 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
   uint32_t ring_underruns = 0;    /* packets sent zero-filled, ring empty */
+  uint32_t ts_reanchors = 0;
+  int32_t ts_err_last = 0;
   /* ADC-following cadence, see the fill controller in the 1 s branch. */
   int64_t fill_adj_q16 = 0;      /* extra ns per packet, Q16 */
   int32_t fill_frac_q16 = 0;     /* sub-ns carry of fill_adj_q16 */
@@ -955,6 +959,7 @@ static void avb_stream_out_task(void *task_param) {
    * gPTP-second) rather than to ESP's crystal, preventing cumulative
    * sample-count drift that causes listeners to drop/dup samples. */
   bool gptp_cadence_ready = false;
+  bool gptp_seeded = false;
   for (int init_try = 0; init_try < 5; init_try++) {
     struct timespec ptp_a, ptp_b;
     if (ptpd_now(&ptp_a) == 0 &&
@@ -966,6 +971,7 @@ static void avb_stream_out_task(void *task_param) {
       int64_t diff = (int64_t)(ts_b - ts_a);
       if (diff >= 0 && diff < 500000) {
         avtp_media_ts = (uint32_t)ts_a;
+        gptp_seeded = true;
         /* Arm the filtered gPTP rate lock below only when a lock
          * interval is configured. At interval 0 the timestamp is still
          * gPTP-seeded but cadence free-runs on esp_timer (no gPTP
@@ -1005,6 +1011,7 @@ static void avb_stream_out_task(void *task_param) {
     int64_t work_start_us = esp_timer_get_time();
 
     int64_t now = esp_timer_get_time();
+    int64_t packet_sched_us = next_send_time;
     int64_t overrun = now - next_send_time;
     if (overrun > params->interval / 2) {
       overrun_count++;
@@ -1123,7 +1130,11 @@ static void avb_stream_out_task(void *task_param) {
     int64_t total_ns = base_ns + adj_ns + fill_ns + sched_ns_carry;
     int32_t us_to_wait = (int32_t)(total_ns / 1000);
     sched_ns_carry = (int32_t)(total_ns - (int64_t)us_to_wait * 1000);
-    if (!gptp_cadence_ready && overrun > params->interval * 10) {
+    /* A talker with gPTP-seeded stamps catches up after a stall like
+     * the rate-locked one: skipping slots without advancing the stamps
+     * put them behind gPTP and dropped the audio meant for those
+     * slots. */
+    if (!gptp_seeded && overrun > params->interval * 10) {
       next_send_time = now + params->interval;
     } else {
       next_send_time += us_to_wait;
@@ -1213,9 +1224,18 @@ static void avb_stream_out_task(void *task_param) {
            * (≈4 ppm) offset-pull drains residual phase error; > 5 ms
            * error (BTC change, servo step, long stall) hard re-anchors
            * with tu so listeners resync. */
-          int32_t ts_err = (int32_t)(avtp_media_ts - (uint32_t)now_gptp_ns);
+          /* Measure against the gPTP time this packet was scheduled
+           * for. After a stall the loop runs behind its schedule while
+           * it catches up; anchoring to the time it got here stamped
+           * the catch-up burst ahead of its samples, then pulled back
+           * at the next check (a sawtooth of re-anchors). */
+          int64_t sched_gptp_ns =
+              now_gptp_ns - (now_esp_us - packet_sched_us) * 1000LL;
+          int32_t ts_err = (int32_t)(avtp_media_ts - (uint32_t)sched_gptp_ns);
+          ts_err_last = ts_err;
           if (ts_err > 5000000 || ts_err < -5000000) {
-            avtp_media_ts = (uint32_t)now_gptp_ns;
+            avtp_media_ts = (uint32_t)sched_gptp_ns;
+            ts_reanchors++;
             ts_rate_corr_q16 = 0;
             ts_rate_frac_q16 = 0;
             tu_active = true;
@@ -1250,17 +1270,32 @@ static void avb_stream_out_task(void *task_param) {
             else if (off_q16 < -32768)
               off_q16 = -32768;
             int64_t want = target_q16 + off_q16;
-            /* Clamp total correction to ±128 ppm (±16 ns/pkt). */
-            if (want > (16LL << 16))
-              want = 16LL << 16;
-            else if (want < -(16LL << 16))
-              want = -(16LL << 16);
-            /* Step toward the target ≤0.25 ns/pkt (≈2 ppm) per window. */
+            /* Clamp the total correction to the widest cadence trim
+             * (rate lock plus ADC fill, 300 ppm) at any packet
+             * interval: a fixed 16 ns/pkt was 128 ppm at 125 us but
+             * only 64 ppm at 250 us, so the stamps fell behind a
+             * faster cadence. */
+            int64_t want_max_q16 =
+                ((int64_t)params->interval * 300LL << 16) / 1000LL;
+            if (want > want_max_q16)
+              want = want_max_q16;
+            else if (want < -want_max_q16)
+              want = -want_max_q16;
+            /* Step toward the target by at most 2 ppm per second. The
+             * window is 8192 packets, so that is 0.25 ns/pkt at 125 us
+             * but 1 ns/pkt at 250 us; a fixed 0.25 ns/pkt there was
+             * 0.5 ppm/s and fell behind the fill trim (observed: stamps
+             * 3 ms ahead after 2 min on a talker whose ADC ran 85 ppm
+             * fast). */
+            int64_t step_max_q16 = ((int64_t)params->interval *
+                                        params->interval * 16384LL
+                                    << 16) /
+                                   1000000000LL;
             int64_t step = want - ts_rate_corr_q16;
-            if (step > 16384)
-              step = 16384;
-            else if (step < -16384)
-              step = -16384;
+            if (step > step_max_q16)
+              step = step_max_q16;
+            else if (step < -step_max_q16)
+              step = -step_max_q16;
             ts_rate_corr_q16 += (int32_t)step;
           }
         }
@@ -1329,6 +1364,8 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->remaining_ns_min = remaining_ns_min;
         tx_ctx->remaining_ns_max = remaining_ns_max;
         tx_ctx->gptp_resync_count = gptp_resync_count;
+        tx_ctx->ts_reanchors = ts_reanchors;
+        tx_ctx->ts_err_ns = ts_err_last;
       }
       /* Reset PLL offset range and cadence-drift range so the published
        * values stay per-window instead of latching worst-ever. */
@@ -1623,10 +1660,10 @@ static void avb_stream_out_task(void *task_param) {
   esp_log_level_set("*", ESP_LOG_INFO);
   avbinfo("Stream out stopped: %lu pkts, %lu fails (last %s), %lu overruns "
           "(max %lldus), i2s: %lu zero_reads, %lu nonzero_audio, %lu ring "
-          "underruns",
+          "underruns, %lu re-anchors",
           loop_count, send_fail_count, esp_err_to_name(last_send_error),
           overrun_count, overrun_max, i2s_zero_reads, i2s_nonzero_audio,
-          ring_underruns);
+          ring_underruns, (unsigned long)ts_reanchors);
   avbinfo("PLL: %lu measures, %lu skipped, offset [%ldns, %ldns]",
           pll_measure_count, pll_skip_count, (long)pll_offset_min,
           (long)pll_offset_max);
@@ -2685,10 +2722,12 @@ void avb_stream_out_print_diag(void) {
   static uint32_t last_z = 0, last_nz = 0, last_skip = 0, last_under = 0;
   static uint32_t last_slip = 0, last_slip_pkts = 0;
   static uint32_t last_resync = 0;
+  static uint32_t last_anchors = 0;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = last_under = 0;
     last_slip = last_slip_pkts = 0;
+    last_anchors = 0;
   }
 
   uint32_t pkts = ctx->pkt_count;
@@ -2701,6 +2740,7 @@ void avb_stream_out_print_diag(void) {
   uint32_t slip_pkts = ctx->slip_muted_pkts;
   uint32_t skip = ctx->pll_skip_count;
   uint32_t resync = ctx->gptp_resync_count;
+  uint32_t anchors = ctx->ts_reanchors;
   int64_t over_max = ctx->overrun_max_us;
   int32_t pll_min = ctx->pll_offset_min_ns;
   int32_t pll_max = ctx->pll_offset_max_ns;
@@ -2721,7 +2761,7 @@ void avb_stream_out_print_diag(void) {
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
-          "resync=%lu slips=%lu/%lu",
+          "resync=%lu slips=%lu/%lu anchors=%lu ts_err=%ldus",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -2738,7 +2778,9 @@ void avb_stream_out_print_diag(void) {
           rem_has_sample ? "" : "no-sample",
           (unsigned long)(resync - last_resync),
           (unsigned long)(slips - last_slip),
-          (unsigned long)(slip_pkts - last_slip_pkts));
+          (unsigned long)(slip_pkts - last_slip_pkts),
+          (unsigned long)(anchors - last_anchors),
+          (long)(ctx->ts_err_ns / 1000));
 
   /* Secondary detail lines only emitted when samples were actually
    * collected, to keep noise-free output when the stream is idle. */
@@ -2761,6 +2803,7 @@ void avb_stream_out_print_diag(void) {
   last_slip_pkts = slip_pkts;
   last_skip = skip;
   last_resync = resync;
+  last_anchors = anchors;
 }
 
 /* Deferred drift sampler. Called from AVB main's periodic loop at
