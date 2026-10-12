@@ -858,6 +858,30 @@ static bool msrp_wifi_class_a_allowed(const avb_state_s *state) {
   return false;
 #endif
 }
+/* Streams whose Class A refusal toward Wi-Fi is logged: a talker that
+ * registers again, as some do every LeaveAll cycle, is not logged again
+ * until its stream is decided otherwise. */
+#define MSRP_CLASS_A_LOGGED_SIZE 8
+static unique_id_t s_class_a_logged[MSRP_CLASS_A_LOGGED_SIZE];
+static int s_class_a_logged_next;
+
+static bool msrp_class_a_refusal_logged(const unique_id_t *stream_id) {
+  for (int i = 0; i < MSRP_CLASS_A_LOGGED_SIZE; i++) {
+    if (memcmp(s_class_a_logged[i], stream_id, UNIQUE_ID_LEN) == 0)
+      return true;
+  }
+  memcpy(s_class_a_logged[s_class_a_logged_next], stream_id, UNIQUE_ID_LEN);
+  s_class_a_logged_next =
+      (s_class_a_logged_next + 1) % MSRP_CLASS_A_LOGGED_SIZE;
+  return false;
+}
+
+static void msrp_class_a_refusal_forget(const unique_id_t *stream_id) {
+  for (int i = 0; i < MSRP_CLASS_A_LOGGED_SIZE; i++) {
+    if (memcmp(s_class_a_logged[i], stream_id, UNIQUE_ID_LEN) == 0)
+      memset(s_class_a_logged[i], 0, UNIQUE_ID_LEN);
+  }
+}
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
 static bool msrp_wifi_admission_refused(const unique_id_t *stream_id);
 /* The Wi-Fi port admission runs on, -1 before its first update. */
@@ -1219,7 +1243,13 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
     if (state->port[y].medium == avb_port_medium_wifi_ftm &&
         new_cls == AVB_SR_CLASS_A && !msrp_wifi_class_a_allowed(state)) {
       msrp_release_admission(ingress, y);
-      avbwarn("MAP: Class A blocked on Wi-Fi egress port %d (opt-in off)", y);
+      if (!msrp_class_a_refusal_logged(stream_id)) {
+        const uint8_t *sid = (const uint8_t *)stream_id;
+        avbwarn("MAP: Class A stream %02x%02x%02x%02x%02x%02x%02x%02x "
+                "refused toward Wi-Fi port %d, Class A not allowed there",
+                sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6],
+                sid[7], y);
+      }
       mrp_declare_talker_failed(state, y, stream_id, dest, vlan, mfs, mfi,
                                 insufficient_bandwidth_for_traffic_class,
                                 propagate_class_b, NULL);
@@ -1227,6 +1257,9 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
           y, stream_id, msrp_attr_type_talker_failed, egress_lat_ns);
       continue;
     }
+
+    if (state->port[y].medium == avb_port_medium_wifi_ftm)
+      msrp_class_a_refusal_forget(stream_id);
 
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
     /* The Wi-Fi port admits when a listener station declares
