@@ -367,6 +367,36 @@ static IRAM_ATTR bool i2s_rx_on_recv_cb(i2s_chan_handle_t handle,
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_captured,
                             (uint64_t)event->size, memory_order_relaxed);
+  /* Copy into the talker's capture ring while one is attached, so the
+   * audio survives a stall of the stream task. */
+  uint8_t *ring = state->media_clock.capture_ring;
+  if (ring) {
+    uint32_t ring_size = state->media_clock.capture_ring_size;
+    uint32_t pos = state->media_clock.capture_write_pos;
+    uint32_t first = ring_size - pos;
+    if (first > event->size)
+      first = event->size;
+    memcpy(ring + pos, event->dma_buf, first);
+    if (event->size > first)
+      memcpy(ring, (const uint8_t *)event->dma_buf + first,
+             event->size - first);
+    pos += event->size;
+    if (pos >= ring_size)
+      pos -= ring_size;
+    state->media_clock.capture_write_pos = pos;
+    atomic_fetch_add_explicit(&state->media_clock.capture_head,
+                              (uint64_t)event->size, memory_order_release);
+  }
+  return false;
+}
+
+/* RX queue overflow: the driver dropped its oldest unread buffer. */
+static IRAM_ATTR bool i2s_rx_on_recv_q_ovf_cb(i2s_chan_handle_t handle,
+                                              i2s_event_data_t *event,
+                                              void *arg) {
+  avb_state_s *state = (avb_state_s *)arg;
+  atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_dropped,
+                            (uint64_t)event->size, memory_order_relaxed);
   return false;
 }
 
@@ -491,7 +521,8 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   i2s_event_callbacks_t tx_cbs = {.on_sent = i2s_tx_on_sent_cb};
   ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_tx_handle,
                                                       &tx_cbs, state));
-  i2s_event_callbacks_t rx_cbs = {.on_recv = i2s_rx_on_recv_cb};
+  i2s_event_callbacks_t rx_cbs = {.on_recv = i2s_rx_on_recv_cb,
+                                  .on_recv_q_ovf = i2s_rx_on_recv_q_ovf_cb};
   ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_rx_handle,
                                                       &rx_cbs, state));
 

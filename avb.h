@@ -823,6 +823,17 @@ typedef struct avb_state_s {
      * DAC share the APLL/MCLK, so either counter senses the same
      * clock; avb_pll's INTERNAL reference picks whichever is live. */
     _Atomic uint64_t i2s_bytes_captured;
+    /* Captured bytes the RX DMA queue overwrote before anyone read
+     * them (on_recv_q_ovf). They count in i2s_bytes_captured but can
+     * never be consumed, so the talker's backlog excludes them. */
+    _Atomic uint64_t i2s_bytes_dropped;
+    /* Talker capture ring, filled by the RX DMA interrupt on single-core
+     * stations (avtp.c), NULL when unused. capture_write_pos belongs to
+     * the interrupt; capture_head counts bytes written. */
+    uint8_t *volatile capture_ring;
+    uint32_t capture_ring_size;
+    uint32_t capture_write_pos;
+    _Atomic uint64_t capture_head;
 
     /* Listener stream reference (avb_pll): bytes the audio stream has
      * delivered into the jitter ring, loss-concealment fill included

@@ -81,6 +81,7 @@ typedef struct {
   volatile int32_t remaining_ns_max; /* widest gPTP-vs-target gap this window */
   volatile uint32_t gptp_resync_count; /* sanity-branch re-seeds (gPTP jumps) */
   volatile uint32_t ts_reanchors;      /* timestamp re-anchored to gPTP (tu) */
+  volatile uint32_t i2s_dropped_bytes; /* captured audio the RX DMA overwrote */
   volatile int32_t ts_err_ns;          /* stamp error vs gPTP schedule */
 } stream_tx_ctx_t;
 
@@ -822,6 +823,9 @@ static void avb_stream_out_task(void *task_param) {
   esp_task_wdt_add_user("AVB-OUT", &wdt_handle);
   esp_log_level_set("ptpd", ESP_LOG_NONE);
   esp_log_level_set("esp.emac", ESP_LOG_NONE);
+  /* The Wi-Fi driver logs each FTM ranging session at warning level; on
+   * a single-core station those console writes stall the stream. */
+  esp_log_level_set("wifi", ESP_LOG_ERROR);
 
   uint32_t loop_count = 0;
   uint32_t overrun_count = 0;
@@ -833,6 +837,8 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t ring_underruns = 0;    /* packets sent zero-filled, ring empty */
   uint32_t ts_reanchors = 0;
   int32_t ts_err_last = 0;
+  uint64_t i2s_dropped_base = atomic_load_explicit(
+      &state->media_clock.i2s_bytes_dropped, memory_order_relaxed);
   /* ADC-following cadence, see the fill controller in the 1 s branch. */
   int64_t fill_adj_q16 = 0;      /* extra ns per packet, Q16 */
   int32_t fill_frac_q16 = 0;     /* sub-ns carry of fill_adj_q16 */
@@ -875,6 +881,23 @@ static void avb_stream_out_task(void *task_param) {
   i2s_ring_size -= i2s_ring_size % i2s_frame_bytes;
   if (i2s_ring_size < i2s_read_size * 4)
     i2s_ring_size = i2s_read_size * 4; /* minimum 4 packets */
+  /* Backlog setpoint: half the 5 ms ring, ~2.5 ms of audio. */
+  int ring_setpoint = i2s_ring_size / 2;
+  /* Single-core stations: Wi-Fi preempts the stream task for up to
+   * ~25 ms, longer than the RX DMA queue holds (~8 ms), and the
+   * driver's read path then drops or repeats audio. There the RX
+   * interrupt copies every buffer into a 32 ms ring (avbcodec.c), so a
+   * stall delays audio instead of losing it. */
+#if portNUM_PROCESSORS == 1
+  bool capture_ring = !params->use_sine_wave;
+#else
+  const bool capture_ring = false;
+#endif
+  if (capture_ring) {
+    i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 32 / 1000);
+    i2s_ring_size -= i2s_ring_size % i2s_frame_bytes;
+  }
+  uint64_t capture_dropped = 0;
   /* Monotonic byte counters — MUST be 64-bit. As 32-bit ints they
    * cross 2^31 after ~31 min of 192 kHz stereo 24-bit capture
    * (1.152 MB/s), C's % on the now-negative value yields a NEGATIVE
@@ -911,35 +934,73 @@ static void avb_stream_out_task(void *task_param) {
       avberr("Stream out: no memory for I2S ring");
       goto err;
     }
-    /* Pre-fill the I2S ring with blocking reads to establish buffer level.
-     * I2S DMA returns in chunks larger than requested (driver adjusts
-     * dma_frame_num), so we fill as much as we can. */
-    int frame_size = i2s_channels * i2s_bytes_per_sample;
-    int prefill_target = i2s_ring_size / 2; /* ~2.5ms of audio */
-    while (i2s_ring_head < (uint64_t)prefill_target) {
-      int write_pos = (int)(i2s_ring_head % (uint64_t)i2s_ring_size);
-      int space = i2s_ring_size - (int)i2s_ring_head;
-      int chunk = i2s_ring_size - write_pos;
-      if (chunk > space)
-        chunk = space;
-      /* Align to frame boundary to prevent partial-frame reads */
-      chunk -= chunk % frame_size;
-      if (chunk == 0)
-        break;
-      size_t got = 0;
-      i2s_channel_read(params->i2s_rx_handle, i2s_ring + write_pos, chunk, &got,
-                       100);
-      got -= got % frame_size; /* discard any trailing partial frame */
-      if (got == 0)
-        break; /* timeout — give up pre-fill */
-      i2s_ring_head += got;
+    if (capture_ring) {
+      state->media_clock.capture_ring_size = (uint32_t)i2s_ring_size;
+      state->media_clock.capture_write_pos = 0;
+      atomic_store_explicit(&state->media_clock.capture_head, 0,
+                            memory_order_relaxed);
+      atomic_thread_fence(memory_order_release);
+      state->media_clock.capture_ring = i2s_ring;
+      int64_t prefill_deadline_us = esp_timer_get_time() + 200000;
+      while (atomic_load_explicit(&state->media_clock.capture_head,
+                                  memory_order_acquire) <
+                 (uint64_t)ring_setpoint &&
+             esp_timer_get_time() < prefill_deadline_us)
+        vTaskDelay(1);
+      i2s_ring_head = atomic_load_explicit(&state->media_clock.capture_head,
+                                           memory_order_acquire);
+      if (i2s_ring_head > (uint64_t)ring_setpoint) {
+        i2s_ring_tail = i2s_ring_head - ring_setpoint;
+        i2s_ring_tail -= i2s_ring_tail % i2s_frame_bytes;
+      }
+      avbinfo("Stream out: capture ring %d bytes, level %d bytes",
+              i2s_ring_size, (int)(i2s_ring_head - i2s_ring_tail));
+    } else {
+      /* Pre-fill the I2S ring with blocking reads to establish buffer level.
+       * I2S DMA returns in chunks larger than requested (driver adjusts
+       * dma_frame_num), so we fill as much as we can. */
+      /* Discard what the RX DMA queue already holds: the channel runs
+       * from boot, so a stream starts on a full queue of stale audio.
+       * Left there, it was consumed by the first packets but missing from
+       * the backlog baseline below, and the fill trim then held the queue
+       * at overflow. */
+      for (int flush = 0; flush < 64; flush++) {
+        size_t stale = 0;
+        i2s_channel_read(params->i2s_rx_handle, i2s_ring, i2s_ring_size, &stale,
+                         0);
+        if (stale == 0)
+          break;
+      }
+      int frame_size = i2s_channels * i2s_bytes_per_sample;
+      int prefill_target = ring_setpoint;
+      while (i2s_ring_head < (uint64_t)prefill_target) {
+        int write_pos = (int)(i2s_ring_head % (uint64_t)i2s_ring_size);
+        int space = i2s_ring_size - (int)i2s_ring_head;
+        int chunk = i2s_ring_size - write_pos;
+        if (chunk > space)
+          chunk = space;
+        /* Align to frame boundary to prevent partial-frame reads */
+        chunk -= chunk % frame_size;
+        if (chunk == 0)
+          break;
+        size_t got = 0;
+        i2s_channel_read(params->i2s_rx_handle, i2s_ring + write_pos, chunk,
+                         &got, 100);
+        got -= got % frame_size; /* discard any trailing partial frame */
+        if (got == 0)
+          break; /* timeout — give up pre-fill */
+        i2s_ring_head += got;
+      }
+      avbinfo("Stream out: I2S ring pre-filled %d bytes", (int)i2s_ring_head);
+      /* Backlog setpoint: the blocking pre-fill just drained the RX DMA,
+       * so from here (captured - consumed) tracks how far the ring + DMA
+       * backlog has moved from the pre-fill level. */
+      adc_bytes_base =
+          atomic_load_explicit(&state->media_clock.i2s_bytes_captured,
+                               memory_order_relaxed) -
+          atomic_load_explicit(&state->media_clock.i2s_bytes_dropped,
+                               memory_order_relaxed);
     }
-    avbinfo("Stream out: I2S ring pre-filled %d bytes", (int)i2s_ring_head);
-    /* Backlog setpoint: the blocking pre-fill just drained the RX DMA,
-     * so from here (captured - consumed) tracks how far the ring + DMA
-     * backlog has moved from the pre-fill level. */
-    adc_bytes_base = atomic_load_explicit(
-        &state->media_clock.i2s_bytes_captured, memory_order_relaxed);
   }
 
   /* Sample PTP and send-time as late as possible — all logging and pre-fill
@@ -1319,11 +1380,19 @@ static void avb_stream_out_task(void *task_param) {
        * stamps stay true gPTP time and the stream's implied media
        * clock is the ADC rate. */
       if (!params->use_sine_wave) {
+        /* Buffers the RX DMA queue overwrote during a stall are lost
+         * audio, not backlog: counting them pinned the trim at its
+         * clamp and drained the ring into zero-filled packets. */
         uint64_t captured =
             atomic_load_explicit(&state->media_clock.i2s_bytes_captured,
                                  memory_order_relaxed) -
+            atomic_load_explicit(&state->media_clock.i2s_bytes_dropped,
+                                 memory_order_relaxed) -
             adc_bytes_base;
-        int64_t backlog_err = (int64_t)captured - (int64_t)i2s_ring_tail;
+        int64_t backlog_err =
+            capture_ring
+                ? (int64_t)(i2s_ring_head - i2s_ring_tail) - ring_setpoint
+                : (int64_t)captured - (int64_t)i2s_ring_tail;
         fill_err_ema_q8 += ((backlog_err << 8) - fill_err_ema_q8) >> 3;
         int64_t err_pkts_q8 = fill_err_ema_q8 / i2s_read_nominal;
         fill_integ_ppm_q8 -= err_pkts_q8 / 16;
@@ -1366,6 +1435,13 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->gptp_resync_count = gptp_resync_count;
         tx_ctx->ts_reanchors = ts_reanchors;
         tx_ctx->ts_err_ns = ts_err_last;
+        tx_ctx->i2s_dropped_bytes =
+            capture_ring
+                ? (uint32_t)capture_dropped
+                : (uint32_t)(atomic_load_explicit(
+                                 &state->media_clock.i2s_bytes_dropped,
+                                 memory_order_relaxed) -
+                             i2s_dropped_base);
       }
       /* Reset PLL offset range and cadence-drift range so the published
        * values stay per-window instead of latching worst-ever. */
@@ -1467,7 +1543,23 @@ static void avb_stream_out_task(void *task_param) {
        * wire captures at 192 kHz (clean at 96 kHz, where the same queue
        * holds 5.3 ms). Keeping the backlog in this 5 ms ring instead
        * leaves the DMA queue near empty at any rate. */
-      int ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
+      int ring_avail;
+      if (capture_ring) {
+        i2s_ring_head = atomic_load_explicit(&state->media_clock.capture_head,
+                                             memory_order_acquire);
+        /* The interrupt is about to overwrite unread audio: skip ahead
+         * to the setpoint and count what was lost. */
+        if (i2s_ring_head - i2s_ring_tail >
+            (uint64_t)(i2s_ring_size - 2 * i2s_read_size)) {
+          uint64_t resume = i2s_ring_head - ring_setpoint;
+          resume -= resume % i2s_frame_bytes;
+          capture_dropped += resume - i2s_ring_tail;
+          i2s_ring_tail = resume;
+        }
+        ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
+        goto skip_refill;
+      }
+      ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
       if (ring_avail < i2s_ring_size) {
         /* Refill: read as much as fits from I2S into the ring */
         int ring_space = i2s_ring_size - ring_avail;
@@ -1660,10 +1752,17 @@ static void avb_stream_out_task(void *task_param) {
   esp_log_level_set("*", ESP_LOG_INFO);
   avbinfo("Stream out stopped: %lu pkts, %lu fails (last %s), %lu overruns "
           "(max %lldus), i2s: %lu zero_reads, %lu nonzero_audio, %lu ring "
-          "underruns, %lu re-anchors",
+          "underruns, %lu bytes dropped, %lu re-anchors",
           loop_count, send_fail_count, esp_err_to_name(last_send_error),
           overrun_count, overrun_max, i2s_zero_reads, i2s_nonzero_audio,
-          ring_underruns, (unsigned long)ts_reanchors);
+          ring_underruns,
+          (unsigned long)(capture_ring
+                              ? capture_dropped
+                              : atomic_load_explicit(
+                                    &state->media_clock.i2s_bytes_dropped,
+                                    memory_order_relaxed) -
+                                    i2s_dropped_base),
+          (unsigned long)ts_reanchors);
   avbinfo("PLL: %lu measures, %lu skipped, offset [%ldns, %ldns]",
           pll_measure_count, pll_skip_count, (long)pll_offset_min,
           (long)pll_offset_max);
@@ -1675,6 +1774,11 @@ err:
   free(sine_lut);
   free(pcm_buf);
   free(i2s_buf);
+  if (i2s_ring && state->media_clock.capture_ring == i2s_ring) {
+    /* Detach, then give a copy already in the interrupt time to end. */
+    state->media_clock.capture_ring = NULL;
+    vTaskDelay(1);
+  }
   free(i2s_ring);
   free(tx_frame);
   free(params);
@@ -2722,12 +2826,12 @@ void avb_stream_out_print_diag(void) {
   static uint32_t last_z = 0, last_nz = 0, last_skip = 0, last_under = 0;
   static uint32_t last_slip = 0, last_slip_pkts = 0;
   static uint32_t last_resync = 0;
-  static uint32_t last_anchors = 0;
+  static uint32_t last_anchors = 0, last_dropped = 0;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = last_under = 0;
     last_slip = last_slip_pkts = 0;
-    last_anchors = 0;
+    last_anchors = last_dropped = 0;
   }
 
   uint32_t pkts = ctx->pkt_count;
@@ -2741,6 +2845,7 @@ void avb_stream_out_print_diag(void) {
   uint32_t skip = ctx->pll_skip_count;
   uint32_t resync = ctx->gptp_resync_count;
   uint32_t anchors = ctx->ts_reanchors;
+  uint32_t dropped = ctx->i2s_dropped_bytes;
   int64_t over_max = ctx->overrun_max_us;
   int32_t pll_min = ctx->pll_offset_min_ns;
   int32_t pll_max = ctx->pll_offset_max_ns;
@@ -2761,7 +2866,7 @@ void avb_stream_out_print_diag(void) {
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
-          "resync=%lu slips=%lu/%lu anchors=%lu ts_err=%ldus",
+          "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -2780,6 +2885,7 @@ void avb_stream_out_print_diag(void) {
           (unsigned long)(slips - last_slip),
           (unsigned long)(slip_pkts - last_slip_pkts),
           (unsigned long)(anchors - last_anchors),
+          (unsigned long)(dropped - last_dropped),
           (long)(ctx->ts_err_ns / 1000));
 
   /* Secondary detail lines only emitted when samples were actually
@@ -2804,6 +2910,7 @@ void avb_stream_out_print_diag(void) {
   last_skip = skip;
   last_resync = resync;
   last_anchors = anchors;
+  last_dropped = dropped;
 }
 
 /* Deferred drift sampler. Called from AVB main's periodic loop at
