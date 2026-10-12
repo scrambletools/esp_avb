@@ -10,6 +10,8 @@
  */
 
 #include "avb.h"
+#include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
 #include "es8311_codec.h"
 #include "es8388_codec.h"
 #include "es8389_codec.h"

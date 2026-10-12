@@ -10,6 +10,7 @@
  */
 
 #include "avb.h"
+#include "driver/i2s_std.h"
 #include "avbbridge.h"
 #include "audio_codec_if.h"
 #include "esp_codec_dev.h"
@@ -32,8 +33,11 @@ static void avb_audio_test_run(avb_state_s *state);
 static void avb_refresh_link_speed(avb_state_s *state);
 
 // logo.png
+#ifdef CONFIG_ESP_AVB_ATDECC
+/* The ATDECC memory object's logo. */
 extern const char logo_png_start[] asm("_binary_logo_png_start");
 extern const char logo_png_end[] asm("_binary_logo_png_end");
+#endif
 
 /* Return the local STREAM_INPUT index used for the CRF media-clock input.
  * Talker-only endpoints expose only the CRF input at index 0. Endpoints with
@@ -357,6 +361,8 @@ static void avb_declare_output_stream(avb_state_s *state, uint16_t index) {
       stream->stream_info_flags.class_b);
 }
 
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+/* A bridge has no output streams of its own. */
 /* AVB Lite unicast transport (profiles/avb_lite.md §6, "Stream transport
  * addressing"): publish each output stream's active unicast DAs into
  * its tx_da[] seqlock mailbox for the TX paths. Listeners are served in
@@ -767,6 +773,7 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
     }
   }
 }
+#endif
 
 /* Initialize AVB state and create L2TAP FDs */
 static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
@@ -1269,8 +1276,10 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   }
 
   // Set logo start and length
+#ifdef CONFIG_ESP_AVB_ATDECC
   state->logo_start = (uint8_t *)logo_png_start;
   state->logo_length = logo_png_end - logo_png_start;
+#endif
 
   // Get latest PTP status. Skip on wifi-medium ports where ptpd
   // isn't started — the wifi endpoint syncs via beacon-IE
@@ -1459,8 +1468,8 @@ static int avb_periodic_send(avb_state_s *state) {
 
   /* Track listener churn into the per-stream unicast DA mailboxes
    * (AVB Lite unicast transport; no-op outside Lite mode). */
-  avb_lite_update_stream_tx_addrs(state);
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+  avb_lite_update_stream_tx_addrs(state);
   avb_persist_journal_tick(state);
 #endif
   avb_emac_rx_unwedge_tick();
@@ -3227,4 +3236,39 @@ void avb_persist_task(void *arg) {
     avb_persist_write_blob(&snapshot);
   }
   vTaskDelete(NULL);
+}
+
+/* Shared by both roles: the bridge build leaves out avtp.c. */
+void stream_id_from_mac(eth_addr_t *mac_addr, uint8_t *stream_id, size_t uid) {
+  // copy the mac address octets to the stream id and fill the remaining octects
+  // with uid
+  memcpy(stream_id, mac_addr, ETH_ADDR_LEN);
+  memset(stream_id + ETH_ADDR_LEN, uid, UNIQUE_ID_LEN - ETH_ADDR_LEN);
+}
+
+uint32_t aaf_code_to_sample_rate(uint8_t code) {
+  switch (code) {
+  case aaf_pcm_sample_rate_8k:
+    return 8000;
+  case aaf_pcm_sample_rate_16k:
+    return 16000;
+  case aaf_pcm_sample_rate_24k:
+    return 24000;
+  case aaf_pcm_sample_rate_32k:
+    return 32000;
+  case aaf_pcm_sample_rate_44_1k:
+    return 44100;
+  case aaf_pcm_sample_rate_48k:
+    return 48000;
+  case aaf_pcm_sample_rate_88_2k:
+    return 88200;
+  case aaf_pcm_sample_rate_96k:
+    return 96000;
+  case aaf_pcm_sample_rate_176_4k:
+    return 176400;
+  case aaf_pcm_sample_rate_192k:
+    return 192000;
+  default:
+    return 48000;
+  }
 }

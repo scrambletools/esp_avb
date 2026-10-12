@@ -17,8 +17,6 @@
 #include "esp_avb.h"
 #include "esp_eth_clock.h"
 #include <arpa/inet.h>
-#include <driver/i2c_master.h>
-#include <driver/i2s_std.h>
 #include <esp_check.h>
 #include <esp_err.h>
 #include <esp_eth_driver.h>
@@ -46,6 +44,10 @@
 #include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
+
+/* The I2S channel handle, as driver/i2s_types.h declares it, so this header
+ * does not pull the drivers into a bridge. */
+typedef struct i2s_channel_obj_t *i2s_chan_handle_t;
 
 /* Number of protocols to use for L2TAP (AVTP, MSRP, MVRP) */
 #define AVB_NUM_PROTOCOLS 4

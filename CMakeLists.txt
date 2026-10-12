@@ -21,23 +21,25 @@
 #   - atdecc.c (IEEE 1722.1 ADP/AECP/ACMP). avb.c's AVTP RX
 #     dispatcher #ifdef-routes the ATDECC subtypes through it.
 
-set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avtp.c avbstats.c)
+set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c)
+set(avb_embed "")
 
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)
     list(APPEND avb_srcs avbbridge.c avbfqtss.c)
 else()
-    list(APPEND avb_srcs avbcodec.c avbpll.c)
+    list(APPEND avb_srcs avtp.c avbcodec.c avbpll.c)
 endif()
 
 if(CONFIG_ESP_AVB_ATDECC)
     list(APPEND avb_srcs atdecc.c)
+    list(APPEND avb_embed logo.png)
 endif()
 
 idf_component_register(SRCS ${avb_srcs}
                        REQUIRES esp_eth
                        PRIV_REQUIRES esp_codec_dev esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
                        INCLUDE_DIRS "." "./include"
-                       EMBED_FILES logo.png)
+                       EMBED_FILES ${avb_embed})
 
 target_sources(${COMPONENT_LIB} PRIVATE)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)

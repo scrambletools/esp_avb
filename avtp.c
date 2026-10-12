@@ -11,6 +11,7 @@
  */
 
 #include "avb.h"
+#include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
@@ -90,12 +91,6 @@ static stream_tx_ctx_t *s_stream_tx_ctx = NULL;
  * task to miss its 125μs deadlines. The DMA ring appears to handle concurrent
  * access in practice (separate TX descriptors for each caller). */
 
-void stream_id_from_mac(eth_addr_t *mac_addr, uint8_t *stream_id, size_t uid) {
-  // copy the mac address octets to the stream id and fill the remaining octects
-  // with uid
-  memcpy(stream_id, mac_addr, ETH_ADDR_LEN);
-  memset(stream_id + ETH_ADDR_LEN, uid, UNIQUE_ID_LEN - ETH_ADDR_LEN);
-}
 
 /* Compute GCD for sine LUT sizing */
 static uint32_t gcd(uint32_t a, uint32_t b) {
@@ -410,32 +405,6 @@ static int avb_send_iec_61883_packet(avb_state_s *state, unique_id_t *stream_id,
  * calls it via the avb.h forward declaration). */
 
 /* Map AAF sample rate enum to Hz */
-uint32_t aaf_code_to_sample_rate(uint8_t code) {
-  switch (code) {
-  case aaf_pcm_sample_rate_8k:
-    return 8000;
-  case aaf_pcm_sample_rate_16k:
-    return 16000;
-  case aaf_pcm_sample_rate_24k:
-    return 24000;
-  case aaf_pcm_sample_rate_32k:
-    return 32000;
-  case aaf_pcm_sample_rate_44_1k:
-    return 44100;
-  case aaf_pcm_sample_rate_48k:
-    return 48000;
-  case aaf_pcm_sample_rate_88_2k:
-    return 88200;
-  case aaf_pcm_sample_rate_96k:
-    return 96000;
-  case aaf_pcm_sample_rate_176_4k:
-    return 176400;
-  case aaf_pcm_sample_rate_192k:
-    return 192000;
-  default:
-    return 48000;
-  }
-}
 
 /* Map sample rate in Hz to AAF sample rate enum */
 static uint8_t sample_rate_to_aaf_code(uint32_t sample_rate) {

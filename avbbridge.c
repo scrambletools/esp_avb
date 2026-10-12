@@ -208,6 +208,42 @@ void avb_codec_set_mic_gain(avb_state_s *state, float db) {
   (void)db;
 }
 
+/* avtp.c stubs, the bridge has no streams of its own. */
+int avb_start_stream_in(avb_state_s *state, uint16_t index) {
+  (void)state;
+  (void)index;
+  return ERROR;
+}
+
+void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
+  (void)state;
+  (void)index;
+}
+
+int avb_start_stream_out(avb_state_s *state, uint16_t index) {
+  (void)state;
+  (void)index;
+  return ERROR;
+}
+
+int avb_stop_stream_out(avb_state_s *state, uint16_t index) {
+  (void)state;
+  (void)index;
+  return OK;
+}
+
+int64_t avb_stream_in_last_rx_us(avb_state_s *state, uint16_t index) {
+  (void)state;
+  (void)index;
+  return 0;
+}
+
+void avb_stream_in_sample_drift(avb_state_s *state) { (void)state; }
+void avb_superfast_connect_start(avb_state_s *state) { (void)state; }
+void avb_stream_in_print_diag(void) {}
+void avb_stream_out_print_diag(void) {}
+uint64_t avb_stream_out_work_us_total(void) { return 0; }
+
 /* avbpll.c stubs — bridge has no media-clock PLL. */
 void avb_pll_tick(avb_state_s *state) { (void)state; }
 void avb_pll_print_stats(avb_state_s *state) { (void)state; }
