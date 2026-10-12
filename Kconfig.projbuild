@@ -158,7 +158,7 @@ menu "AVB Configuration"
 
     config ESP_AVB_WIFI_DELIVERABLE_FRAMES
         int "Wi-Fi port deliverable frames a second"
-        default 7000
+        default 6000
         range 1000 30000
         depends on ESP_AVB_ROLE_BRIDGE && ESP_AVB_WIFI_UNICAST_STREAMS
         help
@@ -171,9 +171,10 @@ menu "AVB Configuration"
             admitted toward the Wi-Fi port only from 12000 frames a
             second, and only with allow_class_a_over_wifi set.
 
-            This bridge forwarded about 7100 to 7450 frames a second
-            under a single 8000 frame/s stream, so the default gives a
-            budget of 5250: one 4000 frame/s Class B stream fits.
+            Offered a single 8000 frame/s stream, an ESP32-P4 bridge
+            with an ESP32-C6 coprocessor over SDIO delivered about 6100
+            frames a second to its station, so the default gives a
+            budget of 4500: one 4000 frame/s Class B stream fits.
 
     config ESP_AVB_AVB_LITE_COMPLIANT
         bool "Advertise AVB Lite compliance"
