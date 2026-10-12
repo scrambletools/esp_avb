@@ -22,6 +22,7 @@
 #include "mrp.h"
 #include "esp_ptp.h"
 #include "esp_cpu.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
@@ -1201,6 +1202,36 @@ void avb_create_eth_frame(uint8_t *eth_frame, eth_addr_t *dest_addr,
   }
 }
 
+/* Forward decl repeated here so endpoint builds (which don't define
+ * CONFIG_ESP_AVB_ROLE_BRIDGE) can still see the symbol. esp_avb avoids
+ * a hard esp_wifi PRIV_REQUIRES; native Wi-Fi or esp_wifi_remote
+ * provides the link symbol when it's actually called. */
+extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
+
+/* Control frames from a station wait out a full TX queue. A station's
+ * stream sends more frames than the air drains, so its queue is full
+ * most of the time and a control frame sent once would mostly fail.
+ * The stream task runs below every control sender on the single core,
+ * so while a sender polls here the next buffer the Wi-Fi task frees
+ * goes to the control frame, not the stream. At the stream's air rate
+ * a buffer frees about every millisecond. */
+#define WIFI_CONTROL_TX_WAIT_US 10000
+#define WIFI_CONTROL_TX_POLL_US 100
+
+static esp_err_t avb_net_wifi_tx_control(int wifi_if, void *frame,
+                                         size_t frame_len) {
+  esp_err_t result = esp_wifi_internal_tx(wifi_if, frame, frame_len);
+  if (result != ESP_ERR_NO_MEM || wifi_if != 0 /* WIFI_IF_STA */) {
+    return result;
+  }
+  int64_t deadline_us = esp_timer_get_time() + WIFI_CONTROL_TX_WAIT_US;
+  while (result == ESP_ERR_NO_MEM && esp_timer_get_time() < deadline_us) {
+    esp_rom_delay_us(WIFI_CONTROL_TX_POLL_US);
+    result = esp_wifi_internal_tx(wifi_if, frame, frame_len);
+  }
+  return result;
+}
+
 /* Send an Ethernet frame */
 int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
                     uint16_t msg_len, struct timespec *ts,
@@ -1221,7 +1252,8 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
   /* Wi-Fi port: L2TAP is Ethernet-only, so we bypass the per-ethertype
    * fds and push the frame straight at the Wi-Fi driver. */
   if (state->port[0].medium == avb_port_medium_wifi_ftm) {
-    return (avb_net_transmit_raw(NULL, eth_frame, sizeof(eth_frame)) == ESP_OK)
+    return (avb_net_wifi_tx_control(0 /* WIFI_IF_STA */, eth_frame,
+                                    sizeof(eth_frame)) == ESP_OK)
                ? (int)sizeof(eth_frame)
                : ERROR;
   }
@@ -1266,7 +1298,8 @@ int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
 
   /* Wi-Fi port: L2TAP is Ethernet-only — go straight to wifi raw TX. */
   if (state->port[0].medium == avb_port_medium_wifi_ftm) {
-    return (avb_net_transmit_raw(NULL, eth_frame, sizeof(eth_frame)) == ESP_OK)
+    return (avb_net_wifi_tx_control(0 /* WIFI_IF_STA */, eth_frame,
+                                    sizeof(eth_frame)) == ESP_OK)
                ? (int)sizeof(eth_frame)
                : ERROR;
   }
@@ -1321,12 +1354,6 @@ int avb_net_send(avb_state_s *state, ethertype_t ethertype, void *msg,
   }
   return avb_net_send_to(state, ethertype, msg, msg_len, ts, &dest_addr);
 }
-
-/* Forward decl repeated here so endpoint builds (which don't define
- * CONFIG_ESP_AVB_ROLE_BRIDGE) can still see the symbol. esp_avb avoids
- * a hard esp_wifi PRIV_REQUIRES; native Wi-Fi or esp_wifi_remote
- * provides the link symbol when it's actually called. */
-extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
 
 /* Per-port control-plane TX. Routes the frame through the named port's
  * egress, building it with that port's own source MAC. Dispatch is
@@ -1401,7 +1428,7 @@ int avb_net_send_on(avb_state_s *state, int port_index,
     if (!buf) return ERROR;
     memcpy(buf, eth_frame, sizeof(eth_frame));
     esp_err_t r =
-        esp_wifi_internal_tx((int)p->wifi_mode, buf, sizeof(eth_frame));
+        avb_net_wifi_tx_control((int)p->wifi_mode, buf, sizeof(eth_frame));
     free(buf);
     return (r == ESP_OK) ? (int)sizeof(eth_frame) : ERROR;
   }
