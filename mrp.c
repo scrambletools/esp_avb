@@ -1927,12 +1927,54 @@ const uint8_t *msrp_wifi_ucast_lookup_stream(const uint8_t *stream_id) {
   return NULL;
 }
 
-/* Recompute the join. Cheap and called only on declaration change. */
+/* Recompute the join. Cheap and called only on declaration change.
+ * The data plane reads the tables without a lock, so the join is built
+ * aside and only changed entries are written back: clearing them in
+ * place sent every frame that arrived mid-rebuild out group addressed,
+ * buffered to the DTIM and late at the station. */
+static avb_wifi_ucast_entry_t s_next_ucast[AVB_WIFI_UCAST_TABLE_SIZE];
+static uint8_t s_next_ucast_idx[256];
+static avb_wifi_restore_entry_t s_next_restore[MSRP_TALKER_TABLE_SIZE];
+
+static void msrp_wifi_ucast_build(int wifi_port);
+
 void msrp_wifi_ucast_refresh(int wifi_port) {
-  memset(s_ucast, 0, sizeof(s_ucast));
-  memset(s_ucast_idx, 0, sizeof(s_ucast_idx));
-  memset(s_restore_tbl, 0, sizeof(s_restore_tbl));
-  if (wifi_port < 0 || wifi_port >= CONFIG_ESP_AVB_NUM_PORTS) return;
+  memset(s_next_ucast, 0, sizeof(s_next_ucast));
+  memset(s_next_ucast_idx, 0, sizeof(s_next_ucast_idx));
+  memset(s_next_restore, 0, sizeof(s_next_restore));
+  if (wifi_port >= 0 && wifi_port < CONFIG_ESP_AVB_NUM_PORTS)
+    msrp_wifi_ucast_build(wifi_port);
+
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    if (memcmp(&s_restore_tbl[i], &s_next_restore[i],
+               sizeof(s_next_restore[i])) == 0)
+      continue;
+    s_restore_tbl[i].valid = false;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    memcpy(s_restore_tbl[i].stream_id, s_next_restore[i].stream_id,
+           UNIQUE_ID_LEN);
+    memcpy(s_restore_tbl[i].da, s_next_restore[i].da, ETH_ADDR_LEN);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_restore_tbl[i].valid = s_next_restore[i].valid;
+  }
+  for (int i = 0; i < AVB_WIFI_UCAST_TABLE_SIZE; i++) {
+    if (memcmp(&s_ucast[i], &s_next_ucast[i], sizeof(s_next_ucast[i])) == 0)
+      continue;
+    s_ucast[i].valid = false;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    memcpy(s_ucast[i].da, s_next_ucast[i].da, ETH_ADDR_LEN);
+    memcpy(s_ucast[i].sta, s_next_ucast[i].sta, ETH_ADDR_LEN);
+    memcpy(s_ucast[i].stream_id, s_next_ucast[i].stream_id, UNIQUE_ID_LEN);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    s_ucast[i].valid = s_next_ucast[i].valid;
+  }
+  for (int i = 0; i < 256; i++) {
+    if (s_ucast_idx[i] != s_next_ucast_idx[i])
+      s_ucast_idx[i] = s_next_ucast_idx[i];
+  }
+}
+
+static void msrp_wifi_ucast_build(int wifi_port) {
 
   /* Restore table: Talker Advertise entries registered on the Wi-Fi
    * port are wireless talkers, record their advertised (group)
@@ -1942,10 +1984,10 @@ void msrp_wifi_ucast_refresh(int wifi_port) {
     if (!te->valid) continue;
     const uint8_t *da = (const uint8_t *)&te->wire.talker.info.stream_dest_addr;
     if ((da[0] & 0x01) == 0) continue; /* already individual, nothing to restore */
-    memcpy(s_restore_tbl[ti].stream_id, &te->wire.talker.info.stream_id,
+    memcpy(s_next_restore[ti].stream_id, &te->wire.talker.info.stream_id,
            UNIQUE_ID_LEN);
-    memcpy(s_restore_tbl[ti].da, da, ETH_ADDR_LEN);
-    s_restore_tbl[ti].valid = true;
+    memcpy(s_next_restore[ti].da, da, ETH_ADDR_LEN);
+    s_next_restore[ti].valid = true;
   }
 
   int n = 0;
@@ -1982,13 +2024,13 @@ void msrp_wifi_ucast_refresh(int wifi_port) {
     /* Only group addressed streams need re-addressing. */
     if (((*da)[0] & 0x01) == 0) continue;
 
-    memcpy(s_ucast[n].da, *da, ETH_ADDR_LEN);
-    memcpy(s_ucast[n].sta, le->peer_mac, ETH_ADDR_LEN);
-    memcpy(s_ucast[n].stream_id, &le->wire.stream_id, UNIQUE_ID_LEN);
-    s_ucast[n].valid = true;
+    memcpy(s_next_ucast[n].da, *da, ETH_ADDR_LEN);
+    memcpy(s_next_ucast[n].sta, le->peer_mac, ETH_ADDR_LEN);
+    memcpy(s_next_ucast[n].stream_id, &le->wire.stream_id, UNIQUE_ID_LEN);
+    s_next_ucast[n].valid = true;
     /* Last writer wins on an index collision; the full-DA verify in the
      * lookup turns a collision into a miss, not a misdelivery. */
-    s_ucast_idx[s_ucast[n].da[ETH_ADDR_LEN - 1]] = (uint8_t)(n + 1);
+    s_next_ucast_idx[s_next_ucast[n].da[ETH_ADDR_LEN - 1]] = (uint8_t)(n + 1);
     n++;
   }
 }
