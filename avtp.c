@@ -1324,12 +1324,18 @@ static void avb_stream_out_task(void *task_param) {
               target_q16 = cadence_adj_q16 +
                            (spacing_q16 * drift_ppm_q8) / (256LL * 1000000LL);
             }
-            /* Offset pull: drain ts_err at ≤4 ppm. */
+            /* Offset pull: drain ts_err at up to 8 ppm at any packet
+             * interval. A fixed 0.5 ns/pkt was 4 ppm at 125 us but only
+             * 2 ppm at 250 us, below the residual rate error of a Class B
+             * talker, whose stamps then crept ~1.5 us/s toward the 5 ms
+             * re-anchor (a glitch at every listener). */
+            int64_t off_max_q16 =
+                ((int64_t)params->interval * 8LL << 16) / 1000LL;
             int64_t off_q16 = -(((int64_t)ts_err) << 16) / (8192 * 4);
-            if (off_q16 > 32768)
-              off_q16 = 32768;
-            else if (off_q16 < -32768)
-              off_q16 = -32768;
+            if (off_q16 > off_max_q16)
+              off_q16 = off_max_q16;
+            else if (off_q16 < -off_max_q16)
+              off_q16 = -off_max_q16;
             int64_t want = target_q16 + off_q16;
             /* Clamp the total correction to the widest cadence trim
              * (rate lock plus ADC fill, 300 ppm) at any packet
