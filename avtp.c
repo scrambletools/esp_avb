@@ -1927,6 +1927,7 @@ typedef struct {
   volatile uint32_t drain_underrun;   /* drain ticks that found ring empty */
   volatile uint32_t stream_id_mismatch; /* packets dropped: wrong stream_id */
   volatile uint32_t seq_num_mismatch; /* sequence number gaps */
+  volatile uint32_t seq_late;         /* duplicate or late frames dropped */
   volatile uint32_t loss_fill_events; /* loss-concealment silence inserts */
   volatile uint32_t loss_fill_frames; /* wire-lost frames replaced by silence */
   volatile uint32_t splice_aligned;   /* inserts sized from presentation time */
@@ -2435,6 +2436,12 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   if (ctx->seq_num_valid && seq_num != (uint8_t)(ctx->last_seq_num + 1)) {
     ctx->seq_num_mismatch++;
     lost_frames = (uint8_t)(seq_num - (uint8_t)(ctx->last_seq_num + 1));
+    if (lost_frames >= 250) {
+      /* Duplicate, or late after its time was concealed: writing it
+       * would add its length to the buffered timeline. */
+      ctx->seq_late++;
+      return;
+    }
   }
   ctx->last_seq_num = seq_num;
   ctx->seq_num_valid = true;
