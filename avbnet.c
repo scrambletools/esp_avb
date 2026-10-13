@@ -24,6 +24,7 @@
 #include "esp_cpu.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
+#include "driver/gptimer.h"
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
 #include <esp_idf_version.h>
@@ -247,6 +248,305 @@ static void avb_bridge_forward(int egress_port, uint16_t ethertype,
       s_fwd_wifi_fail++;
     }
     return;
+  }
+}
+
+/* Station stream pacing. Wi-Fi hands the bridge a station's stream in
+ * bursts of up to an A-MPDU, which forwarded as received exceed the
+ * stream's TSpec on the wire, and a downstream shaper holding them to
+ * the reserved rate keeps the backlog as a standing queue (measured 8
+ * to 30 ms through one switch). 802.1BA 6.4 leaves that smoothing to
+ * the wireless hop: each frame of a reserved station stream goes out
+ * no sooner than its class measurement interval over its
+ * MaxIntervalFrames after the previous one. A frame already that far
+ * apart passes straight through; a burst waits in the stream's queue.
+ * Queues live in PSRAM, the bridge's internal RAM has no room. */
+#define STATION_PACER_STREAMS 8
+#define STATION_PACER_DEPTH 64
+#define STATION_PACER_SLOT_BYTES 1522
+#define STATION_PACER_MAX_FRAMES 8 /* MaxIntervalFrames honored up to this */
+#define STATION_PACER_IDLE_US 2000000
+
+typedef struct {
+  bool valid;
+  uint8_t stream_id[UNIQUE_ID_LEN];
+  int egress_port;
+  int64_t interval_ns;
+  uint8_t max_frames;
+  /* Send times of the last max_frames frames; sent_ns[sent_idx] is the
+   * oldest, and the next frame may go one interval after it. */
+  int64_t sent_ns[STATION_PACER_MAX_FRAMES];
+  uint8_t sent_idx;
+  int64_t last_seen_us;
+  uint16_t head;
+  uint16_t count;
+  uint16_t in_flight; /* taken off the queue, not yet transmitted */
+  uint16_t len[STATION_PACER_DEPTH];
+  uint8_t (*slot)[STATION_PACER_SLOT_BYTES];
+} station_pacer_t;
+
+static station_pacer_t *s_pacers;
+static portMUX_TYPE s_pacer_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_pacer_draining;
+/* A GPTimer alarm wakes the pacer task: esp_timer callbacks share the
+ * bridge's busiest core and ran too late to drain a burst between
+ * Wi-Fi deliveries. */
+static gptimer_handle_t s_pacer_timer;
+static TaskHandle_t s_pacer_task;
+static volatile uint32_t s_fwd_eth_paced, s_fwd_eth_pace_overflow;
+static volatile uint32_t s_pacer_depth_max;
+static volatile uint32_t s_pacer_no_tspec, s_pacer_no_entry;
+
+static inline int64_t station_pacer_next_ns(const station_pacer_t *pacer) {
+  return pacer->sent_ns[pacer->sent_idx] + pacer->interval_ns;
+}
+
+static inline void station_pacer_note_send(station_pacer_t *pacer,
+                                           int64_t now_ns) {
+  pacer->sent_ns[pacer->sent_idx] = now_ns;
+  pacer->sent_idx = (uint8_t)((pacer->sent_idx + 1) % pacer->max_frames);
+}
+
+/* Send every queued frame whose turn has come, then arm the timer for
+ * the next one. One context drains at a time, so a stream's frames
+ * leave in order; transmits happen outside the lock. */
+static void station_pacer_drain(void) {
+  portENTER_CRITICAL(&s_pacer_lock);
+  if (s_pacer_draining) {
+    portEXIT_CRITICAL(&s_pacer_lock);
+    return;
+  }
+  s_pacer_draining = true;
+  portEXIT_CRITICAL(&s_pacer_lock);
+  int64_t earliest_ns;
+  for (;;) {
+    int64_t now_ns = esp_timer_get_time() * 1000;
+    station_pacer_t *due = NULL;
+    const uint8_t *frame = NULL;
+    uint16_t len = 0;
+    earliest_ns = INT64_MAX;
+    portENTER_CRITICAL(&s_pacer_lock);
+    for (int i = 0; i < STATION_PACER_STREAMS && !due; i++) {
+      station_pacer_t *pacer = &s_pacers[i];
+      if (!pacer->valid || pacer->count == 0)
+        continue;
+      int64_t next_ns = station_pacer_next_ns(pacer);
+      if (now_ns >= next_ns) {
+        due = pacer;
+        frame = pacer->slot[pacer->head];
+        len = pacer->len[pacer->head];
+        pacer->head = (uint16_t)((pacer->head + 1) % STATION_PACER_DEPTH);
+        pacer->count--;
+        pacer->in_flight++;
+        station_pacer_note_send(pacer, now_ns);
+      } else if (next_ns < earliest_ns) {
+        earliest_ns = next_ns;
+      }
+    }
+    if (!due)
+      s_pacer_draining = false;
+    portEXIT_CRITICAL(&s_pacer_lock);
+    if (!due)
+      break;
+    avb_bridge_forward(due->egress_port, 0x8100, frame, len);
+    portENTER_CRITICAL(&s_pacer_lock);
+    due->in_flight--;
+    portEXIT_CRITICAL(&s_pacer_lock);
+  }
+  if (earliest_ns != INT64_MAX) {
+    int64_t delay_us = (earliest_ns - esp_timer_get_time() * 1000 + 999) / 1000;
+    uint64_t now_ticks = 0;
+    gptimer_get_raw_count(s_pacer_timer, &now_ticks);
+    gptimer_alarm_config_t alarm = {
+        .alarm_count = now_ticks + (uint64_t)(delay_us < 5 ? 5 : delay_us)};
+    gptimer_set_alarm_action(s_pacer_timer, &alarm);
+  }
+}
+
+static bool IRAM_ATTR
+station_pacer_alarm(gptimer_handle_t timer,
+                    const gptimer_alarm_event_data_t *event, void *arg) {
+  (void)timer;
+  (void)event;
+  (void)arg;
+  BaseType_t woken = pdFALSE;
+  vTaskNotifyGiveFromISR(s_pacer_task, &woken);
+  return woken == pdTRUE;
+}
+
+static void station_pacer_task(void *arg) {
+  (void)arg;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    station_pacer_drain();
+  }
+}
+
+static bool station_pacer_init(void) {
+  s_pacers = heap_caps_calloc(STATION_PACER_STREAMS, sizeof(*s_pacers),
+                              MALLOC_CAP_SPIRAM);
+  if (!s_pacers)
+    return false;
+  gptimer_config_t timer_config = {.clk_src = GPTIMER_CLK_SRC_DEFAULT,
+                                   .direction = GPTIMER_COUNT_UP,
+                                   .resolution_hz = 1000000};
+  gptimer_event_callbacks_t callbacks = {.on_alarm = station_pacer_alarm};
+  if (xTaskCreate(station_pacer_task, "station_pacer", 3072, NULL, 23,
+                  &s_pacer_task) != pdPASS ||
+      gptimer_new_timer(&timer_config, &s_pacer_timer) != ESP_OK ||
+      gptimer_register_event_callbacks(s_pacer_timer, &callbacks, NULL) !=
+          ESP_OK ||
+      gptimer_enable(s_pacer_timer) != ESP_OK ||
+      gptimer_start(s_pacer_timer) != ESP_OK) {
+    avberr("station pacer: timer setup failed, forwarding unpaced");
+    return false;
+  }
+  return true;
+}
+
+/* Forward a station stream frame through its pacer. Returns false when
+ * the frame is not a reserved stream (or pacing is unavailable), so the
+ * caller forwards it as usual. */
+static bool station_pacer_forward(int egress_port, const uint8_t *frame,
+                                  uint32_t len) {
+  /* VLAN-tagged AVTP stream data with a valid stream_id. */
+  if (len < 30 || len > STATION_PACER_SLOT_BYTES || frame[16] != 0x22 ||
+      frame[17] != 0xf0 || (frame[18] & 0x80) || !(frame[19] & 0x80) ||
+      s_wifi_port_idx < 0)
+    return false;
+  uint16_t max_frame_size = 0, max_interval_frames = 0;
+  if (!mrp_talker_advertise_tspec(s_wifi_port_idx,
+                                  (const unique_id_t *)(frame + 22),
+                                  &max_frame_size, &max_interval_frames)) {
+    s_pacer_no_tspec++;
+    return false;
+  }
+  if (max_interval_frames == 0)
+    max_interval_frames = 1;
+  if (max_interval_frames > STATION_PACER_MAX_FRAMES)
+    max_interval_frames = STATION_PACER_MAX_FRAMES;
+  /* PCP 3 is SR class A (125 us), otherwise class B (250 us). */
+  int64_t interval_ns = (frame[14] >> 5) == 3 ? 125000 : 250000;
+
+  static bool init_tried, init_ok;
+  if (!init_tried) {
+    init_tried = true;
+    init_ok = station_pacer_init();
+  }
+  if (!init_ok)
+    return false;
+
+  int64_t now_us = esp_timer_get_time();
+  station_pacer_t *pacer = NULL, *spare = NULL;
+  portENTER_CRITICAL(&s_pacer_lock);
+  for (int i = 0; i < STATION_PACER_STREAMS; i++) {
+    station_pacer_t *candidate = &s_pacers[i];
+    if (candidate->valid &&
+        memcmp(candidate->stream_id, frame + 22, UNIQUE_ID_LEN) == 0) {
+      pacer = candidate;
+      break;
+    }
+    if (!spare && (!candidate->valid ||
+                   (candidate->count == 0 && candidate->in_flight == 0 &&
+                    now_us - candidate->last_seen_us > STATION_PACER_IDLE_US)))
+      spare = candidate;
+  }
+  if (!pacer && spare && spare->slot) {
+    pacer = spare;
+    pacer->valid = true;
+    memcpy(pacer->stream_id, frame + 22, UNIQUE_ID_LEN);
+    pacer->head = pacer->count = 0;
+    pacer->max_frames = 0; /* forces the send history reset below */
+  }
+  portEXIT_CRITICAL(&s_pacer_lock);
+  if (!pacer) {
+    /* Allocate a free entry's queue outside the lock, pace from the
+     * next frame on. */
+    if (spare && !spare->slot)
+      spare->slot = heap_caps_malloc(
+          (size_t)STATION_PACER_DEPTH * STATION_PACER_SLOT_BYTES,
+          MALLOC_CAP_SPIRAM);
+    s_pacer_no_entry++;
+    return false;
+  }
+
+  int64_t now_ns = now_us * 1000;
+  portENTER_CRITICAL(&s_pacer_lock);
+  pacer->egress_port = egress_port;
+  pacer->interval_ns = interval_ns;
+  if (pacer->max_frames != max_interval_frames) {
+    pacer->max_frames = (uint8_t)max_interval_frames;
+    memset(pacer->sent_ns, 0, sizeof(pacer->sent_ns));
+    pacer->sent_idx = 0;
+  }
+  pacer->last_seen_us = now_us;
+  portEXIT_CRITICAL(&s_pacer_lock);
+  for (;;) {
+    bool send_now = false, send_head = false;
+    const uint8_t *head_frame = NULL;
+    uint16_t head_len = 0;
+    portENTER_CRITICAL(&s_pacer_lock);
+    if (pacer->count == 0 && pacer->in_flight == 0 && !s_pacer_draining &&
+        now_ns >= station_pacer_next_ns(pacer)) {
+      send_now = true;
+      pacer->in_flight++;
+      station_pacer_note_send(pacer, now_ns);
+    } else if (pacer->count + pacer->in_flight < STATION_PACER_DEPTH) {
+      int tail = (pacer->head + pacer->count) % STATION_PACER_DEPTH;
+      memcpy(pacer->slot[tail], frame, len);
+      pacer->len[tail] = (uint16_t)len;
+      pacer->count++;
+      s_fwd_eth_paced++;
+      if (pacer->count > s_pacer_depth_max)
+        s_pacer_depth_max = pacer->count;
+    } else if (pacer->count > 0) {
+      /* Full: let the oldest go early, then queue this one behind the
+       * rest once its slot is free. Sending this one now would put it
+       * ahead of the whole queue. */
+      send_head = true;
+      head_frame = pacer->slot[pacer->head];
+      head_len = pacer->len[pacer->head];
+      pacer->head = (uint16_t)((pacer->head + 1) % STATION_PACER_DEPTH);
+      pacer->count--;
+      pacer->in_flight++;
+      station_pacer_note_send(pacer, now_ns);
+      s_fwd_eth_pace_overflow++;
+    } else {
+      send_now = true; /* every slot is being transmitted */
+      pacer->in_flight++;
+    }
+    portEXIT_CRITICAL(&s_pacer_lock);
+    if (send_head) {
+      avb_bridge_forward(egress_port, 0x8100, head_frame, head_len);
+      portENTER_CRITICAL(&s_pacer_lock);
+      pacer->in_flight--;
+      portEXIT_CRITICAL(&s_pacer_lock);
+      continue;
+    }
+    if (send_now) {
+      avb_bridge_forward(egress_port, 0x8100, frame, len);
+      portENTER_CRITICAL(&s_pacer_lock);
+      pacer->in_flight--;
+      portEXIT_CRITICAL(&s_pacer_lock);
+    }
+    break;
+  }
+  station_pacer_drain();
+  return true;
+}
+
+void avb_bridge_pacer_bypass_stats(uint32_t *no_tspec, uint32_t *no_entry) {
+  if (no_tspec) *no_tspec = s_pacer_no_tspec;
+  if (no_entry) *no_entry = s_pacer_no_entry;
+}
+
+void avb_bridge_forward_stats_paced(uint32_t *paced, uint32_t *overflow,
+                                    uint32_t *depth_max) {
+  if (paced) *paced = s_fwd_eth_paced;
+  if (overflow) *overflow = s_fwd_eth_pace_overflow;
+  if (depth_max) {
+    *depth_max = s_pacer_depth_max;
+    s_pacer_depth_max = 0;
   }
 }
 
@@ -632,6 +932,14 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
       free(buf);
       return ESP_OK;
     case AVB_BRIDGE_BRIDGE:
+      if (ingress_port == 1 && ethertype == 0x8100 &&
+          d.egress_port < CONFIG_ESP_AVB_NUM_PORTS &&
+          s_bridge_state->port[d.egress_port].medium ==
+              avb_port_medium_eth_hwts &&
+          station_pacer_forward(d.egress_port, buf, len)) {
+        free(buf);
+        return ESP_OK;
+      }
       avb_bridge_forward(d.egress_port, ethertype, buf, len);
       if (ethertype == 0x22f0)
         avb_bridge_wifi_control(ingress_port, d.egress_port, buf, len);

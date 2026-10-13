@@ -3705,18 +3705,28 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
 uint16_t avb_compute_tspec_max_interval_frames(avb_state_s *state,
                                                uint16_t index) {
   avtp_stream_format_s *fmt = &state->output_streams[index].stream_format;
-  if (fmt->aaf_pcm.subtype != avtp_subtype_aaf)
-    return 1;
-  uint32_t sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
-  uint32_t format_spf = (fmt->aaf_pcm.samples_per_frame_h << 4) |
-                        fmt->aaf_pcm.samples_per_frame;
-  if (sample_rate == 0 || format_spf == 0)
-    return 1;
-  uint32_t interval_us =
-      state->output_streams[index].stream_info_flags.class_b ? 250 : 125;
-  uint32_t class_samples = sample_rate * interval_us / 1000000;
-  uint32_t frames = (class_samples + format_spf - 1) / format_spf;
-  return frames ? (uint16_t)frames : 1;
+  uint32_t frames = 1;
+  if (fmt->aaf_pcm.subtype == avtp_subtype_aaf) {
+    uint32_t sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
+    uint32_t format_spf = (fmt->aaf_pcm.samples_per_frame_h << 4) |
+                          fmt->aaf_pcm.samples_per_frame;
+    if (sample_rate != 0 && format_spf != 0) {
+      uint32_t interval_us =
+          state->output_streams[index].stream_info_flags.class_b ? 250 : 125;
+      uint32_t class_samples = sample_rate * interval_us / 1000000;
+      frames = (class_samples + format_spf - 1) / format_spf;
+      if (frames == 0)
+        frames = 1;
+    }
+  }
+#ifdef CONFIG_ESP_AVB_ROLE_ENDPOINT_WIRELESS
+  /* A wireless talker's frames reach the wire in bursts after the Wi-Fi
+   * hop. Reserved at exactly its rate, a burst never drains from the
+   * bridge's pacer or a downstream shaper; reserving twice the rate
+   * lets each queue catch up. */
+  frames *= 2;
+#endif
+  return (uint16_t)frames;
 }
 
 static int mrp_send_attr(avb_state_s *state, int port, void *attr,

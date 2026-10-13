@@ -1119,6 +1119,14 @@ uint32_t avb_bridge_forward_stats_restored(void);
 /* ACMP frames also sent individually addressed to the station of the
  * entity they are for (AVB Wireless 3.5). */
 uint32_t avb_bridge_forward_stats_acmp_copies(void);
+/* Station stream frames held by the uplink pacer, those sent unpaced
+ * because a pacer queue was full, and the deepest queue since the last
+ * call. */
+void avb_bridge_forward_stats_paced(uint32_t *paced, uint32_t *overflow,
+                                    uint32_t *depth_max);
+/* Bridge: station stream frames forwarded unpaced because their Talker
+ * Advertise was not found, or no pacer entry was free. */
+void avb_bridge_pacer_bypass_stats(uint32_t *no_tspec, uint32_t *no_entry);
 
 /* AVB send functions */
 
