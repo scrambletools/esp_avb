@@ -356,6 +356,23 @@ static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_written,
                             (uint64_t)event->size, memory_order_relaxed);
+  TaskHandle_t drain = (TaskHandle_t)state->media_clock.drain_task;
+  if (drain) {
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(drain, &woken);
+    return woken == pdTRUE;
+  }
+  return false;
+}
+
+/* TX queue overflow: the DMA reached a buffer the drain had not
+ * refilled and played it again (cleared to silence). */
+static IRAM_ATTR bool i2s_tx_on_send_q_ovf_cb(i2s_chan_handle_t handle,
+                                              i2s_event_data_t *event,
+                                              void *arg) {
+  avb_state_s *state = (avb_state_s *)arg;
+  atomic_fetch_add_explicit(&state->media_clock.i2s_tx_starved_bytes,
+                            (uint64_t)event->size, memory_order_relaxed);
   return false;
 }
 
@@ -518,7 +535,8 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    * as before, tracked the talker's arrival rate whenever the DMA was
    * not backpressured, blinding the loop at thin fill.) Must be
    * registered before i2s_channel_enable. */
-  i2s_event_callbacks_t tx_cbs = {.on_sent = i2s_tx_on_sent_cb};
+  i2s_event_callbacks_t tx_cbs = {.on_sent = i2s_tx_on_sent_cb,
+                                  .on_send_q_ovf = i2s_tx_on_send_q_ovf_cb};
   ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_tx_handle,
                                                       &tx_cbs, state));
   i2s_event_callbacks_t rx_cbs = {.on_recv = i2s_rx_on_recv_cb,

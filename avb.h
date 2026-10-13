@@ -827,6 +827,12 @@ typedef struct avb_state_s {
      * them (on_recv_q_ovf). They count in i2s_bytes_captured but can
      * never be consumed, so the talker's backlog excludes them. */
     _Atomic uint64_t i2s_bytes_dropped;
+    /* Playback bytes the TX DMA sent from a buffer nobody refilled
+     * (on_send_q_ovf): silence at the DAC that consumed no ring data. */
+    _Atomic uint64_t i2s_tx_starved_bytes;
+    /* Listener drain task on single-core chips, woken by the TX DMA's
+     * on_sent interrupt; NULL when the drain runs from a timer. */
+    void *volatile drain_task;
     /* Talker capture ring, filled by the RX DMA interrupt on single-core
      * stations (avtp.c), NULL when unused. capture_write_pos belongs to
      * the interrupt; capture_head counts bytes written. */

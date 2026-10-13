@@ -1903,6 +1903,9 @@ typedef struct {
   i2s_chan_handle_t i2s_tx_handle;
   jitter_ring_t ring;                        /* SPSC byte ring, handler→drain */
   esp_timer_handle_t drain_timer;            /* periodic 1 ms drain */
+  TaskHandle_t drain_task;                   /* single-core: ISR-woken drain */
+  volatile bool drain_stop;
+  volatile bool drain_task_exited;
   uint8_t expected_stream_id[UNIQUE_ID_LEN]; /* filter: only accept this stream */
   /* Wire-format guard: until a frame's subtype and rate code match the
    * configured input format, drop instead of ingesting. Protects a
@@ -2079,6 +2082,27 @@ static bool stream_in_timeline_valid(stream_rx_ctx_t *ctx) {
     ctx->timeline_valid_cached = state->ptp_status.clock_source_valid;
   }
   return ctx->timeline_valid_cached;
+}
+
+static void stream_in_drain_cb(void *arg);
+
+/* Single-core stations: the 1 ms esp_timer drain runs below the Wi-Fi
+ * task, which also runs this station's own receive path, so during a
+ * burst the drain waited past the ~2 ms of audio queued in the TX DMA
+ * and the DAC played silence without consuming the ring (measured
+ * ~0.1 % of playback, and the ring then overflowed). This task sits
+ * above Wi-Fi and is woken by every TX DMA completion; its work is a
+ * few microseconds a millisecond. */
+static void stream_in_drain_task(void *arg) {
+  stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
+  while (!ctx->drain_stop) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+    if (ctx->drain_stop)
+      break;
+    stream_in_drain_cb(ctx);
+  }
+  ctx->drain_task_exited = true;
+  vTaskDelete(NULL);
 }
 
 static void stream_in_drain_cb(void *arg) {
@@ -3184,6 +3208,16 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   atomic_store(&ctx->ring.head, 0);
   atomic_store(&ctx->ring.tail, 0);
 
+#if portNUM_PROCESSORS == 1
+  if (xTaskCreate(stream_in_drain_task, "avb_drain", 3072, ctx,
+                  configMAX_PRIORITIES - 1, &ctx->drain_task) != pdPASS) {
+    avberr("Stream in: failed to start drain task");
+    free(ctx->ring.buf);
+    free(ctx);
+    return ERROR;
+  }
+  state->media_clock.drain_task = ctx->drain_task;
+#else
   /* Create the drain timer — fires every 1 ms, reads from ring, writes
    * to I2S TX. Runs in the esp_timer task (prio 22, core 0). Fast
    * callback (~2-10 µs typical) so it doesn't perturb anything. */
@@ -3207,6 +3241,7 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     free(ctx);
     return ERROR;
   }
+#endif
 
   s_stream_rx_ctx = ctx;
   state->stream_in_active = true;
@@ -3311,10 +3346,17 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
     stream_rx_ctx_t *ctx_to_free = s_stream_rx_ctx;
     s_stream_rx_ctx = NULL; /* publishes NULL so handler short-circuits */
 
-    /* Stop the drain timer before freeing anything it reads. */
+    /* Stop the drain before freeing anything it reads. */
     if (ctx_to_free->drain_timer) {
       esp_timer_stop(ctx_to_free->drain_timer);
       esp_timer_delete(ctx_to_free->drain_timer);
+    }
+    if (ctx_to_free->drain_task) {
+      state->media_clock.drain_task = NULL;
+      ctx_to_free->drain_stop = true;
+      xTaskNotifyGive(ctx_to_free->drain_task);
+      while (!ctx_to_free->drain_task_exited)
+        vTaskDelay(1);
     }
 
     avbinfo("Stream in stopped: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
