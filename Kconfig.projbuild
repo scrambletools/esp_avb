@@ -156,6 +156,28 @@ menu "AVB Configuration"
             Turn off to send streams over Wi-Fi exactly as received,
             which is standards-plain but ~20x slower.
 
+    config ESP_AVB_WIFI_BUNDLE
+        bool "Bundle stream frames on the Wi-Fi hop"
+        depends on ESP_AVB_WIFI_UNICAST_STREAMS
+        default n
+        help
+            Send several AVTPDUs of one stream in one Wi-Fi frame: the
+            bridge toward a station and a station talker toward the
+            bridge. Every 802.11 frame pays a fixed cost for contention,
+            preamble and acknowledgment whatever its size, so 4000 small
+            frames a second take most of the channel's airtime. The
+            receiving end splits a bundle back into the original
+            AVTPDUs, timestamps untouched; receiving is always enabled.
+
+    config ESP_AVB_WIFI_BUNDLE_FRAMES
+        int "Most AVTPDUs per Wi-Fi bundle"
+        depends on ESP_AVB_WIFI_BUNDLE
+        range 2 16
+        default 8
+        help
+            A bundle also stops at 1500 bytes, so an 8-channel 48 kHz
+            Class B stream fits 3 and a stereo one 11.
+
     config ESP_AVB_WIFI_DELIVERABLE_FRAMES
         int "Wi-Fi port deliverable frames a second"
         default 6000

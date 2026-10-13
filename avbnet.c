@@ -736,6 +736,568 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
                                          uint8_t *buf, uint32_t len,
                                          void *priv, void *info);
 
+/* Wi-Fi stream bundle: several AVTPDUs of one stream in one 802.11
+ * frame between the bridge and a station. Every 802.11 frame pays a
+ * fixed contention, preamble and acknowledgment cost, so a Class B
+ * stream's 4000 small frames a second take most of the channel. A
+ * bundle is an AVTP experimental stream PDU after the frame's own
+ * Ethernet and VLAN header:
+ *   18  subtype 0x7F   19 sv   20 seq low   21 0   22..29 stream_id
+ *   30..33 "AVBW"   34..35 bundle seq   36 count   37 flags
+ *   38.. count x { length (2), AVTPDU }
+ * The receiver rebuilds each original frame (same header) and handles
+ * it as if it had arrived alone. */
+#define WIFI_BUNDLE_SUBTYPE 0x7F
+#define WIFI_BUNDLE_AVTP 18      /* AVTP header offset in the frame */
+#define WIFI_BUNDLE_ENTRIES 38   /* first entry offset */
+#define WIFI_BUNDLE_MAX_BYTES 1500
+static const uint8_t s_wifi_bundle_tag[4] = {'A', 'V', 'B', 'W'};
+static volatile uint32_t s_wifi_bundles_rx, s_wifi_bundle_frames_rx,
+    s_wifi_split_fail;
+
+static bool wifi_bundle_is(const uint8_t *buf, uint32_t len) {
+  return len >= WIFI_BUNDLE_ENTRIES && buf[12] == 0x81 && buf[13] == 0x00 &&
+         buf[16] == 0x22 && buf[17] == 0xf0 &&
+         buf[WIFI_BUNDLE_AVTP] == WIFI_BUNDLE_SUBTYPE &&
+         memcmp(buf + 30, s_wifi_bundle_tag, 4) == 0;
+}
+
+/* Split a received bundle into its frames and hand each to the normal
+ * receive path. Consumes buf. */
+static void wifi_bundle_split(uint8_t *buf, uint32_t len, void *priv,
+                              void *info) {
+  uint32_t off = WIFI_BUNDLE_ENTRIES;
+  int count = buf[36];
+  s_wifi_bundles_rx++;
+  for (int i = 0; i < count && off + 2 <= len; i++) {
+    uint32_t avtp_len = ((uint32_t)buf[off] << 8) | buf[off + 1];
+    off += 2;
+    if (avtp_len < 12 || off + avtp_len > len)
+      break;
+    uint8_t *frame = malloc(WIFI_BUNDLE_AVTP + avtp_len);
+    if (frame == NULL) {
+      s_wifi_split_fail += count - i;
+      break;
+    }
+    memcpy(frame, buf, WIFI_BUNDLE_AVTP);
+    memcpy(frame + WIFI_BUNDLE_AVTP, buf + off, avtp_len);
+    off += avtp_len;
+    s_wifi_bundle_frames_rx++;
+    avb_unified_rx_cb_inner(NULL, frame, WIFI_BUNDLE_AVTP + avtp_len, priv,
+                            info);
+  }
+  free(buf);
+}
+
+void avb_wifi_bundle_rx_stats(uint32_t *bundles, uint32_t *frames,
+                              uint32_t *split_fail) {
+  if (bundles) *bundles = s_wifi_bundles_rx;
+  if (frames) *frames = s_wifi_bundle_frames_rx;
+  if (split_fail) *split_fail = s_wifi_split_fail;
+}
+
+/* Retransmission on the Wi-Fi hop. A receiver that sees a gap in a
+ * stream's bundle sequence holds the bundles after it, asks the sender
+ * for the missing ones with a NACK, and delivers in order once they
+ * arrive. When the hold time runs out it moves on and the listener
+ * conceals the gap as before. The NACK is an untagged AVTP experimental
+ * stream PDU:
+ *   14 subtype 0x7F   15 sv   18..25 stream_id   26..29 "AVBN"
+ *   30..31 first missing bundle seq   32 count */
+#define WIFI_NACK_AVTP 14
+#define WIFI_NACK_FRAME_LEN 60
+#define WIFI_BUNDLE_HOLD 24
+#define WIFI_BUNDLE_HOLD_US 15000
+#define WIFI_NACK_REPEAT_US 5000
+#define WIFI_RX_STREAMS 4
+static const uint8_t s_wifi_nack_tag[4] = {'A', 'V', 'B', 'N'};
+
+typedef struct {
+  uint16_t seq;
+  uint32_t len;
+  uint8_t *buf;
+} wifi_held_bundle_t;
+
+typedef struct {
+  bool valid;
+  bool seeded;
+  uint8_t stream_id[UNIQUE_ID_LEN];
+  uint8_t peer[ETH_ADDR_LEN]; /* sender of the bundles */
+  uint16_t expected;
+  uint16_t nack_next; /* first bundle seq not NACKed yet */
+  int64_t deadline_us; /* 0 while nothing is held */
+  int64_t last_nack_us;
+  int held_count;
+  wifi_held_bundle_t held[WIFI_BUNDLE_HOLD];
+} wifi_bundle_rx_t;
+
+static wifi_bundle_rx_t s_bundle_rx[WIFI_RX_STREAMS];
+static volatile uint32_t s_wifi_nacks_tx, s_wifi_recovered, s_wifi_given_up,
+    s_wifi_dup_rx;
+
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+static void wifi_tx_nack_handle(const uint8_t *nack);
+#endif
+
+static bool wifi_nack_is(const uint8_t *buf, uint32_t len) {
+  return len >= WIFI_NACK_AVTP + 19 && buf[12] == 0x22 && buf[13] == 0xf0 &&
+         buf[WIFI_NACK_AVTP] == WIFI_BUNDLE_SUBTYPE &&
+         memcmp(buf + 26, s_wifi_nack_tag, 4) == 0;
+}
+
+/* At most this many NACKs a second: under sustained loss they cannot
+ * help, and would only take more of the channel. Called from the Wi-Fi
+ * receive task only. */
+#define WIFI_NACK_MAX_PER_S 100
+
+static bool wifi_nack_rate_ok(void) {
+  static int64_t window_us;
+  static int sent_in_window;
+  int64_t now_us = esp_timer_get_time();
+  if (now_us - window_us >= 1000000) {
+    window_us = now_us;
+    sent_in_window = 0;
+  }
+  if (sent_in_window >= WIFI_NACK_MAX_PER_S)
+    return false;
+  sent_in_window++;
+  return true;
+}
+
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+/* A station sends NACKs to the bridge's Wi-Fi address with the
+ * locally administered bit set: frames for the AP's own address end in
+ * the coprocessor and never reach the bridge. */
+static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
+                           int count) {
+  if (!wifi_nack_rate_ok())
+    return;
+  wifi_ap_record_t ap;
+  if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK)
+    return;
+  uint8_t frame[WIFI_NACK_FRAME_LEN] = {0};
+  memcpy(frame, ap.bssid, ETH_ADDR_LEN);
+  frame[0] |= 0x02;
+  memcpy(frame + ETH_ADDR_LEN, s_own_mac, ETH_ADDR_LEN);
+  frame[12] = 0x22;
+  frame[13] = 0xf0;
+  frame[WIFI_NACK_AVTP] = WIFI_BUNDLE_SUBTYPE;
+  frame[WIFI_NACK_AVTP + 1] = 0x80;
+  memcpy(frame + 18, rx->stream_id, UNIQUE_ID_LEN);
+  memcpy(frame + 26, s_wifi_nack_tag, 4);
+  frame[30] = (uint8_t)(first >> 8);
+  frame[31] = (uint8_t)first;
+  frame[32] = (uint8_t)(count > 255 ? 255 : count);
+  if (avb_net_transmit_raw(NULL, frame, sizeof(frame)) == ESP_OK)
+    s_wifi_nacks_tx++;
+}
+#else
+/* The bridge NACKs a station talker's uplink bundles at the station's
+ * own address. */
+static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
+                           int count) {
+  if (!wifi_nack_rate_ok())
+    return;
+  uint8_t frame[WIFI_NACK_FRAME_LEN] = {0};
+  memcpy(frame, rx->peer, ETH_ADDR_LEN);
+  memcpy(frame + ETH_ADDR_LEN, s_own_mac, ETH_ADDR_LEN);
+  frame[12] = 0x22;
+  frame[13] = 0xf0;
+  frame[WIFI_NACK_AVTP] = WIFI_BUNDLE_SUBTYPE;
+  frame[WIFI_NACK_AVTP + 1] = 0x80;
+  memcpy(frame + 18, rx->stream_id, UNIQUE_ID_LEN);
+  memcpy(frame + 26, s_wifi_nack_tag, 4);
+  frame[30] = (uint8_t)(first >> 8);
+  frame[31] = (uint8_t)first;
+  frame[32] = (uint8_t)(count > 255 ? 255 : count);
+  if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, frame, sizeof(frame)) == ESP_OK)
+    s_wifi_nacks_tx++;
+}
+#endif
+
+/* Deliver held bundles that are next in sequence; when the hold time
+ * has run out, give up on the gap and move on. */
+static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
+                              void *priv, void *info) {
+  for (;;) {
+    int next = -1, lowest = -1;
+    for (int i = 0; i < rx->held_count; i++) {
+      if (rx->held[i].seq == rx->expected)
+        next = i;
+      if (lowest < 0 ||
+          (int16_t)(rx->held[i].seq - rx->held[lowest].seq) < 0)
+        lowest = i;
+    }
+    if (next < 0) {
+      if (rx->held_count == 0) {
+        rx->deadline_us = 0;
+        return;
+      }
+      if (now_us < rx->deadline_us)
+        return;
+      s_wifi_given_up++;
+      rx->expected = rx->held[lowest].seq;
+      rx->deadline_us = now_us + WIFI_BUNDLE_HOLD_US;
+      continue;
+    }
+    wifi_held_bundle_t h = rx->held[next];
+    rx->held[next] = rx->held[--rx->held_count];
+    if (h.buf[37] & 1)
+      s_wifi_recovered++;
+    wifi_bundle_split(h.buf, h.len, priv, info);
+    rx->expected++;
+    rx->deadline_us = rx->held_count ? now_us + WIFI_BUNDLE_HOLD_US : 0;
+  }
+}
+
+/* Receive a bundle: deliver in sequence, hold past a gap and NACK it. */
+static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
+                                void *info) {
+  uint16_t seq = ((uint16_t)buf[34] << 8) | buf[35];
+  int64_t now_us = esp_timer_get_time();
+  wifi_bundle_rx_t *rx = NULL, *spare = NULL;
+  for (int i = 0; i < WIFI_RX_STREAMS; i++) {
+    if (s_bundle_rx[i].valid &&
+        memcmp(s_bundle_rx[i].stream_id, buf + 22, UNIQUE_ID_LEN) == 0) {
+      rx = &s_bundle_rx[i];
+      break;
+    }
+    if (!spare && !s_bundle_rx[i].valid)
+      spare = &s_bundle_rx[i];
+  }
+  if (!rx && spare) {
+    rx = spare;
+    memset(rx, 0, sizeof(*rx));
+    rx->valid = true;
+    memcpy(rx->stream_id, buf + 22, UNIQUE_ID_LEN);
+  }
+  if (!rx) {
+    wifi_bundle_split(buf, len, priv, info);
+    return;
+  }
+  memcpy(rx->peer, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
+  int16_t ahead = rx->seeded ? (int16_t)(seq - rx->expected) : 0;
+  if (!rx->seeded || ahead > 64 || ahead < -64) {
+    /* First bundle, or the sender restarted: start over. */
+    for (int i = 0; i < rx->held_count; i++)
+      free(rx->held[i].buf);
+    rx->held_count = 0;
+    rx->deadline_us = 0;
+    rx->expected = seq;
+    rx->nack_next = seq;
+    rx->seeded = true;
+    ahead = 0;
+  }
+  if (ahead < 0) {
+    s_wifi_dup_rx++; /* a duplicate, or a retransmission after giving up */
+    free(buf);
+    return;
+  }
+  if (ahead == 0) {
+    if (buf[37] & 1)
+      s_wifi_recovered++;
+    wifi_bundle_split(buf, len, priv, info);
+    rx->expected++;
+    if ((int16_t)(rx->expected - rx->nack_next) > 0)
+      rx->nack_next = rx->expected;
+    wifi_bundle_drain(rx, now_us, priv, info);
+    return;
+  }
+  for (int i = 0; i < rx->held_count; i++) {
+    if (rx->held[i].seq == seq) {
+      s_wifi_dup_rx++;
+      free(buf);
+      wifi_bundle_drain(rx, now_us, priv, info);
+      return;
+    }
+  }
+  if (rx->held_count >= WIFI_BUNDLE_HOLD) {
+    /* Hold is full: give up on the gap now, then place this bundle. */
+    rx->deadline_us = now_us;
+    wifi_bundle_drain(rx, now_us, priv, info);
+    wifi_bundle_receive(buf, len, priv, info);
+    return;
+  }
+  rx->held[rx->held_count].seq = seq;
+  rx->held[rx->held_count].len = len;
+  rx->held[rx->held_count].buf = buf;
+  rx->held_count++;
+  if (rx->deadline_us == 0)
+    rx->deadline_us = now_us + WIFI_BUNDLE_HOLD_US;
+  /* NACK each newly missing bundle once; repeat only the oldest gap,
+   * and only after a NACK or its answer could have been lost. */
+  if ((int16_t)(rx->nack_next - rx->expected) < 0)
+    rx->nack_next = rx->expected;
+  if ((int16_t)(seq - rx->nack_next) > 0) {
+    rx->last_nack_us = now_us;
+    wifi_nack_send(rx, rx->nack_next, (int16_t)(seq - rx->nack_next));
+  } else if (now_us - rx->last_nack_us >= WIFI_NACK_REPEAT_US) {
+    rx->last_nack_us = now_us;
+    wifi_nack_send(rx, rx->expected, 1);
+  }
+  if ((int16_t)(seq + 1 - rx->nack_next) > 0)
+    rx->nack_next = (uint16_t)(seq + 1);
+  wifi_bundle_drain(rx, now_us, priv, info);
+}
+
+void avb_wifi_retx_stats(uint32_t *nacks, uint32_t *recovered,
+                         uint32_t *given_up, uint32_t *duplicates) {
+  if (nacks) *nacks = s_wifi_nacks_tx;
+  if (recovered) *recovered = s_wifi_recovered;
+  if (given_up) *given_up = s_wifi_given_up;
+  if (duplicates) *duplicates = s_wifi_dup_rx;
+}
+
+#if defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+/* Downlink bundler, run only from the Ethernet receive task, so it
+ * needs no lock. One slot per station and stream. */
+#define WIFI_BUNDLE_SLOTS 8
+#define WIFI_BUNDLE_MAX_AGE_US 2000
+
+/* Sent bundles kept for retransmission; only those younger than the
+ * age limit are resent, as older ones would miss their presentation
+ * time. Internal RAM: copying each bundle into PSRAM from the Ethernet
+ * receive task cost enough time there to overflow its descriptor ring. */
+#define WIFI_BUNDLE_HISTORY 24
+#define WIFI_BUNDLE_RETX_MAX_AGE_US 18000
+
+typedef struct {
+  uint16_t seq;
+  uint16_t len;
+  int64_t sent_us;
+  int64_t retx_us; /* last retransmission */
+} wifi_bundle_hist_t;
+#define WIFI_BUNDLE_RETX_SPACING_US 4000
+
+typedef struct {
+  bool valid;
+  uint8_t dst[ETH_ADDR_LEN];
+  uint8_t stream_id[UNIQUE_ID_LEN];
+  uint16_t seq;
+  uint8_t count;
+  uint32_t len;
+  int64_t first_us;
+  uint8_t *buf;
+  uint8_t *hist_buf;
+  wifi_bundle_hist_t hist[WIFI_BUNDLE_HISTORY];
+  uint8_t hist_next;
+  bool avtp_seq_valid;
+  uint8_t avtp_seq; /* last stream frame seq from Ethernet */
+} wifi_bundle_slot_t;
+
+static wifi_bundle_slot_t s_bundle_slots[WIFI_BUNDLE_SLOTS];
+static volatile uint32_t s_wifi_bundles_tx, s_wifi_bundle_frames_tx;
+static volatile uint32_t s_wifi_nacks_rx, s_wifi_retx, s_wifi_retx_stale;
+static volatile uint32_t s_wifi_ingress_lost, s_wifi_ingress_late,
+    s_wifi_bundle_bypass;
+static portMUX_TYPE s_bundle_hist_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t *s_retx_buf;
+
+static void wifi_bundle_send(wifi_bundle_slot_t *slot) {
+  if (slot->count == 0)
+    return;
+  uint8_t *out = slot->buf;
+  out[WIFI_BUNDLE_AVTP + 2] = (uint8_t)slot->seq;
+  out[34] = (uint8_t)(slot->seq >> 8);
+  out[35] = (uint8_t)slot->seq;
+  out[36] = slot->count;
+  esp_err_t result = ESP_ERR_NO_MEM;
+  if (!esp_hosted_data_tx_queue_space ||
+      esp_hosted_data_tx_queue_space() > AVB_WIFI_CONTROL_RESERVE)
+    result = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, out, slot->len);
+  if (slot->hist_buf) {
+    /* Kept even when the hosted queue refused it: after a burst, a NACK
+     * may still bring it back in time. */
+    portENTER_CRITICAL(&s_bundle_hist_lock);
+    wifi_bundle_hist_t *entry = &slot->hist[slot->hist_next];
+    memcpy(slot->hist_buf + (size_t)slot->hist_next * WIFI_BUNDLE_MAX_BYTES,
+           out, slot->len);
+    entry->seq = slot->seq;
+    entry->len = (uint16_t)slot->len;
+    entry->sent_us = esp_timer_get_time();
+    entry->retx_us = 0;
+    slot->hist_next = (uint8_t)((slot->hist_next + 1) % WIFI_BUNDLE_HISTORY);
+    portEXIT_CRITICAL(&s_bundle_hist_lock);
+  }
+  if (result == ESP_OK) {
+    s_fwd_wifi_ok += slot->count;
+    s_wifi_bundles_tx++;
+    s_wifi_bundle_frames_tx += slot->count;
+  } else if (result == ESP_ERR_NO_MEM) {
+    s_fwd_wifi_bp_drop += slot->count;
+  } else {
+    s_fwd_wifi_fail += slot->count;
+  }
+  slot->seq++;
+  slot->count = 0;
+  slot->len = 0;
+}
+
+/* Add a re-addressed stream frame to its station's bundle. Returns false
+ * when the frame is not bundled, so the caller sends it as is. */
+static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
+  if (len < WIFI_BUNDLE_AVTP + 12 || frame[16] != 0x22 || frame[17] != 0xf0 ||
+      (frame[18] & 0x80) || !(frame[19] & 0x80) ||
+      WIFI_BUNDLE_ENTRIES + 2 + (len - WIFI_BUNDLE_AVTP) >
+          WIFI_BUNDLE_MAX_BYTES)
+    return false;
+  int64_t now_us = esp_timer_get_time();
+  wifi_bundle_slot_t *slot = NULL, *spare = NULL;
+  for (int i = 0; i < WIFI_BUNDLE_SLOTS; i++) {
+    wifi_bundle_slot_t *candidate = &s_bundle_slots[i];
+    if (candidate->valid && candidate->count > 0 &&
+        now_us - candidate->first_us > WIFI_BUNDLE_MAX_AGE_US)
+      wifi_bundle_send(candidate); /* stale partial bundle */
+    if (candidate->valid && memcmp(candidate->dst, frame, ETH_ADDR_LEN) == 0 &&
+        memcmp(candidate->stream_id, frame + 22, UNIQUE_ID_LEN) == 0)
+      slot = candidate;
+    else if (!spare &&
+             (!candidate->valid || (candidate->count == 0 &&
+                                    now_us - candidate->first_us > 1000000)))
+      spare = candidate; /* unused, or idle for a second */
+  }
+  if (!slot) {
+    if (!spare) {
+      s_wifi_bundle_bypass++;
+      return false;
+    }
+    if (!spare->buf)
+      spare->buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES,
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!spare->buf)
+      spare->buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    if (!spare->buf) {
+      s_wifi_bundle_bypass++;
+      return false;
+    }
+    if (!spare->hist_buf)
+      spare->hist_buf =
+          heap_caps_calloc(WIFI_BUNDLE_HISTORY, WIFI_BUNDLE_MAX_BYTES,
+                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    memset(spare->hist, 0, sizeof(spare->hist));
+    spare->hist_next = 0;
+    spare->avtp_seq_valid = false;
+    slot = spare;
+    slot->valid = true;
+    memcpy(slot->dst, frame, ETH_ADDR_LEN);
+    memcpy(slot->stream_id, frame + 22, UNIQUE_ID_LEN);
+    slot->count = 0;
+    slot->len = 0;
+  }
+  /* Stream frames already missing on arrival from Ethernet */
+  uint8_t avtp_seq = frame[WIFI_BUNDLE_AVTP + 2];
+  if (slot->avtp_seq_valid) {
+    uint8_t skipped = (uint8_t)(avtp_seq - slot->avtp_seq - 1);
+    if (skipped >= 200)
+      s_wifi_ingress_late++;
+    else
+      s_wifi_ingress_lost += skipped;
+  }
+  slot->avtp_seq = avtp_seq;
+  slot->avtp_seq_valid = true;
+  uint32_t avtp_len = len - WIFI_BUNDLE_AVTP;
+  if (slot->count > 0 && slot->len + 2 + avtp_len > WIFI_BUNDLE_MAX_BYTES)
+    wifi_bundle_send(slot);
+  uint8_t *out = slot->buf;
+  if (slot->count == 0) {
+    memcpy(out, frame, WIFI_BUNDLE_AVTP); /* Ethernet, VLAN, ethertype */
+    memset(out + WIFI_BUNDLE_AVTP, 0, WIFI_BUNDLE_ENTRIES - WIFI_BUNDLE_AVTP);
+    out[WIFI_BUNDLE_AVTP] = WIFI_BUNDLE_SUBTYPE;
+    out[WIFI_BUNDLE_AVTP + 1] = 0x80; /* sv */
+    memcpy(out + 22, frame + 22, UNIQUE_ID_LEN);
+    memcpy(out + 30, s_wifi_bundle_tag, 4);
+    slot->len = WIFI_BUNDLE_ENTRIES;
+    slot->first_us = now_us;
+  }
+  out[slot->len] = (uint8_t)(avtp_len >> 8);
+  out[slot->len + 1] = (uint8_t)avtp_len;
+  memcpy(out + slot->len + 2, frame + WIFI_BUNDLE_AVTP, avtp_len);
+  slot->len += 2 + avtp_len;
+  slot->count++;
+  if (slot->count >= CONFIG_ESP_AVB_WIFI_BUNDLE_FRAMES)
+    wifi_bundle_send(slot);
+  return true;
+}
+
+/* A station asks for bundles it missed: resend those still young
+ * enough to arrive before their presentation time. Runs on the Wi-Fi
+ * receive task, concurrently with the sender. */
+static void wifi_nack_handle(const uint8_t *nack) {
+  s_wifi_nacks_rx++;
+  const uint8_t *station = nack + ETH_ADDR_LEN;
+  uint16_t first = ((uint16_t)nack[30] << 8) | nack[31];
+  int count = nack[32];
+  if (!s_retx_buf)
+    s_retx_buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!s_retx_buf)
+    return;
+  for (int i = 0; i < WIFI_BUNDLE_SLOTS; i++) {
+    wifi_bundle_slot_t *slot = &s_bundle_slots[i];
+    if (!slot->valid || !slot->hist_buf ||
+        memcmp(slot->dst, station, ETH_ADDR_LEN) != 0 ||
+        memcmp(slot->stream_id, nack + 18, UNIQUE_ID_LEN) != 0)
+      continue;
+    for (int n = 0; n < count; n++) {
+      uint16_t want = (uint16_t)(first + n);
+      uint16_t len = 0;
+      int64_t now_us = esp_timer_get_time();
+      bool stale = false;
+      portENTER_CRITICAL(&s_bundle_hist_lock);
+      for (int k = 0; k < WIFI_BUNDLE_HISTORY; k++) {
+        wifi_bundle_hist_t *entry = &slot->hist[k];
+        if (entry->len == 0 || entry->seq != want)
+          continue;
+        if (now_us - entry->sent_us > WIFI_BUNDLE_RETX_MAX_AGE_US) {
+          stale = true;
+          break;
+        }
+        if (entry->retx_us != 0 &&
+            now_us - entry->retx_us < WIFI_BUNDLE_RETX_SPACING_US) {
+          stale = true; /* just resent: let that copy arrive */
+          break;
+        }
+        entry->retx_us = now_us;
+        len = entry->len;
+        memcpy(s_retx_buf, slot->hist_buf + (size_t)k * WIFI_BUNDLE_MAX_BYTES,
+               len);
+        break;
+      }
+      portEXIT_CRITICAL(&s_bundle_hist_lock);
+      if (stale)
+        s_wifi_retx_stale++;
+      if (len == 0)
+        continue;
+      if (esp_hosted_data_tx_queue_space &&
+          esp_hosted_data_tx_queue_space() <= AVB_WIFI_CONTROL_RESERVE)
+        return; /* the reserve is for control frames */
+      s_retx_buf[37] |= 1; /* retransmission */
+      if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, s_retx_buf, len) == ESP_OK)
+        s_wifi_retx++;
+    }
+    return;
+  }
+}
+
+void avb_bridge_retx_stats(uint32_t *nacks, uint32_t *retx, uint32_t *stale) {
+  if (nacks) *nacks = s_wifi_nacks_rx;
+  if (retx) *retx = s_wifi_retx;
+  if (stale) *stale = s_wifi_retx_stale;
+}
+
+void avb_bridge_forward_stats_bundles(uint32_t *bundles, uint32_t *frames) {
+  if (bundles) *bundles = s_wifi_bundles_tx;
+  if (frames) *frames = s_wifi_bundle_frames_tx;
+}
+
+void avb_bridge_bundle_ingress_stats(uint32_t *lost, uint32_t *late,
+                                     uint32_t *bypass) {
+  if (lost) *lost = s_wifi_ingress_lost;
+  if (late) *late = s_wifi_ingress_late;
+  if (bypass) *bypass = s_wifi_bundle_bypass;
+}
+#endif
+
 static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
                                    uint32_t len, void *priv, void *info) {
   uint32_t c0 = esp_cpu_get_cycle_count();
@@ -765,6 +1327,21 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
     memmove(buf + 12, buf + 16, len - 16);
     len -= 4;
     ethertype = 0x88f7;
+  }
+
+  /* A bundle from the Wi-Fi hop: handle each AVTPDU in it on its own. */
+  if (eth_handle == NULL && ethertype == 0x8100 && wifi_bundle_is(buf, len)) {
+    wifi_bundle_receive(buf, len, priv, info);
+    return ESP_OK;
+  }
+  if (eth_handle == NULL && ethertype == 0x22f0 && wifi_nack_is(buf, len)) {
+#if defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+    wifi_nack_handle(buf);
+#elif defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+    wifi_tx_nack_handle(buf);
+#endif
+    free(buf);
+    return ESP_OK;
   }
 
 #ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
@@ -834,6 +1411,12 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
       /* Group addressed with no Listener declaration to resolve against:
        * forward as-is and let the counter show it. */
       s_fwd_wifi_no_mapping++;
+    }
+#endif
+#ifdef CONFIG_ESP_AVB_WIFI_BUNDLE
+    if (ucast_da != NULL && wifi_bundle_add(buf, len)) {
+      free(buf);
+      return ESP_OK;
     }
 #endif
     /* Stream frames leave the last few hosted queue entries to control
@@ -1794,11 +2377,212 @@ extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
  * handle means the wifi data-plane (c6 wireless endpoint, Phase
  * 6b.2), and we shoot the frame at the Wi-Fi STA interface via
  * esp_wifi_internal_tx. */
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+/* Uplink bundler on a station: a talker's stream frames go to the
+ * bridge several to a Wi-Fi frame. Each stream is sent from one task,
+ * so a slot has one writer; the slot table itself is claimed under a
+ * lock. */
+#define WIFI_TX_BUNDLE_SLOTS 2
+#define WIFI_TX_BUNDLE_MAX_AGE_US 2000
+#define WIFI_TX_HISTORY 16
+#define WIFI_TX_RETX_MAX_AGE_US 18000
+#define WIFI_TX_RETX_SPACING_US 4000
+typedef struct {
+  uint16_t seq;
+  uint16_t len;
+  int64_t sent_us;
+  int64_t retx_us;
+} wifi_tx_hist_t;
+typedef struct {
+  bool valid;
+  uint8_t stream_id[UNIQUE_ID_LEN];
+  uint16_t seq;
+  uint8_t count;
+  uint32_t len;
+  int64_t first_us;
+  uint8_t buf[WIFI_BUNDLE_MAX_BYTES];
+  /* Sent bundles kept for the bridge's NACKs. */
+  uint8_t *hist_buf;
+  wifi_tx_hist_t hist[WIFI_TX_HISTORY];
+  uint8_t hist_next;
+} wifi_tx_bundle_t;
+static wifi_tx_bundle_t *s_tx_bundles;
+static portMUX_TYPE s_tx_bundle_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t s_wifi_tx_bundles, s_wifi_tx_bundle_frames;
+static volatile uint32_t s_wifi_tx_nacks_rx, s_wifi_tx_retx;
+static uint8_t *s_tx_retx_buf;
+
+static esp_err_t wifi_tx_bundle_send(wifi_tx_bundle_t *bundle) {
+  if (bundle->count == 0)
+    return ESP_OK;
+  bundle->buf[WIFI_BUNDLE_AVTP + 2] = (uint8_t)bundle->seq;
+  bundle->buf[34] = (uint8_t)(bundle->seq >> 8);
+  bundle->buf[35] = (uint8_t)bundle->seq;
+  bundle->buf[36] = bundle->count;
+  esp_err_t result =
+      esp_wifi_internal_tx(0 /* WIFI_IF_STA */, bundle->buf, bundle->len);
+  if (result == ESP_OK) {
+    s_wifi_tx_bundles++;
+    s_wifi_tx_bundle_frames += bundle->count;
+  }
+  if (!bundle->hist_buf)
+    bundle->hist_buf =
+        heap_caps_malloc((size_t)WIFI_TX_HISTORY * WIFI_BUNDLE_MAX_BYTES,
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (bundle->hist_buf) {
+    portENTER_CRITICAL(&s_tx_bundle_lock);
+    wifi_tx_hist_t *entry = &bundle->hist[bundle->hist_next];
+    memcpy(bundle->hist_buf +
+               (size_t)bundle->hist_next * WIFI_BUNDLE_MAX_BYTES,
+           bundle->buf, bundle->len);
+    entry->seq = bundle->seq;
+    entry->len = (uint16_t)bundle->len;
+    entry->sent_us = esp_timer_get_time();
+    entry->retx_us = 0;
+    bundle->hist_next = (uint8_t)((bundle->hist_next + 1) % WIFI_TX_HISTORY);
+    portEXIT_CRITICAL(&s_tx_bundle_lock);
+  }
+  bundle->seq++;
+  bundle->count = 0;
+  bundle->len = 0;
+  return result;
+}
+
+/* Returns true when the frame went into a bundle. */
+static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
+                               esp_err_t *result) {
+  if (len < WIFI_BUNDLE_AVTP + 12 || frame[12] != 0x81 || frame[13] != 0x00 ||
+      frame[16] != 0x22 || frame[17] != 0xf0 || (frame[18] & 0x80) ||
+      !(frame[19] & 0x80) ||
+      WIFI_BUNDLE_ENTRIES + 2 + (len - WIFI_BUNDLE_AVTP) >
+          WIFI_BUNDLE_MAX_BYTES)
+    return false;
+  if (!s_tx_bundles) {
+    wifi_tx_bundle_t *slots =
+        heap_caps_calloc(WIFI_TX_BUNDLE_SLOTS, sizeof(*slots),
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!slots)
+      return false;
+    portENTER_CRITICAL(&s_tx_bundle_lock);
+    if (!s_tx_bundles) {
+      s_tx_bundles = slots;
+      slots = NULL;
+    }
+    portEXIT_CRITICAL(&s_tx_bundle_lock);
+    free(slots);
+  }
+  wifi_tx_bundle_t *bundle = NULL;
+  portENTER_CRITICAL(&s_tx_bundle_lock);
+  for (int i = 0; i < WIFI_TX_BUNDLE_SLOTS && !bundle; i++)
+    if (s_tx_bundles[i].valid &&
+        memcmp(s_tx_bundles[i].stream_id, frame + 22, UNIQUE_ID_LEN) == 0)
+      bundle = &s_tx_bundles[i];
+  for (int i = 0; i < WIFI_TX_BUNDLE_SLOTS && !bundle; i++)
+    if (!s_tx_bundles[i].valid) {
+      bundle = &s_tx_bundles[i];
+      bundle->valid = true;
+      memcpy(bundle->stream_id, frame + 22, UNIQUE_ID_LEN);
+    }
+  portEXIT_CRITICAL(&s_tx_bundle_lock);
+  if (!bundle)
+    return false;
+  int64_t now_us = esp_timer_get_time();
+  uint32_t avtp_len = len - WIFI_BUNDLE_AVTP;
+  *result = ESP_OK;
+  if (bundle->count > 0 &&
+      (bundle->len + 2 + avtp_len > WIFI_BUNDLE_MAX_BYTES ||
+       now_us - bundle->first_us > WIFI_TX_BUNDLE_MAX_AGE_US))
+    *result = wifi_tx_bundle_send(bundle);
+  if (bundle->count == 0) {
+    memcpy(bundle->buf, frame, WIFI_BUNDLE_AVTP);
+    memset(bundle->buf + WIFI_BUNDLE_AVTP, 0,
+           WIFI_BUNDLE_ENTRIES - WIFI_BUNDLE_AVTP);
+    bundle->buf[WIFI_BUNDLE_AVTP] = WIFI_BUNDLE_SUBTYPE;
+    bundle->buf[WIFI_BUNDLE_AVTP + 1] = 0x80;
+    memcpy(bundle->buf + 22, frame + 22, UNIQUE_ID_LEN);
+    memcpy(bundle->buf + 30, s_wifi_bundle_tag, 4);
+    bundle->len = WIFI_BUNDLE_ENTRIES;
+    bundle->first_us = now_us;
+  }
+  bundle->buf[bundle->len] = (uint8_t)(avtp_len >> 8);
+  bundle->buf[bundle->len + 1] = (uint8_t)avtp_len;
+  memcpy(bundle->buf + bundle->len + 2, frame + WIFI_BUNDLE_AVTP, avtp_len);
+  bundle->len += 2 + avtp_len;
+  bundle->count++;
+  if (bundle->count >= CONFIG_ESP_AVB_WIFI_BUNDLE_FRAMES)
+    *result = wifi_tx_bundle_send(bundle);
+  return true;
+}
+
+/* The bridge asks for uplink bundles it missed. Runs on the Wi-Fi
+ * task, concurrently with the talker that sends. */
+static void wifi_tx_nack_handle(const uint8_t *nack) {
+  s_wifi_tx_nacks_rx++;
+  if (!s_tx_bundles)
+    return;
+  uint16_t first = ((uint16_t)nack[30] << 8) | nack[31];
+  int count = nack[32];
+  if (!s_tx_retx_buf)
+    s_tx_retx_buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!s_tx_retx_buf)
+    return;
+  for (int i = 0; i < WIFI_TX_BUNDLE_SLOTS; i++) {
+    wifi_tx_bundle_t *bundle = &s_tx_bundles[i];
+    if (!bundle->valid || !bundle->hist_buf ||
+        memcmp(bundle->stream_id, nack + 18, UNIQUE_ID_LEN) != 0)
+      continue;
+    for (int n = 0; n < count; n++) {
+      uint16_t want = (uint16_t)(first + n);
+      uint16_t len = 0;
+      int64_t now_us = esp_timer_get_time();
+      portENTER_CRITICAL(&s_tx_bundle_lock);
+      for (int k = 0; k < WIFI_TX_HISTORY; k++) {
+        wifi_tx_hist_t *entry = &bundle->hist[k];
+        if (entry->len == 0 || entry->seq != want ||
+            now_us - entry->sent_us > WIFI_TX_RETX_MAX_AGE_US ||
+            (entry->retx_us != 0 &&
+             now_us - entry->retx_us < WIFI_TX_RETX_SPACING_US))
+          continue;
+        entry->retx_us = now_us;
+        len = entry->len;
+        memcpy(s_tx_retx_buf,
+               bundle->hist_buf + (size_t)k * WIFI_BUNDLE_MAX_BYTES, len);
+        break;
+      }
+      portEXIT_CRITICAL(&s_tx_bundle_lock);
+      if (len == 0)
+        continue;
+      s_tx_retx_buf[37] |= 1; /* retransmission */
+      if (esp_wifi_internal_tx(0 /* WIFI_IF_STA */, s_tx_retx_buf, len) ==
+          ESP_OK)
+        s_wifi_tx_retx++;
+    }
+    return;
+  }
+}
+
+void avb_wifi_tx_retx_stats(uint32_t *nacks, uint32_t *retx) {
+  if (nacks) *nacks = s_wifi_tx_nacks_rx;
+  if (retx) *retx = s_wifi_tx_retx;
+}
+
+void avb_wifi_tx_bundle_stats(uint32_t *bundles, uint32_t *frames) {
+  if (bundles) *bundles = s_wifi_tx_bundles;
+  if (frames) *frames = s_wifi_tx_bundle_frames;
+}
+#endif
+
 esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle,
                                const void *frame, size_t frame_len) {
   if (eth_handle != NULL) {
     return esp_eth_transmit(eth_handle, (void *)frame, frame_len);
   }
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+  esp_err_t bundled = ESP_OK;
+  if (wifi_tx_bundle_add(frame, frame_len, &bundled))
+    return bundled;
+#endif
   /* Wi-Fi path: esp_wifi_internal_tx copies the frame into one of the
    * driver's dynamic TX buffers before returning, so the caller's buffer
    * is free again at once; no copy of its own is needed. */

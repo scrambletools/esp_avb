@@ -1130,9 +1130,30 @@ uint32_t avb_bridge_forward_stats_acmp_copies(void);
  * call. */
 void avb_bridge_forward_stats_paced(uint32_t *paced, uint32_t *overflow,
                                     uint32_t *depth_max);
+/* Wi-Fi bundles sent and the stream frames they carried. */
+void avb_bridge_forward_stats_bundles(uint32_t *bundles, uint32_t *frames);
 /* Bridge: station stream frames forwarded unpaced because their Talker
  * Advertise was not found, or no pacer entry was free. */
 void avb_bridge_pacer_bypass_stats(uint32_t *no_tspec, uint32_t *no_entry);
+/* Bridge: stream frames missing or late on arrival from Ethernet, and
+ * frames sent unbundled for lack of a slot. */
+void avb_bridge_bundle_ingress_stats(uint32_t *lost, uint32_t *late,
+                                     uint32_t *bypass);
+/* Wi-Fi bundles received, the stream frames split out of them, and
+ * frames dropped when splitting failed. */
+void avb_wifi_bundle_rx_stats(uint32_t *bundles, uint32_t *frames,
+                              uint32_t *split_fail);
+/* Wi-Fi hop retransmission, receiver side: NACKs sent, bundles
+ * recovered by a retransmission, gaps given up, duplicates dropped. */
+void avb_wifi_retx_stats(uint32_t *nacks, uint32_t *recovered,
+                         uint32_t *given_up, uint32_t *duplicates);
+/* Wi-Fi hop retransmission, bridge side: NACKs received, bundles resent,
+ * requests too old to resend. */
+void avb_bridge_retx_stats(uint32_t *nacks, uint32_t *retx, uint32_t *stale);
+/* Station talker: Wi-Fi bundles sent and frames in them, the bridge's
+ * NACKs received and bundles resent. */
+void avb_wifi_tx_bundle_stats(uint32_t *bundles, uint32_t *frames);
+void avb_wifi_tx_retx_stats(uint32_t *nacks, uint32_t *retx);
 
 /* AVB send functions */
 

@@ -2799,10 +2799,16 @@ void avb_stream_in_print_diag(void) {
   uint32_t under = ctx->drain_underrun;
 
   uint32_t rx_drops = avb_net_stream_rx_drops();
+  uint32_t bundles = 0, bundle_frames = 0, split_fail = 0;
+  avb_wifi_bundle_rx_stats(&bundles, &bundle_frames, &split_fail);
+  uint32_t nacks = 0, recovered = 0, given_up = 0, duplicates = 0;
+  avb_wifi_retx_stats(&nacks, &recovered, &given_up, &duplicates);
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
           "qfill=%lu id_skip=%lu rate_mm=%lu seq_gap=%lu conceal=%lu/%lu "
-          "spl=%lu rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu)",
+          "spl=%lu rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu) "
+          "bundles=%lu/%lu nack=%lu rec=%lu gaveup=%lu dup=%lu starved=%luB "
+          "late=%lu split_fail=%lu",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -2821,7 +2827,15 @@ void avb_stream_in_print_diag(void) {
           ctx->diag_gate_mode == 1   ? "pt"
           : ctx->diag_gate_mode == 2 ? "prefill"
                                      : "none",
-          (long)ctx->diag_gate_err_ns, (unsigned long)ctx->diag_gate_fill);
+          (long)ctx->diag_gate_err_ns, (unsigned long)ctx->diag_gate_fill,
+          (unsigned long)bundles, (unsigned long)bundle_frames,
+          (unsigned long)nacks, (unsigned long)recovered,
+          (unsigned long)given_up, (unsigned long)duplicates,
+          ctx->state ? (unsigned long)atomic_load_explicit(
+                           &ctx->state->media_clock.i2s_tx_starved_bytes,
+                           memory_order_relaxed)
+                     : 0UL,
+          (unsigned long)ctx->seq_late, (unsigned long)split_fail);
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
@@ -2883,6 +2897,12 @@ void avb_stream_out_print_diag(void) {
   uint32_t resync = ctx->gptp_resync_count;
   uint32_t anchors = ctx->ts_reanchors;
   uint32_t dropped = ctx->i2s_dropped_bytes;
+  uint32_t wbundles = 0, wbundle_frames = 0, wnacks = 0, wretx = 0;
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+  avb_wifi_tx_bundle_stats(&wbundles, &wbundle_frames);
+  avb_wifi_tx_retx_stats(&wnacks, &wretx);
+#endif
+  (void)wbundle_frames;
   int64_t over_max = ctx->overrun_max_us;
   int32_t pll_min = ctx->pll_offset_min_ns;
   int32_t pll_max = ctx->pll_offset_max_ns;
@@ -2903,7 +2923,8 @@ void avb_stream_out_print_diag(void) {
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
-          "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus",
+          "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus "
+          "wbundles=%lu wnack=%lu wretx=%lu",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -2923,7 +2944,8 @@ void avb_stream_out_print_diag(void) {
           (unsigned long)(slip_pkts - last_slip_pkts),
           (unsigned long)(anchors - last_anchors),
           (unsigned long)(dropped - last_dropped),
-          (long)(ctx->ts_err_ns / 1000));
+          (long)(ctx->ts_err_ns / 1000), (unsigned long)wbundles,
+          (unsigned long)wnacks, (unsigned long)wretx);
 
   /* Secondary detail lines only emitted when samples were actually
    * collected, to keep noise-free output when the stream is idle. */
