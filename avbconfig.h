@@ -81,12 +81,14 @@
  * (DET readback moved to GPIO 21; identical map when the hat is mounted
  * via the Synthia eurorack interposer — its crossover preserves it.)
  *
- * for ESP32-C6 test board using onboard es8311 the following pins are used:
+ * for ESP32-C6 test board (ESP32-C6-Touch-AMOLED-2.06) using onboard es8311
+ * the following pins are used (DOUT drives the codec's DSDIN, DIN reads
+ * its ASDOUT):
  * MCLK: GPIO 19
  * BCLK: GPIO 20
  * WS: GPIO 22
- * DOUT: GPIO 21
- * DIN: GPIO 23
+ * DOUT: GPIO 23
+ * DIN: GPIO 21
  * I2C_SDA: GPIO 8
  * I2C_SCL: GPIO 7
  * PA: GPIO 6
