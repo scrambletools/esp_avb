@@ -351,6 +351,38 @@ static const eth_addr_t *avb_declared_dest_addr(avb_state_s *state,
   return &stream->stream_dest_addr;
 }
 
+/* An AAF output's frame interval is its SR class: 250 us of samples per
+ * frame is Class B, 125 us is Class A. Talkers advertise from boot,
+ * before any listener picks a class, and a switch may keep the first
+ * value it learned (observed: a switch still forwarding Class A 30 s
+ * after the talker re-declared Class B), so the boot declaration has
+ * to carry the class the format was built for. */
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+static void avb_output_streams_class_from_format(avb_state_s *state) {
+  for (uint16_t i = 0; i < state->num_output_streams; i++) {
+    avb_talker_stream_s *stream = &state->output_streams[i];
+    avtp_stream_format_s *fmt = &stream->stream_format;
+    if (fmt->aaf_pcm.subtype != avtp_subtype_aaf)
+      continue;
+    uint32_t sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
+    uint32_t samples_per_frame = (fmt->aaf_pcm.samples_per_frame_h << 4) |
+                                 fmt->aaf_pcm.samples_per_frame;
+    if (sample_rate == 0 || samples_per_frame == 0)
+      continue;
+    uint32_t interval_us = samples_per_frame * 1000000u / sample_rate;
+    if (interval_us != 125 && interval_us != 250)
+      continue;
+    bool class_b = interval_us == 250;
+    stream->stream_info_flags.class_b = class_b ? 1 : 0;
+    int mapping_index = class_b ? 1 : 0;
+    if (mapping_index < state->msrp_mappings_count)
+      memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
+    avbinfo("Stream out %u: class %c from its %lu us frames", i,
+            class_b ? 'B' : 'A', (unsigned long)interval_us);
+  }
+}
+#endif
+
 /* Declare (or keep declaring) an output stream's Talker Advertise. */
 static void avb_declare_output_stream(avb_state_s *state, uint16_t index) {
   avb_talker_stream_s *stream = &state->output_streams[index];
@@ -1867,6 +1899,7 @@ static void avb_task(void *task_param) {
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   /* A bridge has no stream formats, bindings or levels to keep. */
   avb_persist_load(state);
+  avb_output_streams_class_from_format(state);
 #endif
 
   /* Codec clock-plan check: arithmetic plus one log line per candidate,
