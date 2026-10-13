@@ -547,10 +547,23 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port) {
 
 /* Per-port attribute tables. Linear-scan find/insert; tables are
  * small (≤10 entries) so the O(N) cost is fine. */
-#define MSRP_TALKER_TABLE_SIZE                                                 \
-  (AVB_MAX_NUM_TALKERS + AVB_MAX_NUM_OUTPUT_STREAMS)
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+/* A bridge holds every stream on the network on each port, Advertise
+ * and Failed in separate entries, plus its stations' streams. Sized
+ * for its own streams, the wireless port filled with the wired side's
+ * failed declarations and later stations' talkers were dropped. */
+#define MSRP_TALKER_TABLE_SIZE 20
 #define MSRP_LISTENER_TABLE_SIZE                                               \
   (AVB_MAX_NUM_LISTENERS + AVB_MAX_NUM_INPUT_STREAMS)
+#else
+/* An end station registers every talker its port hears, Advertise and
+ * Failed apart, and a switch may reflect its own declarations back
+ * (15 talker attributes on one bench port). Sized for its own streams,
+ * the table filled and a stream it was told to listen to went
+ * unregistered, so it declared Asking Failed. */
+#define MSRP_TALKER_TABLE_SIZE 32
+#define MSRP_LISTENER_TABLE_SIZE 32
+#endif
 #define MSRP_DOMAIN_TABLE_SIZE 2 /* Class A and Class B */
 
 typedef struct {
@@ -667,6 +680,23 @@ static msrp_talker_entry_t *msrp_talker_find(int port,
   return NULL;
 }
 
+/* An attribute neither registered nor declared holds no state, so its
+ * entry can take a new attribute when the table is full. */
+static bool mrp_sm_idle(const mrp_sm_state_t *sm) {
+  return sm->registrar == mrp_registrar_mt &&
+         sm->applicant == mrp_applicant_vo && sm->pending_tx == mrp_tx_none;
+}
+
+/* A full table drops the declaration, so say so, at most every 10 s. */
+static void msrp_table_full_warn(const char *table, int port) {
+  static int64_t last_us;
+  int64_t now_us = esp_timer_get_time();
+  if (last_us != 0 && now_us - last_us < 10000000)
+    return;
+  last_us = now_us;
+  avbwarn("MSRP: %s table full on port %d, declaration dropped", table, port);
+}
+
 static msrp_talker_entry_t *
 msrp_talker_find_or_insert(int port, const unique_id_t *stream_id,
                            msrp_attr_type_t attr_type) {
@@ -688,6 +718,20 @@ msrp_talker_find_or_insert(int port, const unique_id_t *stream_id,
       return slot;
     }
   }
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    msrp_talker_entry_t *slot = &s_msrp_talkers[port][i];
+    if (mrp_sm_idle(&slot->sm)) {
+      memset(slot, 0, sizeof(*slot));
+      slot->valid = true;
+      slot->attr_type = attr_type;
+      memcpy(&slot->wire.talker.info.stream_id, stream_id, sizeof(unique_id_t));
+      slot->sm.applicant = mrp_applicant_vo;
+      slot->sm.registrar = mrp_registrar_mt;
+      slot->sm.pending_tx = mrp_tx_none;
+      return slot;
+    }
+  }
+  msrp_table_full_warn("talker", port);
   return NULL; /* table full */
 }
 
@@ -770,6 +814,19 @@ msrp_listener_find_or_insert(int port, const unique_id_t *stream_id) {
       return slot;
     }
   }
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
+    msrp_listener_entry_t *slot = &s_msrp_listeners[port][i];
+    if (mrp_sm_idle(&slot->sm)) {
+      memset(slot, 0, sizeof(*slot));
+      slot->valid = true;
+      memcpy(&slot->wire.stream_id, stream_id, sizeof(unique_id_t));
+      slot->sm.applicant = mrp_applicant_vo;
+      slot->sm.registrar = mrp_registrar_mt;
+      slot->sm.pending_tx = mrp_tx_none;
+      return slot;
+    }
+  }
+  msrp_table_full_warn("listener", port);
   return NULL;
 }
 
