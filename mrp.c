@@ -2250,9 +2250,17 @@ static void msrp_be_add(uint8_t *buf, int len, uint32_t add) {
 
 void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
                  size_t length, eth_addr_t *src_addr) {
-  (void)length;
   if (port < 0 || port >= CONFIG_ESP_AVB_NUM_PORTS)
     return;
+  /* Parse what was received. messages_raw[] only sizes the struct; the
+   * PDU sits in the AVB_MAX_MSG_LEN receive buffer. Bounded by the
+   * struct, every message longer than 200 bytes was dropped as
+   * malformed: a switch's Talker Advertise list for 13 talkers (342
+   * bytes) registered none of them, and listeners declared Asking
+   * Failed for streams that were there. */
+  size_t raw_len = length > 1 ? length - 1 : 0; /* after ProtocolVersion */
+  if (raw_len > AVB_MAX_MSG_LEN - 1)
+    raw_len = AVB_MAX_MSG_LEN - 1;
 
   /* An MRPDU carries a sequence of MESSAGES (attr_type + attr_len +
    * attr_list_len + AttributeList); each AttributeList carries one or
@@ -2269,13 +2277,13 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
   int offset = 0;
   uint8_t leaveall_types = 0; /* bitmask of attr types already dispatched */
 
-  while ((size_t)offset + 4 <= sizeof(msg->messages_raw)) {
+  while ((size_t)offset + 4 <= raw_len) {
     uint8_t attr_type = raw[offset];
     if (attr_type == msrp_attr_type_none)
       break;
     size_t list_len = ((size_t)raw[offset + 2] << 8) | raw[offset + 3];
     size_t list_end = (size_t)offset + 4 + list_len;
-    if (list_end > sizeof(msg->messages_raw))
+    if (list_end > raw_len)
       break; /* malformed length */
     int fv_len = msrp_first_value_len(attr_type);
     if (fv_len < 0) {
