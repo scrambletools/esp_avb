@@ -356,8 +356,12 @@ static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_written,
                             (uint64_t)event->size, memory_order_relaxed);
+  /* Wake the drain every fourth buffer: once per buffer cost a
+   * single-core station 15 % of its CPU in context switches, and the
+   * DMA holds 8 ms, so half a millisecond between refills is ample. */
+  static uint32_t s_tx_buffers;
   TaskHandle_t drain = (TaskHandle_t)state->media_clock.drain_task;
-  if (drain) {
+  if (drain && (++s_tx_buffers & 3) == 0) {
     BaseType_t woken = pdFALSE;
     vTaskNotifyGiveFromISR(drain, &woken);
     return woken == pdTRUE;
