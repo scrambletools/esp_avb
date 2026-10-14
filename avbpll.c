@@ -246,6 +246,7 @@ static struct {
   /* Stream reference bookkeeping, see stream_ref_active. */
   bool stream_ref_was_active;
   uint32_t stream_ref_epoch_seen;
+  bool stream_ref_phase; /* sensing presentation phase, see read_sample */
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -407,12 +408,12 @@ static bool read_crf_anchor(avb_state_s *state, uint64_t *ts_out,
 #define AVB_CLOCK_SOURCE_CRF_INPUT 1
 
 /* Stream-referenced listener clock. With no CRF flowing, the audio
- * stream itself is the reference: MCLK is steered so the DAC consumes
- * exactly what the stream delivers (jitter-ring fill held constant).
- * Any talker media-clock rate is followed and the local gPTP servo's
- * phase noise never enters the loop, so this path tracks continuously
- * with the CRF constants instead of converge-and-hold. Presented to
- * controllers as the INTERNAL clock source. */
+ * stream itself is the reference: MCLK is steered so playout holds its
+ * phase against the stream's presentation times (or, before playout
+ * locks on them, so the DAC consumes what the stream delivers). Any
+ * talker media-clock rate is followed, so this path tracks continuously
+ * instead of converge-and-hold. Presented to controllers as the
+ * INTERNAL clock source. */
 static bool stream_ref_active(avb_state_s *state) {
 #if CONFIG_ESP_AVB_LISTENER_STREAM_CLOCK_RECOVERY
   return state->stream_in_active &&
@@ -423,6 +424,33 @@ static bool stream_ref_active(avb_state_s *state) {
   (void)state;
   return false;
 #endif
+}
+
+/* Latest presentation-phase sample from the listener drain (see
+ * stream_phase in avb.h); false when none is fresh. */
+static bool read_stream_phase(avb_state_s *state, uint64_t *media_ns_out,
+                              uint64_t *gptp_ns_out) {
+  for (int retry = 0; retry < 4; retry++) {
+    uint32_t s1 = atomic_load_explicit(&state->media_clock.stream_phase.seq,
+                                       memory_order_acquire);
+    if (s1 == 0)
+      return false;
+    if (s1 & 1u)
+      continue;
+    uint64_t media_ns = state->media_clock.stream_phase.media_ns;
+    uint64_t gptp_ns = state->media_clock.stream_phase.gptp_ns;
+    int64_t stamp_us = state->media_clock.stream_phase.stamp_us;
+    uint32_t s2 = atomic_load_explicit(&state->media_clock.stream_phase.seq,
+                                       memory_order_acquire);
+    if (s1 == s2) {
+      if (esp_timer_get_time() - stamp_us > 1000000LL)
+        return false;
+      *media_ns_out = media_ns;
+      *gptp_ns_out = gptp_ns;
+      return true;
+    }
+  }
+  return false;
 }
 
 /* Sample the time / byte-count pair the PLL will compare against.
@@ -458,18 +486,40 @@ static bool read_sample(avb_state_s *state, uint64_t *bytes_out,
   }
 
   if (active == AVB_CLOCK_SOURCE_INTERNAL && stream_ref_active(state)) {
-    uint32_t epoch = atomic_load_explicit(&state->media_clock.stream_ref_epoch,
-                                          memory_order_relaxed);
-    if (!s_pll.stream_ref_was_active || epoch != s_pll.stream_ref_epoch_seen) {
-      ESP_LOGI(TAG, "stream reference %s (epoch %lu)",
-               s_pll.stream_ref_was_active ? "re-seeded after a playout gate"
-                                           : "selected",
+    /* While playout is locked on presentation time, sense the playout
+     * phase: it moves only with the DAC's rate against the talker's
+     * timestamps, so loss, bursts and pauses never read as rate error
+     * or force a re-seed. Delivered bytes otherwise. */
+    uint64_t phase_media_ns = 0, phase_gptp_ns = 0;
+    bool use_phase = read_stream_phase(state, &phase_media_ns, &phase_gptp_ns);
+    uint32_t epoch =
+        use_phase ? atomic_load_explicit(&state->media_clock.stream_phase_epoch,
+                                         memory_order_relaxed)
+                  : atomic_load_explicit(&state->media_clock.stream_ref_epoch,
+                                         memory_order_relaxed);
+    if (!s_pll.stream_ref_was_active || epoch != s_pll.stream_ref_epoch_seen ||
+        use_phase != s_pll.stream_ref_phase) {
+      ESP_LOGI(TAG, "stream reference %s on %s (epoch %lu)",
+               s_pll.stream_ref_was_active ? "re-seeded" : "selected",
+               use_phase ? "presentation phase" : "delivered bytes",
                (unsigned long)epoch);
       s_pll.stream_ref_was_active = true;
       s_pll.stream_ref_epoch_seen = epoch;
+      s_pll.stream_ref_phase = use_phase;
       s_pll.integrator_ppm_q16 = 0;
       s_pll.valid = false;
       return false; /* re-seed on the new reference next tick */
+    }
+    if (use_phase) {
+      uint32_t byterate = state->media_clock.listener_byterate;
+      if (byterate == 0)
+        byterate = AVB_PLL_FALLBACK_BYTERATE;
+      /* The phase-corrected media time as DAC bytes at the nominal rate,
+       * so the loop reads zero error exactly when the phase holds. */
+      *bytes_out = (phase_media_ns / 1000000000ULL) * byterate +
+                   ((phase_media_ns % 1000000000ULL) * byterate) / 1000000000ULL;
+      *gptp_ns_out = phase_gptp_ns;
+      return true;
     }
     /* Take the drain-published pair (same phase of the I2S queue for
      * both counters); a stale pair means the drain has stopped. */

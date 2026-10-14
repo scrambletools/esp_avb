@@ -1994,6 +1994,15 @@ typedef struct {
   uint64_t phase_lock_played;
   int64_t phase_check_us;
   uint32_t phase_clamps; /* dac position clamped to the ring tail */
+  /* Phase steps taken out of the media-clock reference (see
+   * stream_phase in avb.h): the previous sample and the counters whose
+   * change explains a step. */
+  bool phase_have_prev;
+  int32_t phase_prev_ns;
+  int64_t phase_steps_ns;
+  uint64_t phase_prev_starved;
+  uint32_t phase_prev_fills;
+  uint32_t phase_prev_clamps;
   /* Phase statistics per stats window: playout time less presentation
    * time (plus the extra latency), and the audio buffered ahead of the
    * DAC. The printer sets phase_reset to start a new window. */
@@ -2207,11 +2216,58 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
                                              memory_order_relaxed);
   ctx->phase_lock_played = stream_in_played(ctx);
   ctx->phase_check_us = 0;
+  ctx->phase_have_prev = false;
   ctx->phase_valid = true;
+  atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
+                            memory_order_relaxed);
+}
+
+/* A phase step this large between two samples 20 ms apart is never
+ * clock drift (150 ppm moves 3 µs); smaller ones count as drift unless
+ * an event explains them. */
+#define STREAM_PHASE_STEP_NS 500000
+
+/* Publish the playout phase to the media-clock loop with its steps
+ * taken out, see stream_phase in avb.h. */
+static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
+  avb_state_s *state = ctx->state;
+  uint64_t starved = atomic_load_explicit(
+      &state->media_clock.i2s_tx_starved_bytes, memory_order_relaxed);
+  if (ctx->phase_have_prev) {
+    int32_t step_ns = phase_ns - ctx->phase_prev_ns;
+    bool explained = starved != ctx->phase_prev_starved ||
+                     ctx->loss_fill_events != ctx->phase_prev_fills ||
+                     ctx->phase_clamps != ctx->phase_prev_clamps;
+    if (explained || step_ns > STREAM_PHASE_STEP_NS ||
+        step_ns < -STREAM_PHASE_STEP_NS)
+      ctx->phase_steps_ns += step_ns;
+  }
+  ctx->phase_have_prev = true;
+  ctx->phase_prev_ns = phase_ns;
+  ctx->phase_prev_starved = starved;
+  ctx->phase_prev_fills = ctx->loss_fill_events;
+  ctx->phase_prev_clamps = ctx->phase_clamps;
+
+  struct timespec now_ts;
+  if (ptpd_now(&now_ts) != 0)
+    return;
+  uint64_t gptp_ns =
+      (uint64_t)now_ts.tv_sec * 1000000000ULL + (uint64_t)now_ts.tv_nsec;
+  int64_t continuous_ns = (int64_t)phase_ns - ctx->phase_steps_ns;
+  uint32_t seq = atomic_load_explicit(&state->media_clock.stream_phase.seq,
+                                      memory_order_relaxed);
+  atomic_store_explicit(&state->media_clock.stream_phase.seq, seq + 1,
+                        memory_order_release);
+  state->media_clock.stream_phase.media_ns =
+      (uint64_t)((int64_t)gptp_ns - continuous_ns);
+  state->media_clock.stream_phase.gptp_ns = gptp_ns;
+  state->media_clock.stream_phase.stamp_us = esp_timer_get_time();
+  atomic_store_explicit(&state->media_clock.stream_phase.seq, seq + 2,
+                        memory_order_release);
 }
 
 /* Every STREAM_PHASE_INTERVAL_US while playout is locked: sample the
- * phase for the statistics. */
+ * phase for the statistics and the media-clock loop. */
 static void stream_in_phase_tick(stream_rx_ctx_t *ctx) {
   int64_t now_us = esp_timer_get_time();
   if (now_us - ctx->phase_check_us < STREAM_PHASE_INTERVAL_US)
@@ -2220,6 +2276,8 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx) {
   int32_t phase_ns, ahead_us;
   if (!stream_in_phase(ctx, &phase_ns, &ahead_us))
     return;
+  if (ctx->diag_gate_mode == 1)
+    stream_in_phase_publish(ctx, phase_ns);
   int32_t phase_us = phase_ns / 1000;
   if (ctx->phase_reset || ctx->phase_samples == 0) {
     ctx->phase_reset = false;

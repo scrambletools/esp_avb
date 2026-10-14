@@ -860,6 +860,21 @@ typedef struct avb_state_s {
       uint64_t credited;
       int64_t stamp_us;
     } stream_anchor;
+    /* Presentation-phase reference (avb_pll), published by the drain
+     * while playout is locked on presentation time: media_ns is the
+     * gPTP time elapsed since the lock less the change in playout
+     * phase (playout time against presentation time), with the phase
+     * steps of starvation, late-audio skips and re-alignments taken
+     * out, so it advances exactly at the talker's media rate when the
+     * DAC does. Arrival jitter never enters it. The epoch bumps at
+     * every lock. Seqlock as crf_anchor. */
+    struct {
+      _Atomic uint32_t seq;
+      uint64_t media_ns;
+      uint64_t gptp_ns;
+      int64_t stamp_us;
+    } stream_phase;
+    _Atomic uint32_t stream_phase_epoch;
     /* Bytes per I2S TX DMA buffer; the drain writes whole buffers so a
      * starved DMA's silence is always counted. */
     uint32_t i2s_tx_dma_buf_bytes;
