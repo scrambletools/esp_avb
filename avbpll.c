@@ -407,19 +407,71 @@ static bool read_crf_anchor(avb_state_s *state, uint64_t *ts_out,
 #define AVB_CLOCK_SOURCE_INTERNAL 0
 #define AVB_CLOCK_SOURCE_CRF_INPUT 1
 
+/* Entities must not chase each other's media clocks: when a talker
+ * follows a stream from a talker that follows it back, directly or
+ * around a ring, the loops steer each other and the clocks walk off
+ * together with nothing anchoring them (observed: a wired board and a
+ * station drifting past 100 ppm in 30 min, each talker's samples
+ * running 150 ppm against its own timestamps). So a wired entity that
+ * is streaming itself keeps its gPTP-locked internal clock and only a
+ * pure listener follows. A station always follows, its own clock being
+ * the worse reference, unless its input talker is an ACMP-identified
+ * listener of its stream with a larger entity ID, so that of two
+ * stations streaming to each other exactly one follows. */
+static bool stream_ref_hold(avb_state_s *state) {
+  uint16_t crf_in = avb_get_crf_input_index(state);
+  uint16_t crf_out = avb_get_crf_output_index(state);
+  if (state->port[0].medium != avb_port_medium_wifi_ftm) {
+    for (size_t out = 0; out < state->num_output_streams; out++) {
+      if (out != crf_out && state->output_streams[out].streaming)
+        return true;
+    }
+    return false;
+  }
+  for (size_t in = 0; in < state->num_input_streams; in++) {
+    const avb_listener_stream_s *input = &state->input_streams[in];
+    if (in == crf_in || !input->connected)
+      continue;
+    for (size_t out = 0; out < state->num_output_streams; out++) {
+      if (out == crf_out)
+        continue;
+      const avb_talker_stream_s *output = &state->output_streams[out];
+      for (int i = 0; i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+        if (output->connected_listeners[i].acmp_connected &&
+            memcmp(output->connected_listeners[i].identity.id,
+                   input->talker_id, UNIQUE_ID_LEN) == 0)
+          return memcmp(state->own_entity.summary.entity_id,
+                        input->talker_id, UNIQUE_ID_LEN) < 0;
+      }
+    }
+  }
+  return false;
+}
+
 /* Stream-referenced listener clock. With no CRF flowing, the audio
  * stream itself is the reference: MCLK is steered so playout holds its
  * phase against the stream's presentation times (or, before playout
  * locks on them, so the DAC consumes what the stream delivers). Any
  * talker media-clock rate is followed, so this path tracks continuously
  * instead of converge-and-hold. Presented to controllers as the
- * INTERNAL clock source. */
+ * INTERNAL clock source. Not while stream_ref_hold says this entity
+ * must keep its own clock. */
 static bool stream_ref_active(avb_state_s *state) {
 #if CONFIG_ESP_AVB_LISTENER_STREAM_CLOCK_RECOVERY
-  return state->stream_in_active &&
-         state->media_clock.active_clock_source_index ==
-             AVB_CLOCK_SOURCE_INTERNAL &&
-         !avb_crf_stream_valid();
+  bool candidate = state->stream_in_active &&
+                   state->media_clock.active_clock_source_index ==
+                       AVB_CLOCK_SOURCE_INTERNAL &&
+                   !avb_crf_stream_valid();
+  bool hold = candidate && stream_ref_hold(state);
+  static bool s_hold_logged;
+  if (hold != s_hold_logged) {
+    s_hold_logged = hold;
+    ESP_LOGI(TAG, "%s",
+             hold ? "this entity streams too, holding the internal clock "
+                    "instead of following its input stream"
+                  : "stream reference no longer held");
+  }
+  return candidate && !hold;
 #else
   (void)state;
   return false;
