@@ -2250,8 +2250,14 @@ static void stream_in_drain_cb(void *arg) {
     return;
   }
 
+  /* Whole DMA buffers only: the driver counts a starved DMA's silence
+   * only while no partly written buffer is pending. A remainder under
+   * one buffer waits for the next packet. */
+  uint32_t unit = ctx->state && ctx->state->media_clock.i2s_tx_dma_buf_bytes
+                      ? ctx->state->media_clock.i2s_tx_dma_buf_bytes
+                      : 8;
   uint32_t avail = ring_readable(&ctx->ring);
-  if (avail == 0) {
+  if (avail < unit) {
     /* Empty ring is NORMAL at thin (presentation-time) fill: the
      * standing buffer is only the talker's transit margin (~2 ms), so
      * a 1 ms drain tick routinely drains to zero between packet
@@ -2268,6 +2274,12 @@ static void stream_in_drain_cb(void *arg) {
     if (since_pkt_us > 65000) {
       ctx->drain_underrun++;
       ctx->drain_locked = false;
+      /* Drop the remainder so the next packet finds the ring empty and
+       * can anchor the gate. */
+      atomic_store_explicit(
+          &ctx->ring.tail,
+          atomic_load_explicit(&ctx->ring.head, memory_order_acquire),
+          memory_order_release);
       atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
       if (ctx->ever_locked) {
         ctx->media_unlocked_count++;
@@ -2286,8 +2298,7 @@ static void stream_in_drain_cb(void *arg) {
   uint32_t to_read = avail;
   if (to_read > DRAIN_MAX_BYTES)
     to_read = DRAIN_MAX_BYTES;
-  /* Align to frame boundary (8 bytes = stereo 24-in-32 sample pair) */
-  to_read = (to_read / 8) * 8;
+  to_read -= to_read % unit;
   if (to_read == 0)
     return;
 
