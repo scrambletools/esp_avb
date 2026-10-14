@@ -178,6 +178,19 @@ menu "AVB Configuration"
             A bundle also stops at 1500 bytes, so an 8-channel 48 kHz
             Class B stream fits 3 and a stereo one 11.
 
+    config ESP_AVB_WIFI_BUNDLE_COMPACT
+        bool "Compact bundles"
+        depends on ESP_AVB_WIFI_BUNDLE
+        default y
+        help
+            Send the AVTP header once per bundle and per frame only its
+            sequence number and timestamp, and carry 32-bit AAF samples
+            whose low octet is zero as 24 bits. Lossless: the receiver
+            rebuilds the original AVTPDUs. An 8-channel stream then fits
+            4 frames to a bundle instead of 3, and a stereo bundle of 8
+            frames shrinks by about a third. Every receiver must run
+            firmware that understands compact bundles.
+
     config ESP_AVB_WIFI_DELIVERABLE_FRAMES
         int "Wi-Fi port deliverable frames a second"
         default 6000

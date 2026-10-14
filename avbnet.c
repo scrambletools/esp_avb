@@ -751,6 +751,8 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
 #define WIFI_BUNDLE_AVTP 18      /* AVTP header offset in the frame */
 #define WIFI_BUNDLE_ENTRIES 38   /* first entry offset */
 #define WIFI_BUNDLE_MAX_BYTES 1500
+#define WIFI_BUNDLE_FLAG_RETX 0x01
+#define WIFI_BUNDLE_FLAG_COMPACT 0x02
 static const uint8_t s_wifi_bundle_tag[4] = {'A', 'V', 'B', 'W'};
 static volatile uint32_t s_wifi_bundles_rx, s_wifi_bundle_frames_rx,
     s_wifi_split_fail;
@@ -762,6 +764,126 @@ static bool wifi_bundle_is(const uint8_t *buf, uint32_t len) {
          memcmp(buf + 30, s_wifi_bundle_tag, 4) == 0;
 }
 
+/* Compact bundle body: the first frame's 24-octet stream header as a
+ * template, then per frame
+ *   flags (1)   seq (1)   avtp_timestamp (4)   payload length (2)
+ *   [own 24-octet header, flag 2]   payload
+ * with 32-bit AAF samples carried as their upper 24 bits when every low
+ * octet is zero (flag 1). */
+#define WIFI_COMPACT_HEADER 24
+#define WIFI_COMPACT_FIXED 8
+#define WIFI_COMPACT_PACKED 0x01
+#define WIFI_COMPACT_OWN_HEADER 0x02
+
+/* Flags for one AVTPDU against the bundle's template header. */
+static __attribute__((unused)) uint8_t
+wifi_compact_flags(const uint8_t *tmpl, const uint8_t *avtp, uint32_t avtp_len) {
+  uint8_t flags = 0;
+  if (avtp_len < WIFI_COMPACT_HEADER || tmpl[0] != avtp[0] ||
+      tmpl[1] != avtp[1] || memcmp(tmpl + 3, avtp + 3, 9) != 0 ||
+      memcmp(tmpl + 16, avtp + 16, WIFI_COMPACT_HEADER - 16) != 0)
+    flags |= WIFI_COMPACT_OWN_HEADER;
+  uint32_t payload_len = avtp_len - WIFI_COMPACT_HEADER;
+  /* AAF, INT_32BIT samples */
+  if (avtp_len >= WIFI_COMPACT_HEADER && avtp[0] == 0x02 &&
+      avtp[16] == 0x02 && payload_len % 4 == 0) {
+    const uint8_t *sample = avtp + WIFI_COMPACT_HEADER;
+    uint8_t low = 0;
+    for (uint32_t i = 3; i < payload_len; i += 4)
+      low |= sample[i];
+    if (low == 0)
+      flags |= WIFI_COMPACT_PACKED;
+  }
+  return flags;
+}
+
+static uint32_t wifi_compact_entry_len(uint8_t flags, uint32_t avtp_len) {
+  uint32_t payload_len = avtp_len - WIFI_COMPACT_HEADER;
+  return WIFI_COMPACT_FIXED +
+         ((flags & WIFI_COMPACT_OWN_HEADER) ? WIFI_COMPACT_HEADER : 0) +
+         ((flags & WIFI_COMPACT_PACKED) ? payload_len / 4 * 3 : payload_len);
+}
+
+/* Write one entry; returns its length. */
+static __attribute__((unused)) uint32_t
+wifi_compact_put(uint8_t *out, uint8_t flags, const uint8_t *avtp,
+                 uint32_t avtp_len) {
+  uint32_t payload_len = avtp_len - WIFI_COMPACT_HEADER;
+  uint8_t *pos = out;
+  *pos++ = flags;
+  *pos++ = avtp[2];
+  memcpy(pos, avtp + 12, 4);
+  pos += 4;
+  *pos++ = (uint8_t)(payload_len >> 8);
+  *pos++ = (uint8_t)payload_len;
+  if (flags & WIFI_COMPACT_OWN_HEADER) {
+    memcpy(pos, avtp, WIFI_COMPACT_HEADER);
+    pos += WIFI_COMPACT_HEADER;
+  }
+  const uint8_t *payload = avtp + WIFI_COMPACT_HEADER;
+  if (flags & WIFI_COMPACT_PACKED) {
+    for (uint32_t i = 0; i < payload_len; i += 4) {
+      *pos++ = payload[i];
+      *pos++ = payload[i + 1];
+      *pos++ = payload[i + 2];
+    }
+  } else {
+    memcpy(pos, payload, payload_len);
+    pos += payload_len;
+  }
+  return (uint32_t)(pos - out);
+}
+
+/* Split a compact bundle; same contract as wifi_bundle_split. */
+static void wifi_bundle_split_compact(uint8_t *buf, uint32_t len,
+                                      void *priv, void *info) {
+  int count = buf[36];
+  const uint8_t *tmpl = buf + WIFI_BUNDLE_ENTRIES;
+  uint32_t off = WIFI_BUNDLE_ENTRIES + WIFI_COMPACT_HEADER;
+  for (int i = 0; i < count && off + WIFI_COMPACT_FIXED <= len; i++) {
+    const uint8_t *entry = buf + off;
+    uint8_t flags = entry[0];
+    uint32_t payload_len = ((uint32_t)entry[6] << 8) | entry[7];
+    uint32_t entry_len =
+        wifi_compact_entry_len(flags, WIFI_COMPACT_HEADER + payload_len);
+    if (off + entry_len > len ||
+        ((flags & WIFI_COMPACT_PACKED) && payload_len % 4 != 0))
+      break;
+    uint32_t frame_len = WIFI_BUNDLE_AVTP + WIFI_COMPACT_HEADER + payload_len;
+    uint8_t *frame = malloc(frame_len);
+    if (frame == NULL) {
+      s_wifi_split_fail += count - i;
+      break;
+    }
+    const uint8_t *src = entry + WIFI_COMPACT_FIXED;
+    uint8_t *header = frame + WIFI_BUNDLE_AVTP;
+    memcpy(frame, buf, WIFI_BUNDLE_AVTP);
+    if (flags & WIFI_COMPACT_OWN_HEADER) {
+      memcpy(header, src, WIFI_COMPACT_HEADER);
+      src += WIFI_COMPACT_HEADER;
+    } else {
+      memcpy(header, tmpl, WIFI_COMPACT_HEADER);
+    }
+    header[2] = entry[1];
+    memcpy(header + 12, entry + 2, 4);
+    uint8_t *payload = header + WIFI_COMPACT_HEADER;
+    if (flags & WIFI_COMPACT_PACKED) {
+      for (uint32_t k = 0; k < payload_len; k += 4) {
+        payload[k] = *src++;
+        payload[k + 1] = *src++;
+        payload[k + 2] = *src++;
+        payload[k + 3] = 0;
+      }
+    } else {
+      memcpy(payload, src, payload_len);
+    }
+    off += entry_len;
+    s_wifi_bundle_frames_rx++;
+    avb_unified_rx_cb_inner(NULL, frame, frame_len, priv, info);
+  }
+  free(buf);
+}
+
 /* Split a received bundle into its frames and hand each to the normal
  * receive path. Consumes buf. */
 static void wifi_bundle_split(uint8_t *buf, uint32_t len, void *priv,
@@ -769,6 +891,11 @@ static void wifi_bundle_split(uint8_t *buf, uint32_t len, void *priv,
   uint32_t off = WIFI_BUNDLE_ENTRIES;
   int count = buf[36];
   s_wifi_bundles_rx++;
+  if ((buf[37] & WIFI_BUNDLE_FLAG_COMPACT) &&
+      len >= WIFI_BUNDLE_ENTRIES + WIFI_COMPACT_HEADER) {
+    wifi_bundle_split_compact(buf, len, priv, info);
+    return;
+  }
   for (int i = 0; i < count && off + 2 <= len; i++) {
     uint32_t avtp_len = ((uint32_t)buf[off] << 8) | buf[off + 1];
     off += 2;
@@ -787,6 +914,57 @@ static void wifi_bundle_split(uint8_t *buf, uint32_t len, void *priv,
                             info);
   }
   free(buf);
+}
+
+#ifdef CONFIG_ESP_AVB_WIFI_BUNDLE_COMPACT
+#define WIFI_BUNDLE_MIN_AVTP WIFI_COMPACT_HEADER
+#define WIFI_BUNDLE_FIRST_COST(avtp_len)                                       \
+  (WIFI_BUNDLE_ENTRIES + WIFI_COMPACT_HEADER + WIFI_COMPACT_FIXED + (avtp_len))
+#define WIFI_BUNDLE_ENTRY_COST(buf, count, avtp, avtp_len)                     \
+  ((count) ? wifi_compact_entry_len(                                           \
+                 wifi_compact_flags((buf) + WIFI_BUNDLE_ENTRIES, avtp,         \
+                                    avtp_len),                                 \
+                 avtp_len)                                                     \
+           : 0)
+#else
+#define WIFI_BUNDLE_MIN_AVTP 12
+#define WIFI_BUNDLE_FIRST_COST(avtp_len) (WIFI_BUNDLE_ENTRIES + 2 + (avtp_len))
+#define WIFI_BUNDLE_ENTRY_COST(buf, count, avtp, avtp_len) (2 + (avtp_len))
+#endif
+
+/* Start a bundle in out for the stream of frame; returns its length. */
+static __attribute__((unused)) uint32_t wifi_bundle_begin(uint8_t *out,
+                                                          const uint8_t *frame) {
+  memcpy(out, frame, WIFI_BUNDLE_AVTP); /* Ethernet, VLAN, ethertype */
+  memset(out + WIFI_BUNDLE_AVTP, 0, WIFI_BUNDLE_ENTRIES - WIFI_BUNDLE_AVTP);
+  out[WIFI_BUNDLE_AVTP] = WIFI_BUNDLE_SUBTYPE;
+  out[WIFI_BUNDLE_AVTP + 1] = 0x80; /* sv */
+  memcpy(out + 22, frame + 22, UNIQUE_ID_LEN);
+  memcpy(out + 30, s_wifi_bundle_tag, 4);
+#ifdef CONFIG_ESP_AVB_WIFI_BUNDLE_COMPACT
+  out[37] = WIFI_BUNDLE_FLAG_COMPACT;
+  memcpy(out + WIFI_BUNDLE_ENTRIES, frame + WIFI_BUNDLE_AVTP,
+         WIFI_COMPACT_HEADER);
+  return WIFI_BUNDLE_ENTRIES + WIFI_COMPACT_HEADER;
+#else
+  return WIFI_BUNDLE_ENTRIES;
+#endif
+}
+
+/* Append one AVTPDU at offset len of the bundle; returns the octets added. */
+static __attribute__((unused)) uint32_t wifi_bundle_put(uint8_t *out,
+                                                        uint32_t len,
+                                                        const uint8_t *avtp,
+                                                        uint32_t avtp_len) {
+#ifdef CONFIG_ESP_AVB_WIFI_BUNDLE_COMPACT
+  uint8_t flags = wifi_compact_flags(out + WIFI_BUNDLE_ENTRIES, avtp, avtp_len);
+  return wifi_compact_put(out + len, flags, avtp, avtp_len);
+#else
+  out[len] = (uint8_t)(avtp_len >> 8);
+  out[len + 1] = (uint8_t)avtp_len;
+  memcpy(out + len + 2, avtp, avtp_len);
+  return 2 + avtp_len;
+#endif
 }
 
 void avb_wifi_bundle_rx_stats(uint32_t *bundles, uint32_t *frames,
@@ -942,7 +1120,7 @@ static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
     }
     wifi_held_bundle_t h = rx->held[next];
     rx->held[next] = rx->held[--rx->held_count];
-    if (h.buf[37] & 1)
+    if (h.buf[37] & WIFI_BUNDLE_FLAG_RETX)
       s_wifi_recovered++;
     wifi_bundle_split(h.buf, h.len, priv, info);
     rx->expected++;
@@ -994,7 +1172,7 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
     return;
   }
   if (ahead == 0) {
-    if (buf[37] & 1)
+    if (buf[37] & WIFI_BUNDLE_FLAG_RETX)
       s_wifi_recovered++;
     wifi_bundle_split(buf, len, priv, info);
     rx->expected++;
@@ -1136,10 +1314,9 @@ static void wifi_bundle_send(wifi_bundle_slot_t *slot) {
 /* Add a re-addressed stream frame to its station's bundle. Returns false
  * when the frame is not bundled, so the caller sends it as is. */
 static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
-  if (len < WIFI_BUNDLE_AVTP + 12 || frame[16] != 0x22 || frame[17] != 0xf0 ||
-      (frame[18] & 0x80) || !(frame[19] & 0x80) ||
-      WIFI_BUNDLE_ENTRIES + 2 + (len - WIFI_BUNDLE_AVTP) >
-          WIFI_BUNDLE_MAX_BYTES)
+  if (len < WIFI_BUNDLE_AVTP + WIFI_BUNDLE_MIN_AVTP || frame[16] != 0x22 ||
+      frame[17] != 0xf0 || (frame[18] & 0x80) || !(frame[19] & 0x80) ||
+      WIFI_BUNDLE_FIRST_COST(len - WIFI_BUNDLE_AVTP) > WIFI_BUNDLE_MAX_BYTES)
     return false;
   int64_t now_us = esp_timer_get_time();
   wifi_bundle_slot_t *slot = NULL, *spare = NULL;
@@ -1196,23 +1373,16 @@ static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
   slot->avtp_seq = avtp_seq;
   slot->avtp_seq_valid = true;
   uint32_t avtp_len = len - WIFI_BUNDLE_AVTP;
-  if (slot->count > 0 && slot->len + 2 + avtp_len > WIFI_BUNDLE_MAX_BYTES)
+  const uint8_t *avtp = frame + WIFI_BUNDLE_AVTP;
+  uint32_t entry_len = WIFI_BUNDLE_ENTRY_COST(slot->buf, slot->count, avtp,
+                                              avtp_len);
+  if (slot->count > 0 && slot->len + entry_len > WIFI_BUNDLE_MAX_BYTES)
     wifi_bundle_send(slot);
-  uint8_t *out = slot->buf;
   if (slot->count == 0) {
-    memcpy(out, frame, WIFI_BUNDLE_AVTP); /* Ethernet, VLAN, ethertype */
-    memset(out + WIFI_BUNDLE_AVTP, 0, WIFI_BUNDLE_ENTRIES - WIFI_BUNDLE_AVTP);
-    out[WIFI_BUNDLE_AVTP] = WIFI_BUNDLE_SUBTYPE;
-    out[WIFI_BUNDLE_AVTP + 1] = 0x80; /* sv */
-    memcpy(out + 22, frame + 22, UNIQUE_ID_LEN);
-    memcpy(out + 30, s_wifi_bundle_tag, 4);
-    slot->len = WIFI_BUNDLE_ENTRIES;
+    slot->len = wifi_bundle_begin(slot->buf, frame);
     slot->first_us = now_us;
   }
-  out[slot->len] = (uint8_t)(avtp_len >> 8);
-  out[slot->len + 1] = (uint8_t)avtp_len;
-  memcpy(out + slot->len + 2, frame + WIFI_BUNDLE_AVTP, avtp_len);
-  slot->len += 2 + avtp_len;
+  slot->len += wifi_bundle_put(slot->buf, slot->len, avtp, avtp_len);
   slot->count++;
   if (slot->count >= CONFIG_ESP_AVB_WIFI_BUNDLE_FRAMES)
     wifi_bundle_send(slot);
@@ -1271,7 +1441,7 @@ static void wifi_nack_handle(const uint8_t *nack) {
       if (esp_hosted_data_tx_queue_space &&
           esp_hosted_data_tx_queue_space() <= AVB_WIFI_CONTROL_RESERVE)
         return; /* the reserve is for control frames */
-      s_retx_buf[37] |= 1; /* retransmission */
+      s_retx_buf[37] |= WIFI_BUNDLE_FLAG_RETX;
       if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, s_retx_buf, len) == ESP_OK)
         s_wifi_retx++;
     }
@@ -2451,11 +2621,10 @@ static esp_err_t wifi_tx_bundle_send(wifi_tx_bundle_t *bundle) {
 /* Returns true when the frame went into a bundle. */
 static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
                                esp_err_t *result) {
-  if (len < WIFI_BUNDLE_AVTP + 12 || frame[12] != 0x81 || frame[13] != 0x00 ||
-      frame[16] != 0x22 || frame[17] != 0xf0 || (frame[18] & 0x80) ||
-      !(frame[19] & 0x80) ||
-      WIFI_BUNDLE_ENTRIES + 2 + (len - WIFI_BUNDLE_AVTP) >
-          WIFI_BUNDLE_MAX_BYTES)
+  if (len < WIFI_BUNDLE_AVTP + WIFI_BUNDLE_MIN_AVTP || frame[12] != 0x81 ||
+      frame[13] != 0x00 || frame[16] != 0x22 || frame[17] != 0xf0 ||
+      (frame[18] & 0x80) || !(frame[19] & 0x80) ||
+      WIFI_BUNDLE_FIRST_COST(len - WIFI_BUNDLE_AVTP) > WIFI_BUNDLE_MAX_BYTES)
     return false;
   if (!s_tx_bundles) {
     wifi_tx_bundle_t *slots =
@@ -2488,26 +2657,19 @@ static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
     return false;
   int64_t now_us = esp_timer_get_time();
   uint32_t avtp_len = len - WIFI_BUNDLE_AVTP;
+  const uint8_t *avtp = frame + WIFI_BUNDLE_AVTP;
   *result = ESP_OK;
   if (bundle->count > 0 &&
-      (bundle->len + 2 + avtp_len > WIFI_BUNDLE_MAX_BYTES ||
+      (bundle->len + WIFI_BUNDLE_ENTRY_COST(bundle->buf, bundle->count, avtp,
+                                            avtp_len) >
+           WIFI_BUNDLE_MAX_BYTES ||
        now_us - bundle->first_us > WIFI_TX_BUNDLE_MAX_AGE_US))
     *result = wifi_tx_bundle_send(bundle);
   if (bundle->count == 0) {
-    memcpy(bundle->buf, frame, WIFI_BUNDLE_AVTP);
-    memset(bundle->buf + WIFI_BUNDLE_AVTP, 0,
-           WIFI_BUNDLE_ENTRIES - WIFI_BUNDLE_AVTP);
-    bundle->buf[WIFI_BUNDLE_AVTP] = WIFI_BUNDLE_SUBTYPE;
-    bundle->buf[WIFI_BUNDLE_AVTP + 1] = 0x80;
-    memcpy(bundle->buf + 22, frame + 22, UNIQUE_ID_LEN);
-    memcpy(bundle->buf + 30, s_wifi_bundle_tag, 4);
-    bundle->len = WIFI_BUNDLE_ENTRIES;
+    bundle->len = wifi_bundle_begin(bundle->buf, frame);
     bundle->first_us = now_us;
   }
-  bundle->buf[bundle->len] = (uint8_t)(avtp_len >> 8);
-  bundle->buf[bundle->len + 1] = (uint8_t)avtp_len;
-  memcpy(bundle->buf + bundle->len + 2, frame + WIFI_BUNDLE_AVTP, avtp_len);
-  bundle->len += 2 + avtp_len;
+  bundle->len += wifi_bundle_put(bundle->buf, bundle->len, avtp, avtp_len);
   bundle->count++;
   if (bundle->count >= CONFIG_ESP_AVB_WIFI_BUNDLE_FRAMES)
     *result = wifi_tx_bundle_send(bundle);
@@ -2553,7 +2715,7 @@ static void wifi_tx_nack_handle(const uint8_t *nack) {
       portEXIT_CRITICAL(&s_tx_bundle_lock);
       if (len == 0)
         continue;
-      s_tx_retx_buf[37] |= 1; /* retransmission */
+      s_tx_retx_buf[37] |= WIFI_BUNDLE_FLAG_RETX;
       if (esp_wifi_internal_tx(0 /* WIFI_IF_STA */, s_tx_retx_buf, len) ==
           ESP_OK)
         s_wifi_tx_retx++;
