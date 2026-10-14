@@ -1093,6 +1093,59 @@ static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
 }
 #endif
 
+/* A gap is held for a retransmission only while the frames behind it
+ * can still be played on time: at most WIFI_BUNDLE_HOLD_US, and no later
+ * than the presentation time of the earliest held frame less a margin.
+ * Holding longer would release them late in one burst, deepening the
+ * listener's playout for good. */
+#define WIFI_HOLD_PLAYOUT_MARGIN_US 3000
+#define WIFI_HOLD_MIN_US 1000
+
+/* Presentation time of a bundle's first frame; false when it has none. */
+static bool wifi_bundle_first_pts(const uint8_t *buf, uint32_t len,
+                                  uint32_t *pts) {
+  const uint8_t *stamp;
+  if (buf[37] & WIFI_BUNDLE_FLAG_COMPACT) {
+    uint32_t off = WIFI_BUNDLE_ENTRIES + WIFI_COMPACT_HEADER;
+    if (len < off + WIFI_COMPACT_FIXED || !(buf[WIFI_BUNDLE_ENTRIES + 1] & 0x01))
+      return false;
+    stamp = buf + off + 2;
+  } else {
+    if (len < WIFI_BUNDLE_ENTRIES + 2 + 16 ||
+        !(buf[WIFI_BUNDLE_ENTRIES + 2 + 1] & 0x01))
+      return false;
+    stamp = buf + WIFI_BUNDLE_ENTRIES + 2 + 12;
+  }
+  *pts = ((uint32_t)stamp[0] << 24) | ((uint32_t)stamp[1] << 16) |
+         ((uint32_t)stamp[2] << 8) | (uint32_t)stamp[3];
+  return true;
+}
+
+static int64_t wifi_bundle_hold_until(const wifi_bundle_rx_t *rx,
+                                      int64_t now_us) {
+  int64_t until = now_us + WIFI_BUNDLE_HOLD_US;
+  int lowest = -1;
+  for (int i = 0; i < rx->held_count; i++)
+    if (lowest < 0 || (int16_t)(rx->held[i].seq - rx->held[lowest].seq) < 0)
+      lowest = i;
+  uint32_t pts;
+  struct timespec clock_now;
+  if (lowest < 0 ||
+      !wifi_bundle_first_pts(rx->held[lowest].buf, rx->held[lowest].len,
+                             &pts) ||
+      ptpd_now(&clock_now) != 0)
+    return until;
+  uint32_t now32 = (uint32_t)((uint64_t)clock_now.tv_sec * 1000000000ULL +
+                              (uint64_t)clock_now.tv_nsec);
+  int32_t lead_ns = (int32_t)(pts - now32);
+  if (lead_ns < -400000000 || lead_ns > 400000000)
+    return until; /* not on this clock's timeline */
+  int64_t budget_us = lead_ns / 1000 - WIFI_HOLD_PLAYOUT_MARGIN_US;
+  if (budget_us < WIFI_HOLD_MIN_US)
+    budget_us = WIFI_HOLD_MIN_US;
+  return now_us + budget_us < until ? now_us + budget_us : until;
+}
+
 /* Deliver held bundles that are next in sequence; when the hold time
  * has run out, give up on the gap and move on. */
 static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
@@ -1115,7 +1168,7 @@ static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
         return;
       s_wifi_given_up++;
       rx->expected = rx->held[lowest].seq;
-      rx->deadline_us = now_us + WIFI_BUNDLE_HOLD_US;
+      rx->deadline_us = wifi_bundle_hold_until(rx, now_us);
       continue;
     }
     wifi_held_bundle_t h = rx->held[next];
@@ -1124,7 +1177,7 @@ static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
       s_wifi_recovered++;
     wifi_bundle_split(h.buf, h.len, priv, info);
     rx->expected++;
-    rx->deadline_us = rx->held_count ? now_us + WIFI_BUNDLE_HOLD_US : 0;
+    rx->deadline_us = rx->held_count ? wifi_bundle_hold_until(rx, now_us) : 0;
   }
 }
 
@@ -1201,7 +1254,7 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
   rx->held[rx->held_count].buf = buf;
   rx->held_count++;
   if (rx->deadline_us == 0)
-    rx->deadline_us = now_us + WIFI_BUNDLE_HOLD_US;
+    rx->deadline_us = wifi_bundle_hold_until(rx, now_us);
   /* NACK each newly missing bundle once; repeat only the oldest gap,
    * and only after a NACK or its answer could have been lost. */
   if ((int16_t)(rx->nack_next - rx->expected) < 0)
