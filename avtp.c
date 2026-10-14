@@ -1846,6 +1846,9 @@ typedef struct {
  * and the media-clock sensor is fill-independent (DAC-consumed bytes
  * from the I2S on_sent callback — see avbcodec.c). */
 #define JITTER_PREFILL   8192   /* ~28 ms at 48 kHz stereo 24-bit */
+/* One marker per received packet; enough for a full ring of the
+ * smallest packets in use (64 KB of 12-sample stereo packets is 683). */
+#define STREAM_PT_MARKERS 1024
 
 static inline uint32_t ring_readable(const jitter_ring_t *r) {
   return atomic_load_explicit(&r->head, memory_order_acquire) -
@@ -1974,6 +1977,33 @@ typedef struct {
   int64_t timeline_check_us;
   bool timeline_valid_cached;
   volatile int64_t last_packet_us;    /* esp_timer at most recent packet RX */
+  /* Presentation markers: ring position of each packet's first byte and
+   * its avtp_timestamp, so the drain can tell the presentation time of
+   * the audio at the DAC. Written by the RX handler, read by the drain. */
+  struct {
+    uint32_t pos;
+    uint32_t pt;
+  } pt_markers[STREAM_PT_MARKERS];
+  _Atomic uint32_t pt_marker_count;
+  uint32_t pt_marker_read; /* drain: marker at or before the DAC */
+  /* Playout phase, owned by the drain: the ring position at the DAC is
+   * the position at lock plus the stream bytes played since (DAC bytes
+   * less starved silence). */
+  bool phase_valid;
+  uint32_t phase_lock_pos;
+  uint64_t phase_lock_played;
+  int64_t phase_check_us;
+  uint32_t phase_clamps; /* dac position clamped to the ring tail */
+  /* Phase statistics per stats window: playout time less presentation
+   * time (plus the extra latency), and the audio buffered ahead of the
+   * DAC. The printer sets phase_reset to start a new window. */
+  volatile bool phase_reset;
+  volatile int32_t phase_min_us;
+  volatile int32_t phase_max_us;
+  volatile int64_t phase_sum_us;
+  volatile uint32_t phase_samples;
+  volatile int32_t ahead_min_us;
+  volatile int32_t ahead_max_us;
   /* first-packet snapshot (written by handler, printed by main loop) */
   uint8_t diag_subtype;
   uint16_t diag_sdl;
@@ -2087,6 +2117,129 @@ static bool stream_in_timeline_valid(stream_rx_ctx_t *ctx) {
 
 static void stream_in_drain_cb(void *arg);
 
+#define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
+#define GATE_ANCHOR_STALE_US (2 * 1000 * 1000) /* 32-bit ns wrap guard */
+/* How often the drain samples the playout phase. */
+#define STREAM_PHASE_INTERVAL_US 20000
+
+/* Presentation time of the audio at ring position pos, from the
+ * markers; false when no marker at or before pos is still held. */
+static bool stream_in_pt_at(stream_rx_ctx_t *ctx, uint32_t pos, uint32_t *pt) {
+  uint32_t count =
+      atomic_load_explicit(&ctx->pt_marker_count, memory_order_acquire);
+  if (count == 0 || ctx->ring_bytes_per_sec == 0)
+    return false;
+  /* Keep clear of the slots the handler may be overwriting. */
+  uint32_t oldest =
+      count > STREAM_PT_MARKERS - 8 ? count - (STREAM_PT_MARKERS - 8) : 0;
+  uint32_t read = ctx->pt_marker_read;
+  if ((int32_t)(read - oldest) < 0)
+    read = oldest;
+  if ((int32_t)(ctx->pt_markers[read % STREAM_PT_MARKERS].pos - pos) > 0)
+    return false;
+  while (read + 1 != count &&
+         (int32_t)(ctx->pt_markers[(read + 1) % STREAM_PT_MARKERS].pos -
+                   pos) <= 0)
+    read++;
+  ctx->pt_marker_read = read;
+  uint32_t offset = pos - ctx->pt_markers[read % STREAM_PT_MARKERS].pos;
+  *pt = ctx->pt_markers[read % STREAM_PT_MARKERS].pt +
+        (uint32_t)(((uint64_t)offset * 1000000000ULL) /
+                   ctx->ring_bytes_per_sec);
+  return true;
+}
+
+/* Stream bytes the DAC has played: DMA completions less the silence it
+ * sent from buffers nobody refilled. */
+static uint64_t stream_in_played(const stream_rx_ctx_t *ctx) {
+  avb_state_s *state = ctx->state;
+  return atomic_load_explicit(&state->media_clock.i2s_bytes_written,
+                              memory_order_relaxed) -
+         atomic_load_explicit(&state->media_clock.i2s_tx_starved_bytes,
+                              memory_order_relaxed);
+}
+
+/* Ring position of the audio at the DAC, see phase_lock_pos. */
+static uint32_t stream_in_dac_pos(stream_rx_ctx_t *ctx) {
+  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  uint32_t played = (uint32_t)(stream_in_played(ctx) - ctx->phase_lock_played);
+  uint32_t dac_pos = ctx->phase_lock_pos + played;
+  if ((int32_t)(dac_pos - tail) > 0) {
+    /* Silence the starvation count missed: the DAC cannot be past the
+     * ring tail. */
+    ctx->phase_lock_played += (uint32_t)(dac_pos - tail);
+    ctx->phase_clamps++;
+    dac_pos = tail;
+  }
+  return dac_pos;
+}
+
+/* Playout phase: when the audio at the DAC plays against when it should
+ * (its presentation time plus the configured extra latency), in ns, and
+ * the audio buffered ahead of the DAC in µs. False when unknown. */
+static bool stream_in_phase(stream_rx_ctx_t *ctx, int32_t *phase_ns,
+                            int32_t *ahead_us) {
+  if (!ctx->phase_valid || !ctx->state)
+    return false;
+  uint32_t dac_pos = stream_in_dac_pos(ctx);
+  uint32_t pt;
+  struct timespec now_ts;
+  if (!stream_in_pt_at(ctx, dac_pos, &pt) || ptpd_now(&now_ts) != 0)
+    return false;
+  uint32_t now32 = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
+                              (uint64_t)now_ts.tv_nsec);
+  uint32_t due = pt +
+                 (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US * 1000U) -
+                 STREAM_IN_OUTPUT_DELAY_NS;
+  *phase_ns = (int32_t)(now32 - due);
+  uint32_t head = atomic_load_explicit(&ctx->ring.head, memory_order_acquire);
+  *ahead_us = (int32_t)(((uint64_t)(head - dac_pos) * 1000000ULL) /
+                        ctx->ring_bytes_per_sec);
+  return true;
+}
+
+/* Baseline the phase at a playout lock: the byte at the ring tail is the
+ * next one the DAC plays. */
+static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
+  if (!ctx->state)
+    return;
+  ctx->phase_lock_pos = atomic_load_explicit(&ctx->ring.tail,
+                                             memory_order_relaxed);
+  ctx->phase_lock_played = stream_in_played(ctx);
+  ctx->phase_check_us = 0;
+  ctx->phase_valid = true;
+}
+
+/* Every STREAM_PHASE_INTERVAL_US while playout is locked: sample the
+ * phase for the statistics. */
+static void stream_in_phase_tick(stream_rx_ctx_t *ctx) {
+  int64_t now_us = esp_timer_get_time();
+  if (now_us - ctx->phase_check_us < STREAM_PHASE_INTERVAL_US)
+    return;
+  ctx->phase_check_us = now_us;
+  int32_t phase_ns, ahead_us;
+  if (!stream_in_phase(ctx, &phase_ns, &ahead_us))
+    return;
+  int32_t phase_us = phase_ns / 1000;
+  if (ctx->phase_reset || ctx->phase_samples == 0) {
+    ctx->phase_reset = false;
+    ctx->phase_min_us = ctx->phase_max_us = phase_us;
+    ctx->phase_sum_us = 0;
+    ctx->phase_samples = 0;
+    ctx->ahead_min_us = ctx->ahead_max_us = ahead_us;
+  }
+  if (phase_us < ctx->phase_min_us)
+    ctx->phase_min_us = phase_us;
+  if (phase_us > ctx->phase_max_us)
+    ctx->phase_max_us = phase_us;
+  if (ahead_us < ctx->ahead_min_us)
+    ctx->ahead_min_us = ahead_us;
+  if (ahead_us > ctx->ahead_max_us)
+    ctx->ahead_max_us = ahead_us;
+  ctx->phase_sum_us += phase_us;
+  ctx->phase_samples++;
+}
+
 /* Single-core stations: the 1 ms esp_timer drain runs below the Wi-Fi
  * task, which also runs this station's own receive path, so during a
  * burst the drain waited past the ~2 ms of audio queued in the TX DMA
@@ -2120,8 +2273,6 @@ static void stream_in_drain_cb(void *arg) {
    * tu=1 stream, no valid gPTP, stale anchor, or ring pressure):
    * byte-prefill gate, which gives arrival-relative latency only.
    * Gate state lives in ctx so a stream restart re-gates freshly. */
-#define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
-#define GATE_ANCHOR_STALE_US (2 * 1000 * 1000) /* 32-bit ns wrap guard */
   if (!ctx->drain_locked) {
     /* Post-re-gate anchor wait: the anchor only arms on a packet
      * arriving into an EMPTY ring (its timestamp must describe the
@@ -2211,6 +2362,7 @@ static void stream_in_drain_cb(void *arg) {
       ctx->ever_locked = true;
     }
     ctx->media_locked_count++;
+    stream_in_phase_lock(ctx);
     /* The gate wait moved consumption relative to arrival: tell the
      * stream-referenced PLL to re-seed rather than read it as rate. */
     if (ctx->state)
@@ -2251,11 +2403,13 @@ static void stream_in_drain_cb(void *arg) {
   }
 
   /* Whole DMA buffers only: the driver counts a starved DMA's silence
-   * only while no partly written buffer is pending. A remainder under
-   * one buffer waits for the next packet. */
+   * only while no partly written buffer is pending, and the playout
+   * phase relies on that count. A remainder under one buffer waits for
+   * the next packet. */
   uint32_t unit = ctx->state && ctx->state->media_clock.i2s_tx_dma_buf_bytes
                       ? ctx->state->media_clock.i2s_tx_dma_buf_bytes
                       : 8;
+  stream_in_phase_tick(ctx);
   uint32_t avail = ring_readable(&ctx->ring);
   if (avail < unit) {
     /* Empty ring is NORMAL at thin (presentation-time) fill: the
@@ -2738,6 +2892,16 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
      * acquire load of head). */
     atomic_store_explicit(&ctx->ring.head, h + total, memory_order_release);
     ctx->ring_write_ok++;
+    if (avtp_data[1] & 0x01) { /* tv */
+      uint32_t marker = atomic_load_explicit(&ctx->pt_marker_count,
+                                             memory_order_relaxed);
+      ctx->pt_markers[marker % STREAM_PT_MARKERS].pos = h;
+      ctx->pt_markers[marker % STREAM_PT_MARKERS].pt =
+          ((uint32_t)avtp_data[12] << 24) | ((uint32_t)avtp_data[13] << 16) |
+          ((uint32_t)avtp_data[14] << 8) | (uint32_t)avtp_data[15];
+      atomic_store_explicit(&ctx->pt_marker_count, marker + 1,
+                            memory_order_release);
+    }
     if (!ctx->diag_i2s_bytes)
       ctx->diag_i2s_bytes = (int)total;
     /* Presentation anchor: first packet into an empty ring with a
@@ -2815,11 +2979,21 @@ void avb_stream_in_print_diag(void) {
   uint32_t nacks = 0, recovered = 0, given_up = 0, duplicates = 0;
   avb_wifi_retx_stats(&nacks, &recovered, &given_up, &duplicates);
 
+  /* Playout phase window (see stream_in_phase_tick). */
+  uint32_t phase_n = ctx->phase_reset ? 0 : ctx->phase_samples;
+  int32_t phase_min = phase_n ? ctx->phase_min_us : 0;
+  int32_t phase_max = phase_n ? ctx->phase_max_us : 0;
+  int32_t phase_avg = phase_n ? (int32_t)(ctx->phase_sum_us / phase_n) : 0;
+  int32_t ahead_min = phase_n ? ctx->ahead_min_us : 0;
+  int32_t ahead_max = phase_n ? ctx->ahead_max_us : 0;
+  ctx->phase_reset = true;
+
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
           "qfill=%lu id_skip=%lu rate_mm=%lu seq_gap=%lu conceal=%lu/%lu "
           "spl=%lu rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu) "
           "bundles=%lu/%lu nack=%lu rec=%lu gaveup=%lu dup=%lu starved=%luB "
-          "late=%lu split_fail=%lu",
+          "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
+          "phase_n=%lu",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -2846,7 +3020,9 @@ void avb_stream_in_print_diag(void) {
                            &ctx->state->media_clock.i2s_tx_starved_bytes,
                            memory_order_relaxed)
                      : 0UL,
-          (unsigned long)ctx->seq_late, (unsigned long)split_fail);
+          (unsigned long)ctx->seq_late, (unsigned long)split_fail,
+          (long)phase_min, (long)phase_avg, (long)phase_max, (long)ahead_min,
+          (long)ahead_max, (unsigned long)phase_n);
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
