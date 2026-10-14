@@ -1218,6 +1218,9 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index);
 void avb_stop_stream_in(avb_state_s *state, uint16_t index);
 uint16_t avb_get_crf_input_index(avb_state_s *state);
 uint16_t avb_get_crf_output_index(avb_state_s *state);
+/* Rate correction (Q16 ppm) the listener applies as sample slips on
+ * chips without a tunable audio clock; 0 where the clock is tuned. */
+int32_t avb_pll_software_rate_ppm_q16(void);
 bool avb_crf_stream_valid(void);
 void avb_stream_in_print_diag(void);
 /* Deferred drift sampler — called from AVB main's periodic loop.

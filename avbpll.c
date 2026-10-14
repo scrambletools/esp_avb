@@ -90,11 +90,13 @@ static int mclk_hw_init(uint32_t nominal_mclk_hz) {
            nominal_mclk_hz, s_hw.mclk_div, s_hw.nominal_apll_hz);
   return 0;
 #else
-  /* No APLL on this SOC (e.g. esp32c6). A software-only clock-
-   * recovery path is needed on Wi-Fi-only targets. */
+  /* No APLL on this SOC (e.g. esp32c6): the correction is applied in
+   * software, as sample slips at the listener drain (see
+   * avb_pll_software_rate_ppm_q16). */
   (void)nominal_mclk_hz;
-  s_hw.initialised = false;
-  return -1;
+  s_hw.initialised = true;
+  ESP_LOGI(TAG, "no APLL: rate corrections become sample slips");
+  return 0;
 #endif
 }
 
@@ -124,6 +126,17 @@ bool avb_pll_mclk_derivable(uint32_t mclk_hz, uint32_t *apll_hz) {
 #endif
 }
 
+/* Software rate correction (Q16 ppm) on SOCs without an APLL. */
+static volatile int32_t s_sw_rate_ppm_q16;
+
+int32_t avb_pll_software_rate_ppm_q16(void) {
+#if SOC_CLK_APLL_SUPPORTED
+  return 0;
+#else
+  return s_sw_rate_ppm_q16;
+#endif
+}
+
 /* Apply an absolute ppm offset (Q16) to the nominal MCLK.
  *   actual_mclk = nominal_mclk * (1 + ppm/1e6)
  * Positive → faster, negative → slower. Repeated calls replace the prior
@@ -131,9 +144,10 @@ bool avb_pll_mclk_derivable(uint32_t mclk_hz, uint32_t *apll_hz) {
  *
  * Hardware path uses the on-chip APLL coefficient registers via
  * rtc_clk_apll_coeff_calc/_set. These are only available on SOCs
- * with APLL (e.g. ESP32-P4); Wi-Fi-only targets like ESP32-C6 have
- * no APLL. On those targets this returns -1 — a software clock-
- * recovery path is needed on the Wi-Fi side. */
+ * with APLL (e.g. ESP32-P4). Wi-Fi-only targets like ESP32-C6 have
+ * none; there the value becomes the listener drain's sample-slip rate,
+ * which only the presentation-phase reference can see (see the gate in
+ * avb_pll_tick). */
 static int mclk_hw_tune_ppm_q16(int32_t ppm_q16) {
 #if SOC_CLK_APLL_SUPPORTED
   if (!s_hw.initialised)
@@ -176,8 +190,10 @@ static int mclk_hw_tune_ppm_q16(int32_t ppm_q16) {
            target_hz, real_hz, clk_hal_apll_get_freq_hz());
   return 0;
 #else
-  (void)ppm_q16;
-  return -1;
+  if (!s_hw.initialised)
+    return -1;
+  s_sw_rate_ppm_q16 = ppm_q16;
+  return 0;
 #endif
 }
 
@@ -948,6 +964,15 @@ void avb_pll_tick(avb_state_s *state) {
     s_pll.valid = false;
     return;
   }
+#if !SOC_CLK_APLL_SUPPORTED
+  /* Sample slips change only what the DAC plays, not its rate, so only
+   * the presentation phase sees them; any other reference would read no
+   * effect and walk the correction to its clamp. */
+  if (!stream_ref_active(state) || !s_pll.stream_ref_phase) {
+    s_pll.valid = false;
+    return;
+  }
+#endif
 
   /* First valid sample — seed the baselines, nothing to compare yet */
   if (!s_pll.valid) {
