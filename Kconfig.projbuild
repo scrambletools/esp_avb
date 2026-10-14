@@ -397,6 +397,23 @@ menu "AVB Configuration"
             timestamps are flagged uncertain (tu=1) or gPTP is not yet
             valid, playout falls back to a fixed byte-prefill gate.
 
+    config ESP_AVB_LISTENER_LATENCY_TRIM_S
+        int "Trim surplus playout latency every this many seconds (0 = never)"
+        default 60
+        range 0 3600
+        depends on ESP_AVB
+        help
+            Audio that arrives after its presentation time leaves the
+            DAC playing silence, and playout continues that much later
+            so the next equally late arrival still plays. When a whole
+            window of this length then passed with more audio buffered
+            at every moment than the latency needed (plus a 3 ms
+            margin), the listener drops the surplus in one skip, never
+            below presentation time. Latency then follows the worst
+            lateness of the recent window instead of the worst ever,
+            which also undoes a playout start that locked late. 0 keeps
+            any latency once taken.
+
     config ESP_AVB_AUTO_CRF_CLOCK_SOURCE
         bool "Auto-select CRF input as media clock source when live"
         default y

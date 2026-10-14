@@ -1969,7 +1969,13 @@ typedef struct {
    * The ring-pressure escape still overrides it. */
   bool pt_await_anchor;
   int64_t pt_await_start_us; /* give-up bound for tu=1 streams */
+  int64_t gate_late_since_us; /* first late anchor passed over, 0 = none */
+  /* Playout latency the path has needed (the presentation phase, kept
+   * by the drain while locked on presentation time): a relock and a
+   * long-pause splice aim for it rather than for presentation time. */
+  volatile int32_t learned_latency_ns;
   volatile uint32_t pt_regates; /* diagnostic: re-gates performed */
+  int64_t pt_regate_interval_us; /* next re-gate spacing, 0 = shortest */
   /* Timeline-validity cache: the check reads the PTP clock, which
    * contends with PTPD internals — at the drain's 1 kHz that matters
    * (the drift sampler was moved off the RX path for the same
@@ -1988,10 +1994,11 @@ typedef struct {
   uint32_t pt_marker_read; /* drain: marker at or before the DAC */
   /* Playout phase, owned by the drain: the ring position at the DAC is
    * the position at lock plus the stream bytes played since (DAC bytes
-   * less starved silence). */
+   * less starved silence) plus the ring bytes trimmed. */
   bool phase_valid;
   uint32_t phase_lock_pos;
   uint64_t phase_lock_played;
+  uint32_t phase_trimmed;
   int64_t phase_check_us;
   uint32_t phase_clamps; /* dac position clamped to the ring tail */
   /* Phase steps taken out of the media-clock reference (see
@@ -2002,7 +2009,12 @@ typedef struct {
   int64_t phase_steps_ns;
   uint64_t phase_prev_starved;
   uint32_t phase_prev_fills;
+  uint32_t phase_prev_trimmed;
   uint32_t phase_prev_clamps;
+  volatile uint32_t trims;      /* latency trims */
+  volatile uint32_t trim_bytes; /* ring bytes the trims dropped */
+  int64_t trim_window_start_us;      /* 0 = no window running */
+  int32_t trim_min_ahead_us;         /* least audio buffered this window */
   /* Phase statistics per stats window: playout time less presentation
    * time (plus the extra latency), and the audio buffered ahead of the
    * DAC. The printer sets phase_reset to start a new window. */
@@ -2128,6 +2140,13 @@ static void stream_in_drain_cb(void *arg);
 
 #define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
 #define GATE_ANCHOR_STALE_US (2 * 1000 * 1000) /* 32-bit ns wrap guard */
+/* A presentation lock fires within a drain tick of its target; an
+ * anchor later than this is passed over (see the gate). */
+#define GATE_LATE_NS (2 * 1000 * 1000)
+#define GATE_LATE_PATIENCE_US (500 * 1000)
+/* Re-gate spacing from a prefill lock, see the re-gate below. */
+#define PT_REGATE_INTERVAL_MIN_US (5 * 1000 * 1000)
+#define PT_REGATE_INTERVAL_MAX_US (60 * 1000 * 1000)
 /* How often the drain samples the playout phase. */
 #define STREAM_PHASE_INTERVAL_US 20000
 
@@ -2172,7 +2191,7 @@ static uint64_t stream_in_played(const stream_rx_ctx_t *ctx) {
 static uint32_t stream_in_dac_pos(stream_rx_ctx_t *ctx) {
   uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
   uint32_t played = (uint32_t)(stream_in_played(ctx) - ctx->phase_lock_played);
-  uint32_t dac_pos = ctx->phase_lock_pos + played;
+  uint32_t dac_pos = ctx->phase_lock_pos + played + ctx->phase_trimmed;
   if ((int32_t)(dac_pos - tail) > 0) {
     /* Silence the starvation count missed: the DAC cannot be past the
      * ring tail. */
@@ -2215,8 +2234,10 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
   ctx->phase_lock_pos = atomic_load_explicit(&ctx->ring.tail,
                                              memory_order_relaxed);
   ctx->phase_lock_played = stream_in_played(ctx);
+  ctx->phase_trimmed = 0;
   ctx->phase_check_us = 0;
   ctx->phase_have_prev = false;
+  ctx->trim_window_start_us = 0;
   ctx->phase_valid = true;
   atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
                             memory_order_relaxed);
@@ -2237,6 +2258,7 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
     int32_t step_ns = phase_ns - ctx->phase_prev_ns;
     bool explained = starved != ctx->phase_prev_starved ||
                      ctx->loss_fill_events != ctx->phase_prev_fills ||
+                     ctx->phase_trimmed != ctx->phase_prev_trimmed ||
                      ctx->phase_clamps != ctx->phase_prev_clamps;
     if (explained || step_ns > STREAM_PHASE_STEP_NS ||
         step_ns < -STREAM_PHASE_STEP_NS)
@@ -2246,6 +2268,7 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
   ctx->phase_prev_ns = phase_ns;
   ctx->phase_prev_starved = starved;
   ctx->phase_prev_fills = ctx->loss_fill_events;
+  ctx->phase_prev_trimmed = ctx->phase_trimmed;
   ctx->phase_prev_clamps = ctx->phase_clamps;
 
   struct timespec now_ts;
@@ -2266,9 +2289,63 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
                         memory_order_release);
 }
 
+/* Adaptive playout latency. Audio that arrives after its slot leaves
+ * the DAC playing silence and playout that much later; the listener
+ * keeps that latency, so the next equally late arrival plays. Once a
+ * whole trim window has passed with more audio buffered at every
+ * moment than STREAM_TRIM_MARGIN_US, it drops that surplus in one skip,
+ * so latency follows the path instead of keeping its worst moment.
+ * Never below presentation time. Whole DMA buffers only. */
+#define STREAM_TRIM_MARGIN_US 3000
+static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
+                                   int32_t ahead_us, uint32_t unit) {
+#if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0
+  if (ctx->diag_gate_mode != 1)
+    return;
+  int64_t now_us = esp_timer_get_time();
+  if (ctx->trim_window_start_us == 0 || ahead_us < ctx->trim_min_ahead_us)
+    ctx->trim_min_ahead_us = ahead_us;
+  if (ctx->trim_window_start_us == 0) {
+    ctx->trim_window_start_us = now_us;
+    return;
+  }
+  if (now_us - ctx->trim_window_start_us <
+      (int64_t)CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S * 1000000LL)
+    return;
+  int32_t surplus_us = ctx->trim_min_ahead_us - STREAM_TRIM_MARGIN_US;
+  if (surplus_us > phase_ns / 1000)
+    surplus_us = phase_ns / 1000;
+  ctx->trim_window_start_us = now_us;
+  ctx->trim_min_ahead_us = ahead_us;
+  if (surplus_us < 1000)
+    return;
+  uint32_t surplus_bytes =
+      (uint32_t)(((uint64_t)surplus_us * ctx->ring_bytes_per_sec) / 1000000ULL);
+  uint32_t avail = ring_readable(&ctx->ring);
+  if (surplus_bytes > avail)
+    surplus_bytes = avail;
+  surplus_bytes -= surplus_bytes % unit;
+  if (surplus_bytes == 0)
+    return;
+  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  atomic_store_explicit(&ctx->ring.tail, tail + surplus_bytes,
+                        memory_order_release);
+  ctx->phase_trimmed += surplus_bytes;
+  ctx->trims++;
+  ctx->trim_bytes += surplus_bytes;
+#else
+  (void)ctx;
+  (void)phase_ns;
+  (void)ahead_us;
+  (void)unit;
+#endif
+}
+
 /* Every STREAM_PHASE_INTERVAL_US while playout is locked: sample the
- * phase for the statistics and the media-clock loop. */
-static void stream_in_phase_tick(stream_rx_ctx_t *ctx) {
+ * phase for the statistics and the media-clock loop, then trim surplus
+ * latency. Runs before the drain's write so dropped audio never reaches
+ * the DMA. */
+static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
   int64_t now_us = esp_timer_get_time();
   if (now_us - ctx->phase_check_us < STREAM_PHASE_INTERVAL_US)
     return;
@@ -2276,8 +2353,16 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx) {
   int32_t phase_ns, ahead_us;
   if (!stream_in_phase(ctx, &phase_ns, &ahead_us))
     return;
-  if (ctx->diag_gate_mode == 1)
+  if (ctx->diag_gate_mode == 1) {
     stream_in_phase_publish(ctx, phase_ns);
+    /* Only while audio is buffered: through an outage the DAC plays
+     * silence and the phase climbs by the outage itself. */
+    if (ahead_us >= 1000)
+      ctx->learned_latency_ns = phase_ns < 0           ? 0
+                                : phase_ns > 50000000 ? 50000000
+                                                      : phase_ns;
+  }
+  stream_in_trim_latency(ctx, phase_ns, ahead_us, unit);
   int32_t phase_us = phase_ns / 1000;
   if (ctx->phase_reset || ctx->phase_samples == 0) {
     ctx->phase_reset = false;
@@ -2336,13 +2421,16 @@ static void stream_in_drain_cb(void *arg) {
      * arriving into an EMPTY ring (its timestamp must describe the
      * ring tail). Keep the ring flushed until that happens so the
      * next packet arms with correct alignment; give up after 100 ms
-     * (tu=1 streams never arm) and fall back to prefill. */
+     * of arrivals that armed nothing (tu=1 streams never arm) and fall
+     * back to prefill. A pause with no packets at all proves nothing
+     * (a Wi-Fi talker stalls longer than that), so keep waiting. */
     if (ctx->pt_await_anchor &&
         !atomic_load_explicit(&ctx->gate_armed, memory_order_acquire)) {
-      if (esp_timer_get_time() - ctx->pt_await_start_us > 100000) {
-        /* No packet armed an anchor in 100 ms of empty-ring arrivals:
-         * tu=1 stream (or equivalent) — pt-gating is impossible, stop
-         * re-gate attempts for good. */
+      if (esp_timer_get_time() - ctx->pt_await_start_us > 100000 &&
+          ctx->last_packet_us > ctx->pt_await_start_us) {
+        /* Packets arrived for 100 ms into the flushed ring and none
+         * armed an anchor: tu=1 stream (or equivalent), pt-gating is
+         * impossible, stop re-gate attempts for good. */
         ctx->pt_await_anchor = false;
         ctx->pt_regate_done = true;
       } else {
@@ -2376,11 +2464,33 @@ static void stream_in_drain_cb(void *arg) {
          * moves playout onto presentation time once it becomes so. */
         uint32_t now32 = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
                                     (uint64_t)now_ts.tv_nsec);
+        /* The learned latency carries over a relock, so an outage does
+         * not throw away what the path has shown it needs. */
         uint32_t target = ctx->gate_avtp_ts +
                           (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US *
                                      1000U) -
-                          STREAM_IN_OUTPUT_DELAY_NS;
+                          STREAM_IN_OUTPUT_DELAY_NS +
+                          (uint32_t)ctx->learned_latency_ns;
         int32_t diff = (int32_t)(now32 - target);
+        int64_t now_us = esp_timer_get_time();
+        if (diff > GATE_LATE_NS && diff < 50000000 &&
+            (ctx->gate_late_since_us == 0 ||
+             now_us - ctx->gate_late_since_us < GATE_LATE_PATIENCE_US)) {
+          /* Late anchor, typically the head of a catch-up burst after
+           * an outage: starting on it would play everything that late
+           * from now on. Re-arm on a fresher packet; lateness falls
+           * packet by packet through the burst. A path that is simply
+           * later than the talker's offset never offers an on-time
+           * anchor, so after GATE_LATE_PATIENCE_US the next late one
+           * is taken. */
+          if (ctx->gate_late_since_us == 0)
+            ctx->gate_late_since_us = now_us;
+          atomic_store_explicit(&ctx->gate_armed, false,
+                                memory_order_release);
+          ctx->pt_await_anchor = true;
+          ctx->pt_await_start_us = now_us;
+          return;
+        }
         if (diff >= 0 && diff < 50000000) {
           /* Target reached. A genuine pt lock fires with diff near
            * zero — the drain polls every 1 ms — so a large positive
@@ -2415,6 +2525,7 @@ static void stream_in_drain_cb(void *arg) {
     if (!start)
       return;
     ctx->pt_await_anchor = false;
+    ctx->gate_late_since_us = 0;
     ctx->drain_locked = true;
     if (!ctx->ever_locked) {
       ctx->ever_locked = true;
@@ -2428,6 +2539,8 @@ static void stream_in_drain_cb(void *arg) {
                                 memory_order_relaxed);
     /* No logging here (esp_timer task) — stash for the stats printer. */
     ctx->diag_gate_mode = pt_mode ? 1 : 2;
+    if (pt_mode)
+      ctx->pt_regate_interval_us = 0;
     ctx->diag_gate_err_ns = pt_err_ns;
     ctx->diag_gate_fill = fill;
   }
@@ -2438,20 +2551,30 @@ static void stream_in_drain_cb(void *arg) {
    * out of the sample-accurate timeline the other listeners share.
    * Once the timeline is valid, unlock and re-arm the anchor so the
    * next packet re-gates at its true presentation time. Each attempt
-   * costs a ~fill-target pause; retries are paced 5 s apart in case
-   * an attempt loses to the ring-pressure escape (residual clock
-   * error at re-gate time makes the pt target sit in the future
-   * while the ring fills). pt_regate_done is set permanently by the
-   * anchor-await give-up below — streams that cannot arm an anchor
-   * (tu=1) must not pay a periodic pause forever. */
+   * costs a ~fill-target pause; retries start 5 s apart in case an
+   * attempt loses to the ring-pressure escape (residual clock error at
+   * re-gate time makes the pt target sit in the future while the ring
+   * fills), and back off to 60 s while they keep losing (a station
+   * talker's clock can sit 100 ms ahead for minutes after it boots).
+   * pt_regate_done is set permanently by the anchor-await give-up
+   * above — streams that cannot arm an anchor (tu=1) must not pay a
+   * periodic pause forever. */
+  int64_t regate_interval_us = ctx->pt_regate_interval_us
+                                   ? ctx->pt_regate_interval_us
+                                   : PT_REGATE_INTERVAL_MIN_US;
   if (ctx->drain_locked && ctx->diag_gate_mode == 2 && !ctx->pt_regate_done &&
       stream_in_timeline_valid(ctx) &&
       (ctx->pt_await_start_us == 0 ||
-       esp_timer_get_time() - ctx->pt_await_start_us > 5000000)) {
+       esp_timer_get_time() - ctx->pt_await_start_us > regate_interval_us)) {
+    ctx->pt_regate_interval_us =
+        regate_interval_us * 2 > PT_REGATE_INTERVAL_MAX_US
+            ? PT_REGATE_INTERVAL_MAX_US
+            : regate_interval_us * 2;
     ctx->pt_await_anchor = true;
     ctx->pt_await_start_us = esp_timer_get_time();
     ctx->pt_regates++;
     ctx->drain_locked = false;
+    ctx->gate_late_since_us = 0;
     atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
     if (ctx->ever_locked) {
       ctx->media_unlocked_count++;
@@ -2467,7 +2590,7 @@ static void stream_in_drain_cb(void *arg) {
   uint32_t unit = ctx->state && ctx->state->media_clock.i2s_tx_dma_buf_bytes
                       ? ctx->state->media_clock.i2s_tx_dma_buf_bytes
                       : 8;
-  stream_in_phase_tick(ctx);
+  stream_in_phase_tick(ctx, unit);
   uint32_t avail = ring_readable(&ctx->ring);
   if (avail < unit) {
     /* Empty ring is NORMAL at thin (presentation-time) fill: the
@@ -2486,6 +2609,7 @@ static void stream_in_drain_cb(void *arg) {
     if (since_pkt_us > 65000) {
       ctx->drain_underrun++;
       ctx->drain_locked = false;
+      ctx->gate_late_since_us = 0;
       /* Drop the remainder so the next packet finds the ring empty and
        * can anchor the gate. */
       atomic_store_explicit(
@@ -2844,7 +2968,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
           int32_t lead = (int32_t)(
               pkt_ts +
               (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US * 1000U) -
-              STREAM_IN_OUTPUT_DELAY_NS - now32);
+              STREAM_IN_OUTPUT_DELAY_NS + (uint32_t)ctx->learned_latency_ns -
+              now32);
           if (lead > -400000000 && lead < 400000000) {
             /* A sane clock read owns the decision either way. lead ≤ 0
              * means the resume packet is already at/past its
@@ -3051,7 +3176,7 @@ void avb_stream_in_print_diag(void) {
           "spl=%lu rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu) "
           "bundles=%lu/%lu nack=%lu rec=%lu gaveup=%lu dup=%lu starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
-          "phase_n=%lu",
+          "phase_n=%lu trims=%lu/%luB",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -3080,7 +3205,8 @@ void avb_stream_in_print_diag(void) {
                      : 0UL,
           (unsigned long)ctx->seq_late, (unsigned long)split_fail,
           (long)phase_min, (long)phase_avg, (long)phase_max, (long)ahead_min,
-          (long)ahead_max, (unsigned long)phase_n);
+          (long)ahead_max, (unsigned long)phase_n,
+          (unsigned long)ctx->trims, (unsigned long)ctx->trim_bytes);
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
