@@ -918,9 +918,8 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
 #else
   state->port[1].time_source = avb_port_time_source_gptp_wired;
 #endif
-  /* The if_key for the Wi-Fi AP netif. The bridge application sets it
-   * to "WIFI_0" via the inherent config when creating
-   * esp_netif_create_wifi(WIFI_IF_AP, ...). */
+  /* The if_key for the Wi-Fi AP netif, as the bridge application gave
+   * it to esp_netif_create_wifi(WIFI_IF_AP, ...). */
   if (config->wifi_interface) {
     strncpy(state->port[1].eth_interface, config->wifi_interface,
             sizeof(state->port[1].eth_interface) - 1);
