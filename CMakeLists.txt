@@ -37,9 +37,20 @@ endif()
 
 idf_component_register(SRCS ${avb_srcs}
                        REQUIRES esp_eth
-                       PRIV_REQUIRES esp_codec_dev esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
+                       PRIV_REQUIRES esp_app_format esp_codec_dev esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
                        INCLUDE_DIRS "." "./include"
                        EMBED_FILES ${avb_embed})
 
 target_sources(${COMPONENT_LIB} PRIVATE)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)
+
+# The release version from the manifest, reported in the ENTITY
+# descriptor's firmware_version.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_LIST_DIR}/idf_component.yml")
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/idf_component.yml" avb_version_line
+     REGEX "^version:")
+string(REGEX REPLACE "^version: *\"?([^\"]*)\"?.*$" "\\1" avb_version
+       "${avb_version_line}")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+                           ESP_AVB_VERSION="${avb_version}")

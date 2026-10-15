@@ -126,7 +126,7 @@ typedef struct {
   const char *vendor_name;                   // vendor name
   const char *model_name;                    // model name
   const char *group_name;                    // group name
-  const char *firmware_version;              // firmware version
+  const char *firmware_version;              // firmware version; esp_avb appends its version and build
   const char *serial_number;                 // serial number
   char *eth_interface;                       // ethernet interface name
   char *wifi_interface;                      // wifi netif if_key (bridge port[1]); NULL for endpoints

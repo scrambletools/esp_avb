@@ -14,6 +14,7 @@
 #include "avbbridge.h"
 #include "audio_codec_if.h"
 #include "esp_codec_dev.h"
+#include "esp_app_desc.h"
 #include "esp_timer.h"
 #include <driver/gpio.h>
 #include <esp_task_wdt.h>
@@ -1171,10 +1172,27 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
     snprintf((char *)state->own_entity.detail.entity_name,
              sizeof(state->own_entity.detail.entity_name), "%s",
              state->config.entity_name);
-  if (state->config.firmware_version)
+  {
+    /* esp_avb appends its version and the build, the ELF hash prefix
+     * the boot log prints, so a controller can tell what a device runs
+     * without a serial connection. A long application version gives
+     * way to the suffix. */
+    char elf_sha[10];
+    esp_app_get_elf_sha256(elf_sha, sizeof(elf_sha));
+    char suffix[40];
+    int suffix_len = snprintf(suffix, sizeof(suffix), "(esp_avb %s - %s)",
+                              ESP_AVB_VERSION, elf_sha);
+    const char *app_version =
+        state->config.firmware_version ? state->config.firmware_version : "";
+    int room = (int)sizeof(state->own_entity.detail.firmware_version) - 2 -
+               suffix_len;
     snprintf((char *)state->own_entity.detail.firmware_version,
-             sizeof(state->own_entity.detail.firmware_version), "%s",
-             state->config.firmware_version);
+             sizeof(state->own_entity.detail.firmware_version), "%.*s%s%s",
+             room > 0 ? room : 0, app_version, *app_version ? " " : "",
+             suffix);
+  }
+  avbinfo("Firmware version: %.64s",
+          (const char *)state->own_entity.detail.firmware_version);
   if (state->config.group_name)
     snprintf((char *)state->own_entity.detail.group_name,
              sizeof(state->own_entity.detail.group_name), "%s",
