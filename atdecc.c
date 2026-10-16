@@ -3674,6 +3674,17 @@ int avb_send_acmp_response(avb_state_s *state, acmp_msg_type_t msg_type,
   return ret;
 }
 
+/* Behind a Wi-Fi hop a stream is Class B (AVB Wireless §4), so a station
+ * listener asks for Class B whatever it was asked or last recorded: a
+ * wired talker takes the class from the first connection, and the bridge
+ * refuses a Class A stream toward Wi-Fi. CLASS_B is the 0x0001 ACMP flag. */
+static uint16_t listener_connect_flags(const avb_state_s *state,
+                                       uint16_t flags) {
+  if (state->port[0].medium == avb_port_medium_wifi_ftm)
+    flags |= 0x0001;
+  return flags;
+}
+
 /* Process ACMP connect/disconnect rx command */
 static int avb_send_listener_talker_command(avb_state_s *state,
                                             acmp_message_s *msg,
@@ -3684,6 +3695,11 @@ static int avb_send_listener_talker_command(avb_state_s *state,
 
   acmp_message_s new_command = {0};
   memcpy(&new_command, msg, sizeof(acmp_message_s));
+  if (!disconnect) {
+    uint16_t flags =
+        listener_connect_flags(state, octets_to_uint(new_command.flags, 2));
+    int_to_octets(&flags, new_command.flags, 2);
+  }
 
   /* For MVU BIND/UNBIND the AECP response has already accepted the binding
    * state change. This talker-side ACMP command is the listener's subsequent
@@ -4748,8 +4764,10 @@ static bool avb_fast_connect_listener(avb_state_s *state, uint16_t index) {
   /* Carry the persisted stream class: without it every journaled
    * rebind after a reboot silently reverted a Class B connection to
    * Class A (the talker stamps the class from these flags on first
-   * connection). CLASS_B is the 0x0001 ACMP flag. */
-  uint16_t rebind_flags = stream->stream_info_flags.class_b ? 0x0001u : 0u;
+   * connection). A station asks for Class B even after a talker answered
+   * Class A once. CLASS_B is the 0x0001 ACMP flag. */
+  uint16_t rebind_flags = listener_connect_flags(
+      state, stream->stream_info_flags.class_b ? 0x0001u : 0u);
   int_to_octets(&rebind_flags, cmd.flags, 2);
 
   if (avb_send_acmp_command(state, acmp_msg_type_connect_tx_command, &cmd,
