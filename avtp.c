@@ -1978,6 +1978,11 @@ typedef struct {
    * The ring-pressure escape still overrides it. */
   bool pt_await_anchor;
   int64_t pt_await_start_us; /* give-up bound for tu=1 streams */
+  /* tu=1 packets that found the flushed ring empty, so could not arm the
+   * anchor: the give-up's evidence. The handler counts, the drain keeps
+   * the count at the start of each wait. */
+  volatile uint32_t pt_unarmed_arrivals;
+  uint32_t pt_await_unarmed_base;
   int64_t gate_late_since_us; /* first late anchor passed over, 0 = none */
   /* Playout latency the path has needed (the presentation phase, kept
    * by the drain while locked on presentation time): a relock and a
@@ -2455,6 +2460,19 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
   ctx->phase_samples++;
 }
 
+/* Hold playout for a fresh presentation anchor, see the anchor wait in
+ * the drain. */
+static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
+  ctx->pt_await_anchor = true;
+  ctx->pt_await_start_us = now_us;
+  ctx->pt_await_unarmed_base = ctx->pt_unarmed_arrivals;
+}
+
+/* Arrivals into the empty ring that the give-up needs before it decides
+ * the stream cannot arm: a tu=1 stream supplies one per drain pass, a
+ * talker's 8-packet tu hold around a BTC change at most 8. */
+#define PT_AWAIT_UNARMED_MIN 16
+
 /* Single-core stations: the 1 ms esp_timer drain runs below the Wi-Fi
  * task, which also runs this station's own receive path, so during a
  * burst the drain waited past the ~2 ms of audio queued in the TX DMA
@@ -2493,13 +2511,16 @@ static void stream_in_drain_cb(void *arg) {
      * arriving into an EMPTY ring (its timestamp must describe the
      * ring tail). Keep the ring flushed until that happens so the
      * next packet arms with correct alignment; give up after 100 ms
-     * of arrivals that armed nothing (tu=1 streams never arm) and fall
-     * back to prefill. A pause with no packets at all proves nothing
-     * (a Wi-Fi talker stalls longer than that), so keep waiting. */
+     * in which tu=1 packets kept reaching the flushed ring without
+     * arming (tu=1 streams never arm) and fall back to prefill. Packets
+     * that land before the first flush cannot arm, and a pause with no
+     * packets at all proves nothing (a Wi-Fi talker stalls longer than
+     * that), so neither counts: keep waiting. */
     if (ctx->pt_await_anchor &&
         !atomic_load_explicit(&ctx->gate_armed, memory_order_acquire)) {
       if (esp_timer_get_time() - ctx->pt_await_start_us > 100000 &&
-          ctx->last_packet_us > ctx->pt_await_start_us) {
+          ctx->pt_unarmed_arrivals - ctx->pt_await_unarmed_base >=
+              PT_AWAIT_UNARMED_MIN) {
         /* Packets arrived for 100 ms into the flushed ring and none
          * armed an anchor: tu=1 stream (or equivalent), pt-gating is
          * impossible, stop re-gate attempts for good. */
@@ -2559,8 +2580,7 @@ static void stream_in_drain_cb(void *arg) {
             ctx->gate_late_since_us = now_us;
           atomic_store_explicit(&ctx->gate_armed, false,
                                 memory_order_release);
-          ctx->pt_await_anchor = true;
-          ctx->pt_await_start_us = now_us;
+          stream_in_await_anchor(ctx, now_us);
           return;
         }
         if (diff >= 0 && diff < 50000000) {
@@ -2580,8 +2600,7 @@ static void stream_in_drain_cb(void *arg) {
            * anchor-await flush loop above). */
           atomic_store_explicit(&ctx->gate_armed, false,
                                 memory_order_release);
-          ctx->pt_await_anchor = true;
-          ctx->pt_await_start_us = esp_timer_get_time();
+          stream_in_await_anchor(ctx, esp_timer_get_time());
           return;
         }
       } else if (fill >= JITTER_PREFILL && !ctx->pt_await_anchor) {
@@ -2611,8 +2630,10 @@ static void stream_in_drain_cb(void *arg) {
                                 memory_order_relaxed);
     /* No logging here (esp_timer task) — stash for the stats printer. */
     ctx->diag_gate_mode = pt_mode ? 1 : 2;
-    if (pt_mode)
+    if (pt_mode) {
       ctx->pt_regate_interval_us = 0;
+      ctx->pt_regate_done = false; /* this stream can arm after all */
+    }
     ctx->diag_gate_err_ns = pt_err_ns;
     ctx->diag_gate_fill = fill;
   }
@@ -2642,8 +2663,7 @@ static void stream_in_drain_cb(void *arg) {
         regate_interval_us * 2 > PT_REGATE_INTERVAL_MAX_US
             ? PT_REGATE_INTERVAL_MAX_US
             : regate_interval_us * 2;
-    ctx->pt_await_anchor = true;
-    ctx->pt_await_start_us = esp_timer_get_time();
+    stream_in_await_anchor(ctx, esp_timer_get_time());
     ctx->pt_regates++;
     ctx->drain_locked = false;
     ctx->gate_late_since_us = 0;
@@ -3165,14 +3185,18 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
      * tail, so its avtp_timestamp is the presentation time of the
      * drain's next byte. tu=1 packets never arm — the drain then
      * falls back to the byte-prefill gate. */
-    if (pre_fill == 0 && !(avtp_data[3] & 0x01) &&
+    if (pre_fill == 0 &&
         !atomic_load_explicit(&ctx->gate_armed, memory_order_relaxed)) {
-      ctx->gate_avtp_ts = ((uint32_t)avtp_data[12] << 24) |
-                          ((uint32_t)avtp_data[13] << 16) |
-                          ((uint32_t)avtp_data[14] << 8) |
-                          (uint32_t)avtp_data[15];
-      ctx->gate_arm_us = esp_timer_get_time();
-      atomic_store_explicit(&ctx->gate_armed, true, memory_order_release);
+      if (avtp_data[3] & 0x01) {
+        ctx->pt_unarmed_arrivals++;
+      } else {
+        ctx->gate_avtp_ts = ((uint32_t)avtp_data[12] << 24) |
+                            ((uint32_t)avtp_data[13] << 16) |
+                            ((uint32_t)avtp_data[14] << 8) |
+                            (uint32_t)avtp_data[15];
+        ctx->gate_arm_us = esp_timer_get_time();
+        atomic_store_explicit(&ctx->gate_armed, true, memory_order_release);
+      }
     }
   } else if (total > 0) {
     ctx->ring_write_fail++;
