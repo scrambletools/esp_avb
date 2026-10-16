@@ -914,11 +914,21 @@ static void avb_stream_out_task(void *task_param) {
   /* Slot-slip guard (see the packet loop): jump-density state, hold
    * counter, counters, and a log budget for the first detections. */
   int32_t slip_prev_x = 0;
-  int32_t slip_absdiff_ema = 0;
+  /* Running mean |dx| in Q4. Kept in whole LSB, a >> 10 step cannot
+   * rise on steps under 1024 above the mean and reads hundreds of LSB
+   * low, which disables the relative gate. */
+  int32_t slip_absdiff_ema_q4 = 0;
   uint32_t slip_sample = 100;       /* running sample index */
   uint32_t slip_edge_sample = 0;    /* sample index of the last step */
   int32_t slip_edge_dx = 0, slip_edge_mag = 0, slip_inner_max = 0;
   uint8_t slip_window[512] = {0};
+  /* Pulse window spans 64 ms at any packet interval (512 at Class A,
+   * 256 at Class B). */
+  unsigned slip_window_len = (unsigned)(64000 / params->interval);
+  if (slip_window_len < 1)
+    slip_window_len = 1;
+  if (slip_window_len > sizeof(slip_window))
+    slip_window_len = sizeof(slip_window);
   unsigned slip_window_pos = 0, slip_window_sum = 0;
   uint32_t slip_armed_pkts = 0;
   uint32_t slip_mute_hold = 0;
@@ -1622,11 +1632,12 @@ static void avb_stream_out_task(void *task_param) {
        * the whole event (checked offline against a -25 dBFS room event
        * and every clean capture: zero detections; every corrupted
        * capture: detected within seconds). Three pulses inside the last
-       * 512 packets (64 ms at 8000 pps) is an episode: mute the output,
-       * hold 500 ms, extend by 250 ms while the window is still busy,
-       * then fade back in over 1 ms. Runs on the raw left input, before
-       * the DC block and the mute, so the mute never hides the evidence
-       * from the detector. */
+       * 64 ms is an episode: mute the output, hold it until 500 ms pass
+       * without another episode, then fade back in over 1 ms. Fewer
+       * pulses never extend the hold: a steady background of one or two
+       * per window would otherwise keep the talker muted indefinitely.
+       * Runs on the raw left input, before the DC block and the mute, so
+       * the mute never hides the evidence from the detector. */
       {
         int pulses = 0;
         for (int f = 0; f < this_spp; f++) {
@@ -1635,12 +1646,13 @@ static void avb_stream_out_task(void *task_param) {
           int32_t dx = x - slip_prev_x;
           slip_prev_x = x;
           int32_t adx = dx < 0 ? -dx : dx;
+          int32_t mean_absdiff = slip_absdiff_ema_q4 >> 4;
           uint32_t since = slip_sample - slip_edge_sample;
-          if (slip_armed_pkts > 400 && adx > 4096 && adx > 8 * slip_absdiff_ema) {
+          if (slip_armed_pkts > 400 && adx > 4096 && adx > 8 * mean_absdiff) {
             bool returns = since >= 2 && since <= 5 &&
                            ((dx < 0) != (slip_edge_dx < 0)) &&
                            adx < 2 * slip_edge_mag && adx > slip_edge_mag / 2;
-            int32_t smooth_limit = slip_absdiff_ema > 512 ? slip_absdiff_ema : 512;
+            int32_t smooth_limit = mean_absdiff > 512 ? mean_absdiff : 512;
             if (returns && slip_inner_max <= 4 * smooth_limit) {
               pulses++;
               slip_edge_sample = slip_sample - 100; /* consumed */
@@ -1653,7 +1665,7 @@ static void avb_stream_out_task(void *task_param) {
           } else if (since <= 5 && adx > slip_inner_max) {
             slip_inner_max = adx;
           }
-          slip_absdiff_ema += (adx - slip_absdiff_ema) >> 10;
+          slip_absdiff_ema_q4 += ((adx << 4) - slip_absdiff_ema_q4) >> 10;
           slip_sample++;
         }
         if (slip_armed_pkts <= 400)
@@ -1661,7 +1673,8 @@ static void avb_stream_out_task(void *task_param) {
         slip_window_sum -= slip_window[slip_window_pos];
         slip_window[slip_window_pos] = (uint8_t)(pulses > 255 ? 255 : pulses);
         slip_window_sum += slip_window[slip_window_pos];
-        slip_window_pos = (slip_window_pos + 1) & 511;
+        if (++slip_window_pos >= slip_window_len)
+          slip_window_pos = 0;
         if (slip_window_sum >= 3) {
           if (slip_mute_hold == 0) {
             slip_events++;
@@ -1670,7 +1683,8 @@ static void avb_stream_out_task(void *task_param) {
             if (slip_log_budget > 0) {
               slip_log_budget--;
               avbwarn("slot slip: %u pulses in 64 ms (mean |dx| %ld), muting",
-                      (unsigned)slip_window_sum, (long)slip_absdiff_ema);
+                      (unsigned)slip_window_sum,
+                      (long)(slip_absdiff_ema_q4 >> 4));
             }
           }
           slip_mute_hold = (uint32_t)(500000 / params->interval); /* 500 ms */
@@ -1678,15 +1692,10 @@ static void avb_stream_out_task(void *task_param) {
         if (slip_mute_hold > 0) {
           slip_muted_pkts++;
           if (--slip_mute_hold == 0) {
-            if (slip_window_sum >= 1) {
-              /* Still busy: stay muted another 250 ms. */
-              slip_mute_hold = (uint32_t)(250000 / params->interval);
-            } else {
-              /* Quiet: 1 ms fade-in. */
-              mic_dsp.mute_step = (int32_t)(65536 / (params->sample_rate / 1000));
-              if (mic_dsp.mute_step < 1)
-                mic_dsp.mute_step = 1;
-            }
+            /* 500 ms without an episode: 1 ms fade-in. */
+            mic_dsp.mute_step = (int32_t)(65536 / (params->sample_rate / 1000));
+            if (mic_dsp.mute_step < 1)
+              mic_dsp.mute_step = 1;
           }
         }
       }
