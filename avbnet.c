@@ -293,6 +293,17 @@ static bool s_pacer_draining;
  * Wi-Fi deliveries. */
 static gptimer_handle_t s_pacer_timer;
 static TaskHandle_t s_pacer_task;
+/* gptimer_set_alarm_action() refuses a config outside internal RAM when
+ * CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM is set, and the forward path drains
+ * on an esp-hosted thread whose stack is in PSRAM with
+ * CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM, so the config is static.
+ * Written under s_pacer_lock. */
+static DRAM_ATTR gptimer_alarm_config_t s_pacer_alarm;
+/* Alarms fired, pacer task wakeups, queued frames released by the pacer
+ * task and by the forward path, and alarm arms that failed. */
+static volatile uint32_t s_pacer_alarms, s_pacer_wakeups;
+static volatile uint32_t s_pacer_task_sent, s_pacer_forward_sent;
+static volatile uint32_t s_pacer_arm_fail;
 static volatile uint32_t s_fwd_eth_paced, s_fwd_eth_pace_overflow;
 static volatile uint32_t s_pacer_depth_max;
 static volatile uint32_t s_pacer_no_tspec, s_pacer_no_entry;
@@ -309,15 +320,17 @@ static inline void station_pacer_note_send(station_pacer_t *pacer,
 
 /* Send every queued frame whose turn has come, then arm the timer for
  * the next one. One context drains at a time, so a stream's frames
- * leave in order; transmits happen outside the lock. */
-static void station_pacer_drain(void) {
+ * leave in order; transmits happen outside the lock. Returns the frames
+ * sent. */
+static uint32_t station_pacer_drain(void) {
   portENTER_CRITICAL(&s_pacer_lock);
   if (s_pacer_draining) {
     portEXIT_CRITICAL(&s_pacer_lock);
-    return;
+    return 0;
   }
   s_pacer_draining = true;
   portEXIT_CRITICAL(&s_pacer_lock);
+  uint32_t sent = 0;
   int64_t earliest_ns;
   for (;;) {
     int64_t now_ns = esp_timer_get_time() * 1000;
@@ -349,6 +362,7 @@ static void station_pacer_drain(void) {
     if (!due)
       break;
     avb_bridge_forward(due->egress_port, 0x8100, frame, len);
+    sent++;
     portENTER_CRITICAL(&s_pacer_lock);
     due->in_flight--;
     portEXIT_CRITICAL(&s_pacer_lock);
@@ -357,10 +371,15 @@ static void station_pacer_drain(void) {
     int64_t delay_us = (earliest_ns - esp_timer_get_time() * 1000 + 999) / 1000;
     uint64_t now_ticks = 0;
     gptimer_get_raw_count(s_pacer_timer, &now_ticks);
-    gptimer_alarm_config_t alarm = {
-        .alarm_count = now_ticks + (uint64_t)(delay_us < 5 ? 5 : delay_us)};
-    gptimer_set_alarm_action(s_pacer_timer, &alarm);
+    portENTER_CRITICAL(&s_pacer_lock);
+    s_pacer_alarm.alarm_count =
+        now_ticks + (uint64_t)(delay_us < 5 ? 5 : delay_us);
+    esp_err_t armed = gptimer_set_alarm_action(s_pacer_timer, &s_pacer_alarm);
+    portEXIT_CRITICAL(&s_pacer_lock);
+    if (armed != ESP_OK)
+      s_pacer_arm_fail++;
   }
+  return sent;
 }
 
 static bool IRAM_ATTR
@@ -370,6 +389,7 @@ station_pacer_alarm(gptimer_handle_t timer,
   (void)event;
   (void)arg;
   BaseType_t woken = pdFALSE;
+  s_pacer_alarms++;
   vTaskNotifyGiveFromISR(s_pacer_task, &woken);
   return woken == pdTRUE;
 }
@@ -378,7 +398,8 @@ static void station_pacer_task(void *arg) {
   (void)arg;
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    station_pacer_drain();
+    s_pacer_wakeups++;
+    s_pacer_task_sent += station_pacer_drain();
   }
 }
 
@@ -531,13 +552,23 @@ static bool station_pacer_forward(int egress_port, const uint8_t *frame,
     }
     break;
   }
-  station_pacer_drain();
+  s_pacer_forward_sent += station_pacer_drain();
   return true;
 }
 
 void avb_bridge_pacer_bypass_stats(uint32_t *no_tspec, uint32_t *no_entry) {
   if (no_tspec) *no_tspec = s_pacer_no_tspec;
   if (no_entry) *no_entry = s_pacer_no_entry;
+}
+
+void avb_bridge_pacer_wake_stats(uint32_t *alarms, uint32_t *wakeups,
+                                 uint32_t *task_sent, uint32_t *forward_sent,
+                                 uint32_t *arm_fail) {
+  if (alarms) *alarms = s_pacer_alarms;
+  if (wakeups) *wakeups = s_pacer_wakeups;
+  if (task_sent) *task_sent = s_pacer_task_sent;
+  if (forward_sent) *forward_sent = s_pacer_forward_sent;
+  if (arm_fail) *arm_fail = s_pacer_arm_fail;
 }
 
 void avb_bridge_forward_stats_paced(uint32_t *paced, uint32_t *overflow,

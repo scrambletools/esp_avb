@@ -1153,6 +1153,12 @@ void avb_bridge_forward_stats_bundles(uint32_t *bundles, uint32_t *frames);
 /* Bridge: station stream frames forwarded unpaced because their Talker
  * Advertise was not found, or no pacer entry was free. */
 void avb_bridge_pacer_bypass_stats(uint32_t *no_tspec, uint32_t *no_entry);
+/* Bridge: uplink pacer alarms fired, pacer task wakeups, queued frames
+ * released by the pacer task and by the forward path, and alarm arms
+ * that failed. */
+void avb_bridge_pacer_wake_stats(uint32_t *alarms, uint32_t *wakeups,
+                                 uint32_t *task_sent, uint32_t *forward_sent,
+                                 uint32_t *arm_fail);
 /* Bridge: stream frames missing or late on arrival from Ethernet, and
  * frames sent unbundled for lack of a slot. */
 void avb_bridge_bundle_ingress_stats(uint32_t *lost, uint32_t *late,
