@@ -3953,14 +3953,13 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     /* IEEE 1722.1-2021 §8.2.1.16 Table 8-4: CLASS_B is the 0x0001
      * flag (the table's bit numbering is MSB-first labeling, every
      * mainstream implementation carries CLASS_B as the least
-     * significant bit). The class is selected per
-     * connection at CONNECT_RX time; one stream can be set up as
-     * either Class A or Class B but cannot be transmitted as both
-     * simultaneously. Gate: lock class only when at least one
-     * ACMP-confirmed listener is bound; subsequent CONNECTs must
-     * match. MSRP-only listener entries (peers that declared
-     * Listener but never completed ACMP CONNECT_TX) do not lock
-     * the class — they're "interested but not committed". */
+     * significant bit). One stream goes out in one class: the first
+     * ACMP-confirmed listener sets it, and while other such listeners
+     * remain, a request for the other class gets the stream's current
+     * class instead of a refusal (Milan v1.3 §5.5.4.1: a probe gets
+     * success, §5.5.2.7: it does not change the talker's state).
+     * MSRP-only listener entries (peers that declared Listener but
+     * never completed ACMP CONNECT_TX) do not hold the class. */
     uint16_t cmd_flags = octets_to_uint(msg->flags, 2);
     bool req_class_b = (cmd_flags & 0x0001) != 0;
     /* Behind a Wi-Fi hop a stream is Class B (AVB Wireless §4) whatever
@@ -3969,22 +3968,21 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
       avbinfo("ACMP: stream %d stays Class B behind Wi-Fi", talker_uid);
       req_class_b = true;
     }
+    /* The requester's own earlier connection does not hold the class. */
     uint16_t conn_count = octets_to_uint(stream->connection_count, 2);
-    int acmp_locked = 0;
+    int other_listeners = 0;
     for (int i = 0; i < conn_count && i < AVB_MAX_NUM_CONNECTED_LISTENERS;
          i++) {
-      if (stream->connected_listeners[i].acmp_connected)
-        acmp_locked++;
+      if (stream->connected_listeners[i].acmp_connected && i != listener_idx)
+        other_listeners++;
     }
-    if (acmp_locked > 0 &&
+    if (other_listeners > 0 &&
         (bool)stream->stream_info_flags.class_b != req_class_b) {
-      avbwarn("ACMP: stream %d class-mismatch CONNECT_TX rejected "
-              "(active class %s, requested %s, acmp_listeners=%d/%u)",
+      avbinfo("ACMP: stream %d stays Class %s for %d other listener(s), "
+              "Class %s asked",
               talker_uid, stream->stream_info_flags.class_b ? "B" : "A",
-              req_class_b ? "B" : "A", acmp_locked, (unsigned)conn_count);
-      avb_send_acmp_response(state, tx_response_type, msg,
-                             acmp_status_talker_exclusive);
-      return ERROR;
+              other_listeners, req_class_b ? "B" : "A");
+      req_class_b = stream->stream_info_flags.class_b;
     }
 
     listener_idx = find_or_add_talker_listener_by_identity(
@@ -4000,14 +3998,14 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     stream->connected_listeners[listener_idx].last_seen_us =
         esp_timer_get_time();
 
-    /* First-connection edge stamps the class onto the stream.
+    /* With no other listener, the request sets the stream's class.
      * Also re-derive vlan_id from msrp_mappings[mapping_index] —
      * Class A and Class B may live on different VIDs (strict AVB
      * switches enforce one-class-per-VLAN), so the per-stream vlan_id
      * has to follow the class flip. */
     if (stream->stream_info_flags.class_b != req_class_b) {
-      avbinfo("ACMP: stream %d class set to %s by first connection", talker_uid,
-              req_class_b ? "B" : "A");
+      avbinfo("ACMP: stream %d class set to %s by its only listener",
+              talker_uid, req_class_b ? "B" : "A");
       stream->stream_info_flags.class_b = req_class_b ? 1 : 0;
       uint16_t mapping_index = req_class_b ? 1 : 0;
       if (mapping_index < state->msrp_mappings_count) {
