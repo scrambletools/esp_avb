@@ -1165,13 +1165,26 @@ void avb_wifi_bundle_rx_stats(uint32_t *bundles, uint32_t *frames,
  * recovered by a retransmission, gaps given up, duplicates dropped. */
 void avb_wifi_retx_stats(uint32_t *nacks, uint32_t *recovered,
                          uint32_t *given_up, uint32_t *duplicates);
+/* NACKs a receiver left unsent: the gap could not wait for an answer. */
+void avb_wifi_retx_detail(uint32_t *skipped);
+/* Audio the listener of stream_id holds ahead of its playout, in us;
+ * false unless that listener is playing. */
+bool avb_stream_in_buffered_us(const uint8_t *stream_id, int32_t *buffered_us);
 /* Wi-Fi hop retransmission, bridge side: NACKs received, bundles resent,
  * requests too old to resend. */
 void avb_bridge_retx_stats(uint32_t *nacks, uint32_t *retx, uint32_t *stale);
+/* Outcome of every bundle NACKs asked for: requested = retx + late +
+ * spaced + evicted + no_slot + no_room + tx_fail. */
+void avb_bridge_retx_detail(uint32_t *requested, uint32_t *late,
+                            uint32_t *spaced, uint32_t *evicted,
+                            uint32_t *no_slot, uint32_t *no_room,
+                            uint32_t *tx_fail);
 /* Station talker: Wi-Fi bundles sent and frames in them, the bridge's
  * NACKs received and bundles resent. */
 void avb_wifi_tx_bundle_stats(uint32_t *bundles, uint32_t *frames);
 void avb_wifi_tx_retx_stats(uint32_t *nacks, uint32_t *retx);
+/* Uplink NACK requests left unanswered: too late, or no longer kept. */
+void avb_wifi_tx_retx_detail(uint32_t *late, uint32_t *evicted);
 
 /* AVB send functions */
 

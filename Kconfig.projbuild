@@ -191,6 +191,31 @@ menu "AVB Configuration"
             frames shrinks by about a third. Every receiver must run
             firmware that understands compact bundles.
 
+    config ESP_AVB_WIFI_RETX_HOLD_MAX_US
+        int "Longest wait for a retransmitted Wi-Fi bundle (us)"
+        default 40000
+        range 1000 100000
+        help
+            A receiver that sees a gap in a stream's bundles holds the
+            bundles after it and asks for the missing one. A station
+            waits while its listener still plays audio queued before the
+            gap, less 3 ms, and never longer than this. Each held bundle
+            stays in RAM meanwhile, at most 32 per stream.
+
+    config ESP_AVB_WIFI_RETX_DOWNSTREAM_LATENCY_US
+        int "Playout latency assumed behind the bridge for uplink gaps (us)"
+        default 0
+        range 0 100000
+        depends on ESP_AVB_ROLE_BRIDGE
+        help
+            The bridge has no listener of its own, so it waits for a
+            station's missing uplink bundle only until the earliest held
+            frame's presentation time plus this, less 3 ms. With 0 it
+            waits at most 1 ms past presentation time and, as station
+            talkers arrive after it, sends no NACKs. Set it to a value the
+            wired listeners' playout latency covers to trade uplink
+            latency for recovery.
+
     config ESP_AVB_WIFI_DELIVERABLE_FRAMES
         int "Wi-Fi port deliverable frames a second"
         default 6000

@@ -3218,6 +3218,19 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   }
 }
 
+/* Audio the listener of stream_id holds ahead of its playout, in us;
+ * false unless that listener is playing. Called from the Wi-Fi receive
+ * path: head and tail are atomics, the rest is fixed while playing. */
+bool avb_stream_in_buffered_us(const uint8_t *stream_id, int32_t *buffered_us) {
+  stream_rx_ctx_t *ctx = s_stream_rx_ctx;
+  if (!ctx || !ctx->phase_valid || ctx->ring_bytes_per_sec == 0 ||
+      memcmp(ctx->expected_stream_id, stream_id, UNIQUE_ID_LEN) != 0)
+    return false;
+  *buffered_us = (int32_t)(((uint64_t)ring_readable(&ctx->ring) * 1000000ULL) /
+                           ctx->ring_bytes_per_sec);
+  return true;
+}
+
 /* Print stream-in diagnostics — called from AVB main loop (safe for UART).
  * One-shot: prints first-packet info once, then suppressed. */
 void avb_stream_in_print_diag(void) {
@@ -3257,7 +3270,9 @@ void avb_stream_in_print_diag(void) {
   uint32_t bundles = 0, bundle_frames = 0, split_fail = 0;
   avb_wifi_bundle_rx_stats(&bundles, &bundle_frames, &split_fail);
   uint32_t nacks = 0, recovered = 0, given_up = 0, duplicates = 0;
+  uint32_t nacks_skipped = 0;
   avb_wifi_retx_stats(&nacks, &recovered, &given_up, &duplicates);
+  avb_wifi_retx_detail(&nacks_skipped);
 
   /* Playout phase window (see stream_in_phase_tick). */
   uint32_t phase_n = ctx->phase_reset ? 0 : ctx->phase_samples;
@@ -3271,7 +3286,8 @@ void avb_stream_in_print_diag(void) {
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
           "qfill=%lu id_skip=%lu rate_mm=%lu seq_gap=%lu conceal=%lu/%lu "
           "spl=%lu rx_drops=%lu locked=%lu/%lu gate=%s(err=%ldns fill=%lu) "
-          "bundles=%lu/%lu nack=%lu rec=%lu gaveup=%lu dup=%lu starved=%luB "
+          "bundles=%lu/%lu nack=%lu nack_skip=%lu rec=%lu gaveup=%lu dup=%lu "
+          "starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu",
           (unsigned long)(packets - last_pkt),
@@ -3294,8 +3310,9 @@ void avb_stream_in_print_diag(void) {
                                      : "none",
           (long)ctx->diag_gate_err_ns, (unsigned long)ctx->diag_gate_fill,
           (unsigned long)bundles, (unsigned long)bundle_frames,
-          (unsigned long)nacks, (unsigned long)recovered,
-          (unsigned long)given_up, (unsigned long)duplicates,
+          (unsigned long)nacks, (unsigned long)nacks_skipped,
+          (unsigned long)recovered, (unsigned long)given_up,
+          (unsigned long)duplicates,
           ctx->state ? (unsigned long)atomic_load_explicit(
                            &ctx->state->media_clock.i2s_tx_starved_bytes,
                            memory_order_relaxed)
@@ -3367,9 +3384,11 @@ void avb_stream_out_print_diag(void) {
   uint32_t anchors = ctx->ts_reanchors;
   uint32_t dropped = ctx->i2s_dropped_bytes;
   uint32_t wbundles = 0, wbundle_frames = 0, wnacks = 0, wretx = 0;
+  uint32_t wretx_late = 0, wretx_evicted = 0;
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
   avb_wifi_tx_bundle_stats(&wbundles, &wbundle_frames);
   avb_wifi_tx_retx_stats(&wnacks, &wretx);
+  avb_wifi_tx_retx_detail(&wretx_late, &wretx_evicted);
 #endif
   (void)wbundle_frames;
   int64_t over_max = ctx->overrun_max_us;
@@ -3393,7 +3412,7 @@ void avb_stream_out_print_diag(void) {
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
           "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus "
-          "wbundles=%lu wnack=%lu wretx=%lu",
+          "wbundles=%lu wnack=%lu wretx=%lu/%lu/%lu",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -3414,7 +3433,8 @@ void avb_stream_out_print_diag(void) {
           (unsigned long)(anchors - last_anchors),
           (unsigned long)(dropped - last_dropped),
           (long)(ctx->ts_err_ns / 1000), (unsigned long)wbundles,
-          (unsigned long)wnacks, (unsigned long)wretx);
+          (unsigned long)wnacks, (unsigned long)wretx,
+          (unsigned long)wretx_late, (unsigned long)wretx_evicted);
 
   /* Secondary detail lines only emitted when samples were actually
    * collected, to keep noise-free output when the stream is idle. */

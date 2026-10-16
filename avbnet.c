@@ -981,12 +981,26 @@ void avb_wifi_bundle_rx_stats(uint32_t *bundles, uint32_t *frames,
  * conceals the gap as before. The NACK is an untagged AVTP experimental
  * stream PDU:
  *   14 subtype 0x7F   15 sv   18..25 stream_id   26..29 "AVBN"
- *   30..31 first missing bundle seq   32 count */
+ *   30..31 first missing bundle seq   32 count
+ *   33..34 time the receiver still waits, 100 us units, 0 unknown */
 #define WIFI_NACK_AVTP 14
 #define WIFI_NACK_FRAME_LEN 60
-#define WIFI_BUNDLE_HOLD 24
-#define WIFI_BUNDLE_HOLD_US 15000
-#define WIFI_NACK_REPEAT_US 5000
+#ifndef CONFIG_ESP_AVB_WIFI_RETX_HOLD_MAX_US
+#define CONFIG_ESP_AVB_WIFI_RETX_HOLD_MAX_US 40000
+#endif
+#ifndef CONFIG_ESP_AVB_WIFI_RETX_DOWNSTREAM_LATENCY_US
+#define CONFIG_ESP_AVB_WIFI_RETX_DOWNSTREAM_LATENCY_US 0
+#endif
+#define WIFI_BUNDLE_HOLD 32
+#define WIFI_BUNDLE_HOLD_US CONFIG_ESP_AVB_WIFI_RETX_HOLD_MAX_US
+/* A NACK and its answer each cross a loaded FIFO; repeating sooner only
+ * duplicates the answer still on its way. */
+#define WIFI_NACK_REPEAT_US 15000
+/* Below this a copy cannot cross the hop and still be played. */
+#define WIFI_RETX_MIN_BUDGET_US 3000
+/* A NACK's waiting time less its own trip to the sender. */
+#define WIFI_NACK_TRIP_US 2000
+#define WIFI_NACK_BUDGET 33
 #define WIFI_RX_STREAMS 4
 static const uint8_t s_wifi_nack_tag[4] = {'A', 'V', 'B', 'N'};
 
@@ -1011,7 +1025,7 @@ typedef struct {
 
 static wifi_bundle_rx_t s_bundle_rx[WIFI_RX_STREAMS];
 static volatile uint32_t s_wifi_nacks_tx, s_wifi_recovered, s_wifi_given_up,
-    s_wifi_dup_rx;
+    s_wifi_dup_rx, s_wifi_nacks_skipped;
 
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
 static void wifi_tx_nack_handle(const uint8_t *nack);
@@ -1024,9 +1038,10 @@ static bool wifi_nack_is(const uint8_t *buf, uint32_t len) {
 }
 
 /* At most this many NACKs a second: under sustained loss they cannot
- * help, and would only take more of the channel. Called from the Wi-Fi
+ * help, and would only take more of the channel (loss bursts ran 30 to
+ * 50 gaps a second and recovered about 1 %). Called from the Wi-Fi
  * receive task only. */
-#define WIFI_NACK_MAX_PER_S 100
+#define WIFI_NACK_MAX_PER_S 20
 
 static bool wifi_nack_rate_ok(void) {
   static int64_t window_us;
@@ -1047,7 +1062,7 @@ static bool wifi_nack_rate_ok(void) {
  * locally administered bit set: frames for the AP's own address end in
  * the coprocessor and never reach the bridge. */
 static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
-                           int count) {
+                           int count, int64_t budget_us) {
   if (!wifi_nack_rate_ok())
     return;
   wifi_ap_record_t ap;
@@ -1066,6 +1081,11 @@ static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
   frame[30] = (uint8_t)(first >> 8);
   frame[31] = (uint8_t)first;
   frame[32] = (uint8_t)(count > 255 ? 255 : count);
+  int64_t units = budget_us / 100;
+  if (units > 0xFFFF)
+    units = 0xFFFF;
+  frame[WIFI_NACK_BUDGET] = (uint8_t)(units >> 8);
+  frame[WIFI_NACK_BUDGET + 1] = (uint8_t)units;
   if (avb_net_transmit_raw(NULL, frame, sizeof(frame)) == ESP_OK)
     s_wifi_nacks_tx++;
 }
@@ -1073,7 +1093,7 @@ static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
 /* The bridge NACKs a station talker's uplink bundles at the station's
  * own address. */
 static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
-                           int count) {
+                           int count, int64_t budget_us) {
   if (!wifi_nack_rate_ok())
     return;
   uint8_t frame[WIFI_NACK_FRAME_LEN] = {0};
@@ -1088,16 +1108,24 @@ static void wifi_nack_send(const wifi_bundle_rx_t *rx, uint16_t first,
   frame[30] = (uint8_t)(first >> 8);
   frame[31] = (uint8_t)first;
   frame[32] = (uint8_t)(count > 255 ? 255 : count);
+  int64_t units = budget_us / 100;
+  if (units > 0xFFFF)
+    units = 0xFFFF;
+  frame[WIFI_NACK_BUDGET] = (uint8_t)(units >> 8);
+  frame[WIFI_NACK_BUDGET + 1] = (uint8_t)units;
   if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, frame, sizeof(frame)) == ESP_OK)
     s_wifi_nacks_tx++;
 }
 #endif
 
 /* A gap is held for a retransmission only while the frames behind it
- * can still be played on time: at most WIFI_BUNDLE_HOLD_US, and no later
- * than the presentation time of the earliest held frame less a margin.
- * Holding longer would release them late in one burst, deepening the
- * listener's playout for good. */
+ * can still be played on time. A local listener plays the audio queued
+ * before the gap first, so the gap may wait until that runs out less a
+ * margin; its playout runs tens of ms behind presentation time on Wi-Fi,
+ * so presentation time alone left only the 1 ms floor. Without a local
+ * listener (the bridge) the bound is presentation time plus the latency
+ * the downstream listener is assumed to add. Never longer than
+ * WIFI_BUNDLE_HOLD_US. */
 #define WIFI_HOLD_PLAYOUT_MARGIN_US 3000
 #define WIFI_HOLD_MIN_US 1000
 
@@ -1121,9 +1149,10 @@ static bool wifi_bundle_first_pts(const uint8_t *buf, uint32_t len,
   return true;
 }
 
-static int64_t wifi_bundle_hold_until(const wifi_bundle_rx_t *rx,
-                                      int64_t now_us) {
-  int64_t until = now_us + WIFI_BUNDLE_HOLD_US;
+/* How long the earliest held frame may still wait, from presentation
+ * time; false when that is unknown. */
+static bool wifi_bundle_pts_budget(const wifi_bundle_rx_t *rx,
+                                   int64_t *budget_us) {
   int lowest = -1;
   for (int i = 0; i < rx->held_count; i++)
     if (lowest < 0 || (int16_t)(rx->held[i].seq - rx->held[lowest].seq) < 0)
@@ -1134,16 +1163,32 @@ static int64_t wifi_bundle_hold_until(const wifi_bundle_rx_t *rx,
       !wifi_bundle_first_pts(rx->held[lowest].buf, rx->held[lowest].len,
                              &pts) ||
       ptpd_now(&clock_now) != 0)
-    return until;
+    return false;
   uint32_t now32 = (uint32_t)((uint64_t)clock_now.tv_sec * 1000000000ULL +
                               (uint64_t)clock_now.tv_nsec);
   int32_t lead_ns = (int32_t)(pts - now32);
   if (lead_ns < -400000000 || lead_ns > 400000000)
-    return until; /* not on this clock's timeline */
-  int64_t budget_us = lead_ns / 1000 - WIFI_HOLD_PLAYOUT_MARGIN_US;
+    return false; /* not on this clock's timeline */
+  *budget_us = lead_ns / 1000 + CONFIG_ESP_AVB_WIFI_RETX_DOWNSTREAM_LATENCY_US -
+               WIFI_HOLD_PLAYOUT_MARGIN_US;
+  return true;
+}
+
+static int64_t wifi_bundle_hold_until(const wifi_bundle_rx_t *rx,
+                                      int64_t now_us) {
+  int64_t budget_us = WIFI_BUNDLE_HOLD_US;
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+  int32_t buffered_us;
+  if (avb_stream_in_buffered_us(rx->stream_id, &buffered_us))
+    budget_us = (int64_t)buffered_us - WIFI_HOLD_PLAYOUT_MARGIN_US;
+  else
+#endif
+    wifi_bundle_pts_budget(rx, &budget_us);
   if (budget_us < WIFI_HOLD_MIN_US)
     budget_us = WIFI_HOLD_MIN_US;
-  return now_us + budget_us < until ? now_us + budget_us : until;
+  if (budget_us > WIFI_BUNDLE_HOLD_US)
+    budget_us = WIFI_BUNDLE_HOLD_US;
+  return now_us + budget_us;
 }
 
 /* Deliver held bundles that are next in sequence; when the hold time
@@ -1256,19 +1301,54 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
   if (rx->deadline_us == 0)
     rx->deadline_us = wifi_bundle_hold_until(rx, now_us);
   /* NACK each newly missing bundle once; repeat only the oldest gap,
-   * and only after a NACK or its answer could have been lost. */
+   * and only after a NACK or its answer could have been lost. No NACK
+   * when the gap cannot wait long enough for an answer. */
   if ((int16_t)(rx->nack_next - rx->expected) < 0)
     rx->nack_next = rx->expected;
+  int64_t budget_us = rx->deadline_us - now_us;
   if ((int16_t)(seq - rx->nack_next) > 0) {
+    if (budget_us >= WIFI_RETX_MIN_BUDGET_US) {
+      rx->last_nack_us = now_us;
+      wifi_nack_send(rx, rx->nack_next, (int16_t)(seq - rx->nack_next),
+                     budget_us);
+    } else {
+      s_wifi_nacks_skipped++;
+    }
+  } else if (now_us - rx->last_nack_us >= WIFI_NACK_REPEAT_US &&
+             budget_us >= WIFI_RETX_MIN_BUDGET_US) {
     rx->last_nack_us = now_us;
-    wifi_nack_send(rx, rx->nack_next, (int16_t)(seq - rx->nack_next));
-  } else if (now_us - rx->last_nack_us >= WIFI_NACK_REPEAT_US) {
-    rx->last_nack_us = now_us;
-    wifi_nack_send(rx, rx->expected, 1);
+    wifi_nack_send(rx, rx->expected, 1, budget_us);
   }
   if ((int16_t)(seq + 1 - rx->nack_next) > 0)
     rx->nack_next = (uint16_t)(seq + 1);
   wifi_bundle_drain(rx, now_us, priv, info);
+}
+
+/* Earliest hold deadline, 0 when nothing is held: the caller arms a
+ * one-shot timer for it. */
+static __attribute__((unused)) int64_t wifi_bundle_next_deadline(void) {
+  int64_t next = 0;
+  for (int i = 0; i < WIFI_RX_STREAMS; i++)
+    if (s_bundle_rx[i].valid && s_bundle_rx[i].held_count &&
+        (next == 0 || s_bundle_rx[i].deadline_us < next))
+      next = s_bundle_rx[i].deadline_us;
+  return next;
+}
+
+/* Give up on gaps whose time ran out while nothing arrived, so the held
+ * audio still plays. Runs from that timer, under the same lock as
+ * wifi_bundle_receive. */
+static __attribute__((unused)) void wifi_bundle_poll(int64_t now_us,
+                                                    void *priv, void *info) {
+  for (int i = 0; i < WIFI_RX_STREAMS; i++)
+    if (s_bundle_rx[i].valid && s_bundle_rx[i].held_count &&
+        now_us >= s_bundle_rx[i].deadline_us)
+      wifi_bundle_drain(&s_bundle_rx[i], now_us, priv, info);
+}
+
+/* NACKs left unsent because the gap could not wait for an answer. */
+void avb_wifi_retx_detail(uint32_t *skipped) {
+  if (skipped) *skipped = s_wifi_nacks_skipped;
 }
 
 void avb_wifi_retx_stats(uint32_t *nacks, uint32_t *recovered,
@@ -1290,6 +1370,7 @@ void avb_wifi_retx_stats(uint32_t *nacks, uint32_t *recovered,
  * time. Internal RAM: copying each bundle into PSRAM from the Ethernet
  * receive task cost enough time there to overflow its descriptor ring. */
 #define WIFI_BUNDLE_HISTORY 24
+/* Age limit for a NACK that carries no waiting time (older stations). */
 #define WIFI_BUNDLE_RETX_MAX_AGE_US 18000
 
 typedef struct {
@@ -1298,7 +1379,7 @@ typedef struct {
   int64_t sent_us;
   int64_t retx_us; /* last retransmission */
 } wifi_bundle_hist_t;
-#define WIFI_BUNDLE_RETX_SPACING_US 4000
+#define WIFI_BUNDLE_RETX_SPACING_US 12000
 
 typedef struct {
   bool valid;
@@ -1319,6 +1400,9 @@ typedef struct {
 static wifi_bundle_slot_t s_bundle_slots[WIFI_BUNDLE_SLOTS];
 static volatile uint32_t s_wifi_bundles_tx, s_wifi_bundle_frames_tx;
 static volatile uint32_t s_wifi_nacks_rx, s_wifi_retx, s_wifi_retx_stale;
+/* Every requested bundle ends in exactly one of these. */
+static volatile uint32_t s_retx_requested, s_retx_no_slot, s_retx_evicted,
+    s_retx_late, s_retx_spaced, s_retx_no_room, s_retx_tx_fail;
 static volatile uint32_t s_wifi_ingress_lost, s_wifi_ingress_late,
     s_wifi_bundle_bypass;
 static portMUX_TYPE s_bundle_hist_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -1442,19 +1526,25 @@ static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
   return true;
 }
 
-/* A station asks for bundles it missed: resend those still young
- * enough to arrive before their presentation time. Runs on the Wi-Fi
- * receive task, concurrently with the sender. */
+/* A station asks for bundles it missed: resend those still in the
+ * history that can arrive while the station waits for them. Runs on the
+ * Wi-Fi receive task, concurrently with the sender. */
 static void wifi_nack_handle(const uint8_t *nack) {
   s_wifi_nacks_rx++;
   const uint8_t *station = nack + ETH_ADDR_LEN;
   uint16_t first = ((uint16_t)nack[30] << 8) | nack[31];
   int count = nack[32];
+  int64_t budget_us =
+      (int64_t)(((uint32_t)nack[WIFI_NACK_BUDGET] << 8) |
+                nack[WIFI_NACK_BUDGET + 1]) * 100;
+  s_retx_requested += count;
   if (!s_retx_buf)
     s_retx_buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES,
                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!s_retx_buf)
+  if (!s_retx_buf) {
+    s_retx_no_room += count;
     return;
+  }
   for (int i = 0; i < WIFI_BUNDLE_SLOTS; i++) {
     wifi_bundle_slot_t *slot = &s_bundle_slots[i];
     if (!slot->valid || !slot->hist_buf ||
@@ -1465,19 +1555,23 @@ static void wifi_nack_handle(const uint8_t *nack) {
       uint16_t want = (uint16_t)(first + n);
       uint16_t len = 0;
       int64_t now_us = esp_timer_get_time();
-      bool stale = false;
+      bool found = false, late = false, spaced = false;
       portENTER_CRITICAL(&s_bundle_hist_lock);
       for (int k = 0; k < WIFI_BUNDLE_HISTORY; k++) {
         wifi_bundle_hist_t *entry = &slot->hist[k];
         if (entry->len == 0 || entry->seq != want)
           continue;
-        if (now_us - entry->sent_us > WIFI_BUNDLE_RETX_MAX_AGE_US) {
-          stale = true;
+        found = true;
+        int64_t age_us = now_us - entry->sent_us;
+        if (budget_us == 0 ? age_us > WIFI_BUNDLE_RETX_MAX_AGE_US
+                           : budget_us - WIFI_NACK_TRIP_US <
+                                 WIFI_RETX_MIN_BUDGET_US) {
+          late = true;
           break;
         }
         if (entry->retx_us != 0 &&
             now_us - entry->retx_us < WIFI_BUNDLE_RETX_SPACING_US) {
-          stale = true; /* just resent: let that copy arrive */
+          spaced = true; /* just resent: let that copy arrive */
           break;
         }
         entry->retx_us = now_us;
@@ -1487,19 +1581,47 @@ static void wifi_nack_handle(const uint8_t *nack) {
         break;
       }
       portEXIT_CRITICAL(&s_bundle_hist_lock);
-      if (stale)
-        s_wifi_retx_stale++;
-      if (len == 0)
+      if (!found) {
+        s_retx_evicted++;
         continue;
+      }
+      if (late || spaced) {
+        if (late)
+          s_retx_late++;
+        else
+          s_retx_spaced++;
+        s_wifi_retx_stale++;
+        continue;
+      }
       if (esp_hosted_data_tx_queue_space &&
-          esp_hosted_data_tx_queue_space() <= AVB_WIFI_CONTROL_RESERVE)
-        return; /* the reserve is for control frames */
+          esp_hosted_data_tx_queue_space() <= AVB_WIFI_CONTROL_RESERVE) {
+        s_retx_no_room += count - n; /* the reserve is for control frames */
+        return;
+      }
       s_retx_buf[37] |= WIFI_BUNDLE_FLAG_RETX;
       if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, s_retx_buf, len) == ESP_OK)
         s_wifi_retx++;
+      else
+        s_retx_tx_fail++;
     }
     return;
   }
+  s_retx_no_slot += count;
+}
+
+/* Outcome of every bundle a NACK asked for: requested = sent (the retx
+ * counter) + late + spaced + evicted + no_slot + no_room + tx_fail. */
+void avb_bridge_retx_detail(uint32_t *requested, uint32_t *late,
+                            uint32_t *spaced, uint32_t *evicted,
+                            uint32_t *no_slot, uint32_t *no_room,
+                            uint32_t *tx_fail) {
+  if (requested) *requested = s_retx_requested;
+  if (late) *late = s_retx_late;
+  if (spaced) *spaced = s_retx_spaced;
+  if (evicted) *evicted = s_retx_evicted;
+  if (no_slot) *no_slot = s_retx_no_slot;
+  if (no_room) *no_room = s_retx_no_room;
+  if (tx_fail) *tx_fail = s_retx_tx_fail;
 }
 
 void avb_bridge_retx_stats(uint32_t *nacks, uint32_t *retx, uint32_t *stale) {
@@ -1964,6 +2086,47 @@ extern esp_err_t esp_wifi_internal_free_rx_buffer(void *eb);
 extern esp_err_t esp_wifi_internal_reg_rxcb(
     int wifi_if, esp_err_t (*fn)(void *buffer, uint16_t len, void *eb));
 
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+/* A held gap is given up when its time runs out even if nothing else
+ * arrives, so the audio held behind it still plays. Wi-Fi receive and
+ * this timer both feed the listener; the lock keeps them one at a time. */
+static SemaphoreHandle_t s_wifi_rx_lock;
+static esp_timer_handle_t s_hold_timer;
+static int64_t s_hold_timer_due;
+
+/* Called with s_wifi_rx_lock held. */
+static void wifi_hold_timer_arm(void) {
+  int64_t due = wifi_bundle_next_deadline();
+  if (!s_hold_timer || due == s_hold_timer_due)
+    return;
+  esp_timer_stop(s_hold_timer);
+  s_hold_timer_due = due;
+  if (due == 0)
+    return;
+  int64_t wait_us = due - esp_timer_get_time();
+  esp_timer_start_once(s_hold_timer, wait_us > 100 ? (uint64_t)wait_us : 100);
+}
+
+static void wifi_hold_timer_cb(void *arg) {
+  (void)arg;
+  xSemaphoreTake(s_wifi_rx_lock, portMAX_DELAY);
+  s_hold_timer_due = 0;
+  wifi_bundle_poll(esp_timer_get_time(), NULL, NULL);
+  wifi_hold_timer_arm();
+  xSemaphoreGive(s_wifi_rx_lock);
+}
+
+static void wifi_rx_lock_init(void) {
+  if (s_wifi_rx_lock)
+    return;
+  s_wifi_rx_lock = xSemaphoreCreateMutex();
+  const esp_timer_create_args_t args = {.callback = wifi_hold_timer_cb,
+                                        .name = "wifi_hold"};
+  if (esp_timer_create(&args, &s_hold_timer) != ESP_OK)
+    s_hold_timer = NULL;
+}
+#endif
+
 static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
   s_rx_wifi_cb_entry++; /* L2 counter — bare increment, no logging in hot path */
   uint8_t *buf = malloc(len);
@@ -1973,6 +2136,17 @@ static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
   }
   memcpy(buf, buffer, len);
   esp_wifi_internal_free_rx_buffer(eb);
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+  wifi_rx_lock_init();
+  if (s_wifi_rx_lock) {
+    xSemaphoreTake(s_wifi_rx_lock, portMAX_DELAY);
+    esp_err_t result = avb_unified_rx_cb(NULL /* no eth_handle */, buf,
+                                         (uint32_t)len, NULL, NULL);
+    wifi_hold_timer_arm();
+    xSemaphoreGive(s_wifi_rx_lock);
+    return result;
+  }
+#endif
   return avb_unified_rx_cb(NULL /* no eth_handle */, buf, (uint32_t)len,
                            NULL /* priv */, NULL /* info */);
 }
@@ -2608,8 +2782,8 @@ extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
 #define WIFI_TX_BUNDLE_SLOTS 2
 #define WIFI_TX_BUNDLE_MAX_AGE_US 2000
 #define WIFI_TX_HISTORY 16
-#define WIFI_TX_RETX_MAX_AGE_US 18000
-#define WIFI_TX_RETX_SPACING_US 4000
+#define WIFI_TX_RETX_MAX_AGE_US 18000 /* NACKs without a waiting time */
+#define WIFI_TX_RETX_SPACING_US 12000
 typedef struct {
   uint16_t seq;
   uint16_t len;
@@ -2633,6 +2807,7 @@ static wifi_tx_bundle_t *s_tx_bundles;
 static portMUX_TYPE s_tx_bundle_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_wifi_tx_bundles, s_wifi_tx_bundle_frames;
 static volatile uint32_t s_wifi_tx_nacks_rx, s_wifi_tx_retx;
+static volatile uint32_t s_wifi_tx_retx_late, s_wifi_tx_retx_evicted;
 static uint8_t *s_tx_retx_buf;
 
 static esp_err_t wifi_tx_bundle_send(wifi_tx_bundle_t *bundle) {
@@ -2737,6 +2912,9 @@ static void wifi_tx_nack_handle(const uint8_t *nack) {
     return;
   uint16_t first = ((uint16_t)nack[30] << 8) | nack[31];
   int count = nack[32];
+  int64_t budget_us =
+      (int64_t)(((uint32_t)nack[WIFI_NACK_BUDGET] << 8) |
+                nack[WIFI_NACK_BUDGET + 1]) * 100;
   if (!s_tx_retx_buf)
     s_tx_retx_buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES,
                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -2751,14 +2929,22 @@ static void wifi_tx_nack_handle(const uint8_t *nack) {
       uint16_t want = (uint16_t)(first + n);
       uint16_t len = 0;
       int64_t now_us = esp_timer_get_time();
+      bool found = false;
       portENTER_CRITICAL(&s_tx_bundle_lock);
       for (int k = 0; k < WIFI_TX_HISTORY; k++) {
         wifi_tx_hist_t *entry = &bundle->hist[k];
-        if (entry->len == 0 || entry->seq != want ||
-            now_us - entry->sent_us > WIFI_TX_RETX_MAX_AGE_US ||
-            (entry->retx_us != 0 &&
-             now_us - entry->retx_us < WIFI_TX_RETX_SPACING_US))
+        if (entry->len == 0 || entry->seq != want)
           continue;
+        found = true;
+        if (budget_us == 0
+                ? now_us - entry->sent_us > WIFI_TX_RETX_MAX_AGE_US
+                : budget_us - WIFI_NACK_TRIP_US < WIFI_RETX_MIN_BUDGET_US) {
+          s_wifi_tx_retx_late++;
+          break;
+        }
+        if (entry->retx_us != 0 &&
+            now_us - entry->retx_us < WIFI_TX_RETX_SPACING_US)
+          break;
         entry->retx_us = now_us;
         len = entry->len;
         memcpy(s_tx_retx_buf,
@@ -2766,6 +2952,8 @@ static void wifi_tx_nack_handle(const uint8_t *nack) {
         break;
       }
       portEXIT_CRITICAL(&s_tx_bundle_lock);
+      if (!found)
+        s_wifi_tx_retx_evicted++;
       if (len == 0)
         continue;
       s_tx_retx_buf[37] |= WIFI_BUNDLE_FLAG_RETX;
@@ -2780,6 +2968,11 @@ static void wifi_tx_nack_handle(const uint8_t *nack) {
 void avb_wifi_tx_retx_stats(uint32_t *nacks, uint32_t *retx) {
   if (nacks) *nacks = s_wifi_tx_nacks_rx;
   if (retx) *retx = s_wifi_tx_retx;
+}
+
+void avb_wifi_tx_retx_detail(uint32_t *late, uint32_t *evicted) {
+  if (late) *late = s_wifi_tx_retx_late;
+  if (evicted) *evicted = s_wifi_tx_retx_evicted;
 }
 
 void avb_wifi_tx_bundle_stats(uint32_t *bundles, uint32_t *frames) {
