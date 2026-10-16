@@ -1398,9 +1398,8 @@ void avb_wifi_retx_stats(uint32_t *nacks, uint32_t *recovered,
 
 /* Sent bundles kept for retransmission; only those younger than the
  * age limit are resent, as older ones would miss their presentation
- * time. Internal RAM: copying each bundle into PSRAM from the Ethernet
- * receive task cost enough time there to overflow its descriptor ring. */
-#define WIFI_BUNDLE_HISTORY 24
+ * time. 48 cover 48 ms at 8 channels, longer than a station waits. */
+#define WIFI_BUNDLE_HISTORY 48
 /* Age limit for a NACK that carries no waiting time (older stations). */
 #define WIFI_BUNDLE_RETX_MAX_AGE_US 18000
 
@@ -1515,6 +1514,12 @@ static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
       s_wifi_bundle_bypass++;
       return false;
     }
+    /* PSRAM first: 48 bundles per slot are too many for internal RAM,
+     * and in loaded tests the copy into PSRAM lost no received frames. */
+    if (!spare->hist_buf)
+      spare->hist_buf =
+          heap_caps_calloc(WIFI_BUNDLE_HISTORY, WIFI_BUNDLE_MAX_BYTES,
+                           MALLOC_CAP_SPIRAM);
     if (!spare->hist_buf)
       spare->hist_buf =
           heap_caps_calloc(WIFI_BUNDLE_HISTORY, WIFI_BUNDLE_MAX_BYTES,
