@@ -3274,6 +3274,15 @@ void avb_stream_in_print_diag(void) {
   avb_wifi_retx_stats(&nacks, &recovered, &given_up, &duplicates);
   avb_wifi_retx_detail(&nacks_skipped);
 
+  uint32_t gap_hist[7];
+  avb_wifi_gap_histogram(gap_hist);
+  if (bundles)
+    avbinfo("WIFI-GAPS: 1=%lu 2=%lu 3=%lu 4=%lu 5-8=%lu 9-16=%lu more=%lu",
+            (unsigned long)gap_hist[0], (unsigned long)gap_hist[1],
+            (unsigned long)gap_hist[2], (unsigned long)gap_hist[3],
+            (unsigned long)gap_hist[4], (unsigned long)gap_hist[5],
+            (unsigned long)gap_hist[6]);
+
   /* Playout phase window (see stream_in_phase_tick). */
   uint32_t phase_n = ctx->phase_reset ? 0 : ctx->phase_samples;
   int32_t phase_min = phase_n ? ctx->phase_min_us : 0;

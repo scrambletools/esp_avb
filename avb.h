@@ -1188,6 +1188,8 @@ void avb_bridge_retx_detail(uint32_t *requested, uint32_t *late,
 /* Station talker: Wi-Fi bundles sent and frames in them, the bridge's
  * NACKs received and bundles resent. */
 void avb_wifi_tx_bundle_stats(uint32_t *bundles, uint32_t *frames);
+/* Given-up Wi-Fi bundle gaps by length: 1, 2, 3, 4, 5-8, 9-16, more. */
+void avb_wifi_gap_histogram(uint32_t hist[7]);
 void avb_wifi_tx_retx_stats(uint32_t *nacks, uint32_t *retx);
 /* Uplink NACK requests left unanswered: too late, or no longer kept. */
 void avb_wifi_tx_retx_detail(uint32_t *late, uint32_t *evicted);

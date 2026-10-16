@@ -1337,6 +1337,21 @@ static int64_t wifi_bundle_hold_until(const wifi_bundle_rx_t *rx,
   return now_us + budget_us;
 }
 
+/* Bundles given up per gap, by gap length: 1, 2, 3, 4, 5-8, 9-16, more
+ * (a sender restart counts as more). */
+static volatile uint32_t s_wifi_gap_hist[7];
+
+static void wifi_gap_hist_add(uint32_t gap) {
+  int bucket = gap <= 4 ? (int)gap - 1 : gap <= 8 ? 4 : gap <= 16 ? 5 : 6;
+  if (bucket >= 0)
+    s_wifi_gap_hist[bucket]++;
+}
+
+void avb_wifi_gap_histogram(uint32_t hist[7]) {
+  for (int i = 0; i < 7; i++)
+    hist[i] = s_wifi_gap_hist[i];
+}
+
 /* Deliver held bundles that are next in sequence; when the hold time
  * has run out, give up on the gap and move on. */
 static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
@@ -1358,6 +1373,7 @@ static void wifi_bundle_drain(wifi_bundle_rx_t *rx, int64_t now_us,
       if (now_us < rx->deadline_us)
         return;
       s_wifi_given_up++;
+      wifi_gap_hist_add((uint16_t)(rx->held[lowest].seq - rx->expected));
       rx->expected = rx->held[lowest].seq;
       rx->deadline_us = wifi_bundle_hold_until(rx, now_us);
       continue;
@@ -1401,6 +1417,8 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
   int16_t ahead = rx->seeded ? (int16_t)(seq - rx->expected) : 0;
   if (!rx->seeded || ahead > 64 || ahead < -64) {
     /* First bundle, or the sender restarted: start over. */
+    if (rx->seeded)
+      wifi_gap_hist_add(UINT16_MAX);
     for (int i = 0; i < rx->held_count; i++)
       free(rx->held[i].buf);
     rx->held_count = 0;
