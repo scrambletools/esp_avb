@@ -621,6 +621,11 @@ typedef struct {
    * and a reflection landing in that window would re-clobber the
    * value and self-sustain the withdraw loop. */
   bool locally_originated;
+  /* TALKER_FAILED entries: the code already reported. A failure
+   * re-registers every LeaveAll period, so it is logged once per code
+   * until the stream advertises again. */
+  bool failure_logged;
+  uint8_t logged_failure_code;
 } msrp_talker_entry_t;
 
 typedef struct {
@@ -1821,13 +1826,25 @@ msrp_rx_talker_attr(avb_state_s *state, int port, msrp_attr_type_t attr_type,
   mrp_sm_step(&e->sm, mrp_3pe_to_event(e1));
   mrp_reg_transition_e trans = mrp_reg_transition(before, e->sm.registrar);
   if (attr_type == msrp_attr_type_talker_failed &&
-      trans == mrp_reg_transition_register) {
+      trans == mrp_reg_transition_register &&
+      (!e->failure_logged ||
+       e->logged_failure_code != wire->talker_failed.failure_code)) {
     const uint8_t *sid = wire->talker.info.stream_id;
+    e->failure_logged = true;
+    e->logged_failure_code = wire->talker_failed.failure_code;
     ESP_LOGW("avb_srp",
              "MSRP: TALKER_FAILED registered for stream "
              "%02x%02x%02x%02x%02x%02x%02x%02x, code=%u",
              sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
              wire->talker_failed.failure_code);
+  }
+  if (attr_type == msrp_attr_type_talker_advertise &&
+      trans == mrp_reg_transition_register) {
+    msrp_talker_entry_t *failed = msrp_talker_find(
+        port, (const unique_id_t *)&wire->talker.info.stream_id,
+        msrp_attr_type_talker_failed);
+    if (failed != NULL)
+      failed->failure_logged = false;
   }
   /* §35.2.4: TALKER_ADVERTISE and TALKER_FAILED are alternate
    * declarations of the same Talker attribute, so registering one
