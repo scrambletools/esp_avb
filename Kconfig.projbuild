@@ -416,6 +416,22 @@ menu "AVB Configuration"
             cadence modulation, or when an external media-clock chain
             cannot tolerate any talker-side rate steering.
 
+    config ESP_AVB_LISTENER_CONCEAL_REPEAT
+        bool "Conceal lost audio by repeating the waveform"
+        default n
+        help
+            Fill a gap with the last pitch period of the audio before it,
+            fading to silence over 20 ms, and crossfade into the audio
+            after it over 1 ms, instead of inserting silence.
+
+    config ESP_AVB_LISTENER_CONCEAL_AB
+        bool "Bench A/B: switch concealment every minute"
+        default n
+        help
+            Switches between silence and waveform repetition every 60 s
+            and logs "CONCEAL: ab=N" with the mean sample step into and
+            out of each insert.
+
     config ESP_AVB_LISTENER_EXTRA_LATENCY_US
         int "Listener playout latency added beyond presentation time (µs)"
         default 0

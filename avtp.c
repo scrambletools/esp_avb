@@ -1943,6 +1943,16 @@ typedef struct {
   volatile uint32_t loss_fill_events; /* loss-concealment silence inserts */
   volatile uint32_t loss_fill_frames; /* wire-lost frames replaced by silence */
   volatile uint32_t splice_aligned;   /* inserts sized from presentation time */
+  /* Waveform-repetition concealment (stream_conceal_fill): the period
+   * repeated through the last insert, and the crossfade still owed to
+   * the real audio after it. */
+  uint32_t conceal_src;               /* ring position of that period */
+  uint32_t conceal_produced;          /* repetition frames produced so far */
+  uint16_t conceal_period;            /* frames; 0 when none */
+  uint16_t conceal_crossfade;         /* real frames still to crossfade */
+  bool conceal_step_pending;          /* measure the step into real audio */
+  uint64_t conceal_step_sum[2];       /* |step| into and out of inserts */
+  uint32_t conceal_step_count[2];
   uint32_t ring_bytes_per_sec;        /* ring byte rate at nominal DAC rate */
   volatile uint32_t ts_uncertain_count; /* AVTPDU with tu=1 received */
   uint8_t last_seq_num;               /* last received sequence number */
@@ -2856,6 +2866,154 @@ static void avb_crf_rx_handler(uint8_t *avtp_data, uint16_t len,
  * No `ESP_LOG*` calls here — all diagnostics via `volatile` counters the
  * main loop samples. No per-packet `esp_timer_get_time()`, no
  * `clock_gettime()`, no per-packet allocation. */
+/* Loss concealment by waveform repetition: instead of silence, an insert
+ * repeats the last pitch period of the audio before it, fading to
+ * silence over 20 ms, and the real audio after it is crossfaded in over
+ * 1 ms. Ring frames are two 32-bit big-endian slots holding 24 bits. */
+#define CONCEAL_FRAME_BYTES 8
+#define CONCEAL_PERIOD_MIN 48   /* 1 ms at 48 kHz */
+#define CONCEAL_PERIOD_MAX 480  /* 10 ms */
+#define CONCEAL_MATCH_FRAMES 128 /* compared every 4th frame */
+#define CONCEAL_LAG_STEP 4      /* 83 us at 48 kHz */
+#define CONCEAL_FADE_FRAMES 960 /* 20 ms */
+#define CONCEAL_CROSSFADE_FRAMES 48
+#if CONFIG_ESP_AVB_LISTENER_CONCEAL_REPEAT
+static volatile bool s_conceal_repeat = true;
+#else
+static volatile bool s_conceal_repeat;
+#endif
+
+static inline int32_t ring_sample_get(const uint8_t *buf, uint32_t mask,
+                                      uint32_t pos) {
+  return (int32_t)(((uint32_t)buf[pos & mask] << 24) |
+                   ((uint32_t)buf[(pos + 1) & mask] << 16) |
+                   ((uint32_t)buf[(pos + 2) & mask] << 8)) >> 8;
+}
+
+static inline void ring_sample_put(uint8_t *buf, uint32_t mask, uint32_t pos,
+                                   int32_t sample) {
+  if (sample > 0x7fffff)
+    sample = 0x7fffff;
+  else if (sample < -0x800000)
+    sample = -0x800000;
+  buf[pos & mask] = (uint8_t)(sample >> 16);
+  buf[(pos + 1) & mask] = (uint8_t)(sample >> 8);
+  buf[(pos + 2) & mask] = (uint8_t)sample;
+  buf[(pos + 3) & mask] = 0;
+}
+
+/* Left-channel lag, in frames, that best matches the audio before head. */
+static uint16_t stream_conceal_period(const uint8_t *buf, uint32_t mask,
+                                      uint32_t head) {
+  uint16_t best_lag = CONCEAL_PERIOD_MAX;
+  float best_score = 0.0f;
+  for (int lag = CONCEAL_PERIOD_MIN; lag <= CONCEAL_PERIOD_MAX;
+       lag += CONCEAL_LAG_STEP) {
+    int64_t correlation = 0, energy = 0;
+    for (int back = 1; back <= CONCEAL_MATCH_FRAMES; back += 4) {
+      int32_t recent =
+          ring_sample_get(buf, mask, head - back * CONCEAL_FRAME_BYTES) >> 8;
+      int32_t earlier = ring_sample_get(
+          buf, mask, head - (back + lag) * CONCEAL_FRAME_BYTES) >> 8;
+      correlation += (int64_t)recent * earlier;
+      energy += (int64_t)earlier * earlier;
+    }
+    if (correlation <= 0 || energy == 0)
+      continue;
+    float score = (float)correlation * (float)correlation / (float)energy;
+    if (score > best_score) {
+      best_score = score;
+      best_lag = (uint16_t)lag;
+    }
+  }
+  return best_lag;
+}
+
+/* One repetition frame, channel ch, number produced since the insert began. */
+static inline int32_t stream_conceal_sample(const stream_rx_ctx_t *ctx,
+                                            const uint8_t *buf, uint32_t mask,
+                                            uint32_t produced, int ch) {
+  if (produced >= CONCEAL_FADE_FRAMES)
+    return 0;
+  int32_t sample = ring_sample_get(
+      buf, mask,
+      ctx->conceal_src + (produced % ctx->conceal_period) * CONCEAL_FRAME_BYTES +
+          ch * 4);
+  return (int32_t)((int64_t)sample * (CONCEAL_FADE_FRAMES - produced) /
+                   CONCEAL_FADE_FRAMES);
+}
+
+/* Writes fill_bytes of concealment at head (not yet published). */
+static void stream_conceal_fill(stream_rx_ctx_t *ctx, uint32_t head,
+                                uint32_t fill_bytes) {
+  uint8_t *buf = ctx->ring.buf;
+  uint32_t mask = ctx->ring.capacity - 1;
+  uint32_t frames = fill_bytes / CONCEAL_FRAME_BYTES;
+  int32_t before = ring_sample_get(buf, mask, head - CONCEAL_FRAME_BYTES);
+  uint32_t repeated = 0;
+  if (s_conceal_repeat) {
+    ctx->conceal_period = stream_conceal_period(buf, mask, head);
+    ctx->conceal_src = head - ctx->conceal_period * CONCEAL_FRAME_BYTES;
+    /* Past the fade the repetition is silence, written below. */
+    repeated = frames < CONCEAL_FADE_FRAMES ? frames : CONCEAL_FADE_FRAMES;
+    for (uint32_t frame = 0; frame < repeated; frame++)
+      for (int ch = 0; ch < 2; ch++)
+        ring_sample_put(buf, mask, head + frame * CONCEAL_FRAME_BYTES + ch * 4,
+                        stream_conceal_sample(ctx, buf, mask, frame, ch));
+    ctx->conceal_produced = frames;
+    ctx->conceal_crossfade = frames < CONCEAL_FADE_FRAMES ? CONCEAL_CROSSFADE_FRAMES : 0;
+  } else {
+    ctx->conceal_period = 0;
+    ctx->conceal_crossfade = 0;
+  }
+  uint32_t zero_start = (head + repeated * CONCEAL_FRAME_BYTES) & mask;
+  uint32_t zero_bytes = fill_bytes - repeated * CONCEAL_FRAME_BYTES;
+  uint32_t zero_first = ctx->ring.capacity - zero_start;
+  if (zero_first > zero_bytes)
+    zero_first = zero_bytes;
+  memset(buf + zero_start, 0, zero_first);
+  if (zero_bytes > zero_first)
+    memset(buf, 0, zero_bytes - zero_first);
+  int32_t first = ring_sample_get(buf, mask, head);
+  ctx->conceal_step_sum[0] += (uint32_t)abs(first - before);
+  ctx->conceal_step_count[0]++;
+  ctx->conceal_step_pending = true;
+}
+
+/* Crossfades the frames just written at head into the repetition, and
+ * measures the step from the insert into the real audio. */
+static void stream_conceal_after_write(stream_rx_ctx_t *ctx, uint32_t head,
+                                       uint32_t bytes) {
+  uint8_t *buf = ctx->ring.buf;
+  uint32_t mask = ctx->ring.capacity - 1;
+  uint32_t frames = bytes / CONCEAL_FRAME_BYTES;
+  for (uint32_t frame = 0;
+       frame < frames && ctx->conceal_crossfade > 0 && ctx->conceal_period;
+       frame++) {
+    uint32_t real_share = CONCEAL_CROSSFADE_FRAMES - ctx->conceal_crossfade + 1;
+    for (int ch = 0; ch < 2; ch++) {
+      uint32_t pos = head + frame * CONCEAL_FRAME_BYTES + ch * 4;
+      int32_t real = ring_sample_get(buf, mask, pos);
+      int32_t repeated =
+          stream_conceal_sample(ctx, buf, mask, ctx->conceal_produced, ch);
+      ring_sample_put(buf, mask, pos,
+                      (int32_t)(((int64_t)real * real_share +
+                                 (int64_t)repeated *
+                                     (CONCEAL_CROSSFADE_FRAMES - real_share)) /
+                                CONCEAL_CROSSFADE_FRAMES));
+    }
+    ctx->conceal_produced++;
+    ctx->conceal_crossfade--;
+  }
+  if (ctx->conceal_step_pending && frames) {
+    ctx->conceal_step_pending = false;
+    int32_t last = ring_sample_get(buf, mask, head - CONCEAL_FRAME_BYTES);
+    int32_t first = ring_sample_get(buf, mask, head);
+    ctx->conceal_step_sum[1] += (uint32_t)abs(first - last);
+    ctx->conceal_step_count[1]++;
+  }
+}
+
 static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
                                   void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
@@ -3110,14 +3268,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     }
     if (fill_bytes > 0 && ring_writable(&ctx->ring) >= fill_bytes + total) {
       uint32_t fh = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
-      uint32_t fmask = ctx->ring.capacity - 1;
-      uint32_t fstart = fh & fmask;
-      uint32_t ffirst = ctx->ring.capacity - fstart;
-      if (ffirst > fill_bytes)
-        ffirst = fill_bytes;
-      memset(ctx->ring.buf + fstart, 0, ffirst);
-      if (fill_bytes > ffirst)
-        memset(ctx->ring.buf, 0, fill_bytes - ffirst);
+      stream_conceal_fill(ctx, fh, fill_bytes);
       atomic_store_explicit(&ctx->ring.head, fh + fill_bytes,
                             memory_order_release);
       ctx->loss_fill_events++;
@@ -3163,6 +3314,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
         offset += 4;
       }
     }
+    if (ctx->conceal_crossfade || ctx->conceal_step_pending)
+      stream_conceal_after_write(ctx, h, total);
     /* Publish — drain can't see any of the bytes we just wrote until
      * this store lands (release ordering pairs with ring_readable's
      * acquire load of head). */
@@ -3274,6 +3427,20 @@ void avb_stream_in_print_diag(void) {
   avb_wifi_retx_stats(&nacks, &recovered, &given_up, &duplicates);
   avb_wifi_retx_detail(&nacks_skipped);
 
+  {
+    uint32_t into = ctx->conceal_step_count[0], out = ctx->conceal_step_count[1];
+    avbinfo("CONCEAL: ab=%d inserts=%lu step_in=%lu step_out=%lu",
+            s_conceal_repeat, (unsigned long)into,
+            (unsigned long)(into ? ctx->conceal_step_sum[0] / into : 0),
+            (unsigned long)(out ? ctx->conceal_step_sum[1] / out : 0));
+    ctx->conceal_step_sum[0] = ctx->conceal_step_sum[1] = 0;
+    ctx->conceal_step_count[0] = ctx->conceal_step_count[1] = 0;
+#if CONFIG_ESP_AVB_LISTENER_CONCEAL_AB
+    static unsigned conceal_intervals;
+    if (!(++conceal_intervals % 6))
+      s_conceal_repeat = !s_conceal_repeat;
+#endif
+  }
   uint32_t gap_hist[7];
   avb_wifi_gap_histogram(gap_hist);
   if (bundles)
