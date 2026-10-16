@@ -725,7 +725,10 @@ msrp_talker_find_or_insert(int port, const unique_id_t *stream_id,
   }
   for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
     msrp_talker_entry_t *slot = &s_msrp_talkers[port][i];
-    if (mrp_sm_idle(&slot->sm)) {
+    /* A declaration held off after a value change looks idle (its
+     * Applicant waits in VO) but still owns the stream; giving its slot
+     * away lost the hold-off and, with the table full, the declaration. */
+    if (mrp_sm_idle(&slot->sm) && slot->redeclare_after_us == 0) {
       memset(slot, 0, sizeof(*slot));
       slot->valid = true;
       slot->attr_type = attr_type;
@@ -767,6 +770,15 @@ bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,
   *max_interval_frames =
       (uint16_t)octets_to_uint(e->wire.talker.info.tspec_max_frame_interval, 2);
   return true;
+}
+
+/* True while a talker declaration of ours is withdrawn and held off
+ * after a value change (see MSRP_VALUE_CHANGE_HOLDOFF_US). The stream has
+ * no Talker Advertise on the wire then and must not be transmitted. */
+bool mrp_talker_advertise_held_off(int port, const unique_id_t *stream_id) {
+  msrp_talker_entry_t *e =
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
+  return e != NULL && e->redeclare_after_us != 0;
 }
 
 bool mrp_talker_failed_active(int port, const unique_id_t *stream_id,
@@ -1772,6 +1784,41 @@ static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
   }
 }
 
+/* A switch reflects our own Talker Advertise back with the value it has
+ * registered (MOTU observed). A TSpec, priority or VLAN there that differs
+ * from what we declare means the network kept an older FirstValue of the
+ * stream; say so (once a minute), it explains a reservation that does not
+ * fit the frames. DA and accumulated_latency are left out, a reflecting
+ * end station rewrites those. */
+static void msrp_check_own_reflection(const msrp_talker_entry_t *e,
+                                      const msrp_talker_message_u *wire) {
+  const talker_adv_info_s *rx = &wire->talker.info;
+  const talker_adv_info_s *own = &e->wire.talker.info;
+  if (e->redeclare_after_us != 0)
+    return; /* our old value is still leaving */
+  if (memcmp(rx->tspec_max_frame_size, own->tspec_max_frame_size, 2) == 0 &&
+      memcmp(rx->tspec_max_frame_interval, own->tspec_max_frame_interval,
+             2) == 0 &&
+      rx->priority == own->priority &&
+      memcmp(rx->vlan_id, own->vlan_id, 2) == 0)
+    return;
+  static int64_t last_us;
+  int64_t now_us = esp_timer_get_time();
+  if (last_us != 0 && now_us - last_us < 60 * 1000 * 1000)
+    return;
+  last_us = now_us;
+  const uint8_t *sid = own->stream_id;
+  avbwarn("MSRP: network reflects stream %02x%02x%02x%02x%02x%02x%02x%02x "
+          "with MaxFrameSize %u interval %u priority %u, we declare %u/%u/%u",
+          sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
+          (unsigned)octets_to_uint(rx->tspec_max_frame_size, 2),
+          (unsigned)octets_to_uint(rx->tspec_max_frame_interval, 2),
+          (unsigned)rx->priority,
+          (unsigned)octets_to_uint(own->tspec_max_frame_size, 2),
+          (unsigned)octets_to_uint(own->tspec_max_frame_interval, 2),
+          (unsigned)own->priority);
+}
+
 /* Process one TALKER_ADVERTISE or TALKER_FAILED attribute, including
  * its 3pe event vector. Returns the Registrar transition (register
  * /deregister edge) so the caller can fire the MAP / application
@@ -1809,6 +1856,8 @@ msrp_rx_talker_attr(avb_state_s *state, int port, msrp_attr_type_t attr_type,
    * declared value is protected. */
   if (!e->locally_originated) {
     memcpy(&e->wire, wire, sizeof(*wire));
+  } else if (attr_type == msrp_attr_type_talker_advertise) {
+    msrp_check_own_reflection(e, wire);
   }
   e->last_refresh_us = esp_timer_get_time();
   if (src_addr != NULL)
@@ -2672,6 +2721,22 @@ static void mrp_tx_talker_value_leave(avb_state_s *state, int port,
   mrp_send_attr(state, port, &msg, attr_list_len, "talker value leave", NULL);
 }
 
+/* IEEE 802.1Q-2022 35.2.2.8: MSRP does not support a change in any
+ * FirstValue field for an existing StreamID; a talker that brings the
+ * stream back with a different value waits at least two LeaveAllTime
+ * periods after withdrawing it, so every device has dropped the old one.
+ * Milan v1.3 Table 5.3 says the same for a DA or priority change. Two of
+ * the longest Milan LeaveAll periods (15.5 s) and a LeaveTime. A bridge
+ * re-declares a value its upstream talker already waited for, so it keeps
+ * only the LeaveTime margin. Observed with 1.5 s: a MOTU switch kept the
+ * stereo TSpec of a stream re-declared as 8 channels, forwarded it for
+ * minutes and shaped the stream to 36 % of its frames. */
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+#define MSRP_VALUE_CHANGE_HOLDOFF_US (1500 * 1000)
+#else
+#define MSRP_VALUE_CHANGE_HOLDOFF_US (32 * 1000 * 1000)
+#endif
+
 /* Reset an entry's SMs so the next declare propagates as New!. */
 static void mrp_sm_reset_for_new_value(mrp_sm_state_t *sm) {
   sm->applicant = mrp_applicant_vo;
@@ -2746,8 +2811,14 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
        * registration down. */
       mrp_tx_talker_value_leave(state, port, e);
       mrp_tx_talker_value_leave(state, port, e);
-      e->redeclare_after_us = esp_timer_get_time() + 1500000;
-      avbinfo("MSRP: talker advertise value changed — withdrew old value");
+      e->redeclare_after_us =
+          esp_timer_get_time() + MSRP_VALUE_CHANGE_HOLDOFF_US;
+      avbinfo("MSRP: talker advertise value changed, withdrew MaxFrameSize "
+              "%u, declaring %u in %d s",
+              (unsigned)octets_to_uint(e->wire.talker.info.tspec_max_frame_size,
+                                       2),
+              (unsigned)max_frame_size,
+              (int)(MSRP_VALUE_CHANGE_HOLDOFF_US / 1000000));
     }
     mrp_sm_reset_for_new_value(&e->sm);
     e->wire = fresh;
@@ -2932,6 +3003,20 @@ static void mrp_tx_flush_talker(avb_state_s *state, int port,
   } else {
     msg.talker_failed.event_data[0] = int_to_3pe(pe, 0, 0);
   }
+#ifndef CONFIG_ESP_AVB_ROLE_BRIDGE
+  /* What our own Talker Advertise carries when it goes out as New: the
+   * declaration a switch registers (Joins repeat the same value). */
+  if (e->locally_originated && e->attr_type == msrp_attr_type_talker_advertise &&
+      pe == mrp_attr_event_new) {
+    const uint8_t *sid = msg.talker.info.stream_id;
+    avbinfo("MSRP TX talker advertise New stream %02x%02x%02x%02x%02x%02x%02x%02x "
+            "MaxFrameSize %u interval %u",
+            sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
+            (unsigned)octets_to_uint(msg.talker.info.tspec_max_frame_size, 2),
+            (unsigned)octets_to_uint(msg.talker.info.tspec_max_frame_interval,
+                                     2));
+  }
+#endif
   mrp_send_attr(state, port, &msg, attr_list_len,
                 (e->attr_type == msrp_attr_type_talker_advertise)
                     ? "talker advertise"
