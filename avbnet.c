@@ -784,6 +784,121 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
 #define WIFI_BUNDLE_MAX_BYTES 1500
 #define WIFI_BUNDLE_FLAG_RETX 0x01
 #define WIFI_BUNDLE_FLAG_COMPACT 0x02
+
+/* Wi-Fi access category. The C6 picks a frame's 802.11 TID from IPv4
+ * precedence and sends everything else as best effort, so a bundle sent
+ * inside an IPv4 header with precedence 5 (protocol 253, never handed to
+ * an IP stack) goes out as video: shorter AIFS and contention window, and
+ * still aggregated. Receivers accept both forms. Bundles leave room for
+ * the header so the wrapped frame still fits one esp-hosted buffer. */
+#define WIFI_VI_HEADER_LEN 22 /* ethertype 0x0800 + IPv4 header */
+#define WIFI_VI_IP_PROTOCOL 253
+#define WIFI_VI_IP_ID 0x4156
+#define WIFI_BUNDLE_FILL_BYTES (WIFI_BUNDLE_MAX_BYTES - WIFI_VI_HEADER_LEN)
+#if CONFIG_ESP_AVB_WIFI_VIDEO_AC
+static volatile bool s_wifi_vi_wrap = true;
+#else
+static volatile bool s_wifi_vi_wrap;
+#endif
+static SemaphoreHandle_t s_wifi_vi_lock;
+static uint8_t *s_wifi_vi_buf;
+static volatile uint32_t s_wifi_vi_tx, s_wifi_vi_rx;
+
+static void wifi_vi_init(void) {
+  static portMUX_TYPE init_lock = portMUX_INITIALIZER_UNLOCKED;
+  if (s_wifi_vi_lock)
+    return;
+  SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+  uint8_t *buf = heap_caps_malloc(WIFI_BUNDLE_MAX_BYTES + WIFI_VI_HEADER_LEN,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!lock || !buf) {
+    if (lock)
+      vSemaphoreDelete(lock);
+    free(buf);
+    return;
+  }
+  portENTER_CRITICAL(&init_lock);
+  bool installed = !s_wifi_vi_lock;
+  if (installed) {
+    s_wifi_vi_buf = buf;
+    s_wifi_vi_lock = lock;
+  }
+  portEXIT_CRITICAL(&init_lock);
+  if (!installed) {
+    vSemaphoreDelete(lock);
+    free(buf);
+  }
+}
+
+extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
+
+/* Sends a bundle, wrapped for the video access category when enabled. */
+static esp_err_t wifi_tx_bundle_frame(int wifi_if, const uint8_t *frame,
+                                      uint32_t len) {
+  if (!s_wifi_vi_wrap)
+    return esp_wifi_internal_tx(wifi_if, (void *)frame, len);
+  wifi_vi_init();
+  if (!s_wifi_vi_lock || len < 14 || len > WIFI_BUNDLE_MAX_BYTES)
+    return esp_wifi_internal_tx(wifi_if, (void *)frame, len);
+  xSemaphoreTake(s_wifi_vi_lock, portMAX_DELAY);
+  uint8_t *out = s_wifi_vi_buf;
+  uint8_t *ip = out + 14;
+  uint16_t ip_len = (uint16_t)(len - 12 + WIFI_VI_HEADER_LEN - 2);
+  memcpy(out, frame, 12);
+  out[12] = 0x08;
+  out[13] = 0x00;
+  memset(ip, 0, 20);
+  ip[0] = 0x45;
+  ip[1] = 0xa0; /* precedence 5 */
+  ip[2] = (uint8_t)(ip_len >> 8);
+  ip[3] = (uint8_t)ip_len;
+  ip[4] = (uint8_t)(WIFI_VI_IP_ID >> 8);
+  ip[5] = (uint8_t)WIFI_VI_IP_ID;
+  ip[6] = 0x40;
+  ip[8] = 1;
+  ip[9] = WIFI_VI_IP_PROTOCOL;
+  uint32_t sum = 0;
+  for (int word = 0; word < 20; word += 2)
+    sum += (uint32_t)(ip[word] << 8 | ip[word + 1]);
+  sum = (sum & 0xffff) + (sum >> 16);
+  sum = (sum & 0xffff) + (sum >> 16);
+  ip[10] = (uint8_t)(~sum >> 8);
+  ip[11] = (uint8_t)~sum;
+  memcpy(out + 12 + WIFI_VI_HEADER_LEN, frame + 12, len - 12);
+  esp_err_t result =
+      esp_wifi_internal_tx(wifi_if, out, len + WIFI_VI_HEADER_LEN);
+  xSemaphoreGive(s_wifi_vi_lock);
+  if (result == ESP_OK)
+    s_wifi_vi_tx++;
+  return result;
+}
+
+/* Restores a wrapped frame in place and returns its length. */
+static uint32_t wifi_vi_unwrap(uint8_t *buf, uint32_t len) {
+  if (len < 12 + WIFI_VI_HEADER_LEN + 4 || buf[12] != 0x08 || buf[13] != 0x00 ||
+      buf[14] != 0x45 || buf[23] != WIFI_VI_IP_PROTOCOL ||
+      buf[18] != (uint8_t)(WIFI_VI_IP_ID >> 8) ||
+      buf[19] != (uint8_t)WIFI_VI_IP_ID)
+    return len;
+  memmove(buf + 12, buf + 12 + WIFI_VI_HEADER_LEN, len - 12 - WIFI_VI_HEADER_LEN);
+  s_wifi_vi_rx++;
+  return len - WIFI_VI_HEADER_LEN;
+}
+
+#if CONFIG_ESP_AVB_WIFI_VIDEO_AC_AB
+/* Bench A/B: switch the wrapper every 6 log intervals of 10 s. */
+static void wifi_vi_ab_task(void *arg) {
+  (void)arg;
+  wifi_vi_init();
+  for (unsigned interval = 1;; interval++) {
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    ESP_LOGI(TAG, "vi_ab: ab=%d tx=%" PRIu32 " rx=%" PRIu32, s_wifi_vi_wrap,
+             s_wifi_vi_tx, s_wifi_vi_rx);
+    if (!(interval % 6))
+      s_wifi_vi_wrap = !s_wifi_vi_wrap;
+  }
+}
+#endif
 static const uint8_t s_wifi_bundle_tag[4] = {'A', 'V', 'B', 'W'};
 static volatile uint32_t s_wifi_bundles_rx, s_wifi_bundle_frames_rx,
     s_wifi_split_fail;
@@ -1449,7 +1564,7 @@ static void wifi_bundle_send(wifi_bundle_slot_t *slot) {
   esp_err_t result = ESP_ERR_NO_MEM;
   if (!esp_hosted_data_tx_queue_space ||
       esp_hosted_data_tx_queue_space() > AVB_WIFI_CONTROL_RESERVE)
-    result = esp_wifi_internal_tx(1 /* WIFI_IF_AP */, out, slot->len);
+    result = wifi_tx_bundle_frame(1 /* WIFI_IF_AP */, out, slot->len);
   if (slot->hist_buf) {
     /* Kept even when the hosted queue refused it: after a burst, a NACK
      * may still bring it back in time. */
@@ -1483,7 +1598,7 @@ static void wifi_bundle_send(wifi_bundle_slot_t *slot) {
 static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
   if (len < WIFI_BUNDLE_AVTP + WIFI_BUNDLE_MIN_AVTP || frame[16] != 0x22 ||
       frame[17] != 0xf0 || (frame[18] & 0x80) || !(frame[19] & 0x80) ||
-      WIFI_BUNDLE_FIRST_COST(len - WIFI_BUNDLE_AVTP) > WIFI_BUNDLE_MAX_BYTES)
+      WIFI_BUNDLE_FIRST_COST(len - WIFI_BUNDLE_AVTP) > WIFI_BUNDLE_FILL_BYTES)
     return false;
   int64_t now_us = esp_timer_get_time();
   wifi_bundle_slot_t *slot = NULL, *spare = NULL;
@@ -1549,7 +1664,7 @@ static bool wifi_bundle_add(const uint8_t *frame, uint32_t len) {
   const uint8_t *avtp = frame + WIFI_BUNDLE_AVTP;
   uint32_t entry_len = WIFI_BUNDLE_ENTRY_COST(slot->buf, slot->count, avtp,
                                               avtp_len);
-  if (slot->count > 0 && slot->len + entry_len > WIFI_BUNDLE_MAX_BYTES)
+  if (slot->count > 0 && slot->len + entry_len > WIFI_BUNDLE_FILL_BYTES)
     wifi_bundle_send(slot);
   if (slot->count == 0) {
     slot->len = wifi_bundle_begin(slot->buf, frame);
@@ -1635,7 +1750,7 @@ static void wifi_nack_handle(const uint8_t *nack) {
         return;
       }
       s_retx_buf[37] |= WIFI_BUNDLE_FLAG_RETX;
-      if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, s_retx_buf, len) == ESP_OK)
+      if (wifi_tx_bundle_frame(1 /* WIFI_IF_AP */, s_retx_buf, len) == ESP_OK)
         s_wifi_retx++;
       else
         s_retx_tx_fail++;
@@ -2172,6 +2287,7 @@ static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
   }
   memcpy(buf, buffer, len);
   esp_wifi_internal_free_rx_buffer(eb);
+  len = (uint16_t)wifi_vi_unwrap(buf, len);
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   wifi_rx_lock_init();
   if (s_wifi_rx_lock) {
@@ -2344,6 +2460,15 @@ bool avb_eth_apply_link_policy(esp_eth_handle_t eth_handle, bool restart) {
 }
 
 int avb_net_init(avb_state_s *state) {
+#if CONFIG_ESP_AVB_WIFI_VIDEO_AC_AB
+  static bool vi_ab_started;
+  if (!vi_ab_started) {
+    vi_ab_started = true;
+    /* Above the streaming tasks: on a single-core station a low priority
+     * task does not run while audio flows. */
+    xTaskCreate(wifi_vi_ab_task, "vi_ab", 3072, NULL, 20, NULL);
+  }
+#endif
   /* Cache RX port indices by medium so the unified RX callback can
    * tag ingress without knowing the bridge/endpoint topology. */
   avb_net_cache_port_indices(state);
@@ -2854,7 +2979,7 @@ static esp_err_t wifi_tx_bundle_send(wifi_tx_bundle_t *bundle) {
   bundle->buf[35] = (uint8_t)bundle->seq;
   bundle->buf[36] = bundle->count;
   esp_err_t result =
-      esp_wifi_internal_tx(0 /* WIFI_IF_STA */, bundle->buf, bundle->len);
+      wifi_tx_bundle_frame(0 /* WIFI_IF_STA */, bundle->buf, bundle->len);
   if (result == ESP_OK) {
     s_wifi_tx_bundles++;
     s_wifi_tx_bundle_frames += bundle->count;
@@ -2888,7 +3013,7 @@ static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
   if (len < WIFI_BUNDLE_AVTP + WIFI_BUNDLE_MIN_AVTP || frame[12] != 0x81 ||
       frame[13] != 0x00 || frame[16] != 0x22 || frame[17] != 0xf0 ||
       (frame[18] & 0x80) || !(frame[19] & 0x80) ||
-      WIFI_BUNDLE_FIRST_COST(len - WIFI_BUNDLE_AVTP) > WIFI_BUNDLE_MAX_BYTES)
+      WIFI_BUNDLE_FIRST_COST(len - WIFI_BUNDLE_AVTP) > WIFI_BUNDLE_FILL_BYTES)
     return false;
   if (!s_tx_bundles) {
     wifi_tx_bundle_t *slots =
@@ -2926,7 +3051,7 @@ static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
   if (bundle->count > 0 &&
       (bundle->len + WIFI_BUNDLE_ENTRY_COST(bundle->buf, bundle->count, avtp,
                                             avtp_len) >
-           WIFI_BUNDLE_MAX_BYTES ||
+           WIFI_BUNDLE_FILL_BYTES ||
        now_us - bundle->first_us > WIFI_TX_BUNDLE_MAX_AGE_US))
     *result = wifi_tx_bundle_send(bundle);
   if (bundle->count == 0) {
@@ -2993,7 +3118,7 @@ static void wifi_tx_nack_handle(const uint8_t *nack) {
       if (len == 0)
         continue;
       s_tx_retx_buf[37] |= WIFI_BUNDLE_FLAG_RETX;
-      if (esp_wifi_internal_tx(0 /* WIFI_IF_STA */, s_tx_retx_buf, len) ==
+      if (wifi_tx_bundle_frame(0 /* WIFI_IF_STA */, s_tx_retx_buf, len) ==
           ESP_OK)
         s_wifi_tx_retx++;
     }

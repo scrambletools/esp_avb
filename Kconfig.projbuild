@@ -191,6 +191,23 @@ menu "AVB Configuration"
             frames shrinks by about a third. Every receiver must run
             firmware that understands compact bundles.
 
+    config ESP_AVB_WIFI_VIDEO_AC
+        bool "Send Wi-Fi bundles as video traffic"
+        depends on ESP_AVB_WIFI_BUNDLE
+        default n
+        help
+            Send each bundle inside an IPv4 header with precedence 5, so
+            the C6 transmits it in the video access category (TID 5)
+            instead of best effort. Receivers accept both forms.
+
+    config ESP_AVB_WIFI_VIDEO_AC_AB
+        bool "Bench A/B: switch video traffic on and off every minute"
+        depends on ESP_AVB_WIFI_BUNDLE
+        default n
+        help
+            Logs "vi_ab: ab=N" every 10 s and switches the video access
+            category every 60 s, for comparing both in the same air.
+
     config ESP_AVB_WIFI_RETX_HOLD_MAX_US
         int "Longest wait for a retransmitted Wi-Fi bundle (us)"
         default 40000
