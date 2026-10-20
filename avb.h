@@ -910,6 +910,13 @@ typedef struct avb_state_s {
     int32_t pll_cumulative_ppm_error_q16; /* since baseline, Q16 */
     int32_t pll_applied_ppm_q16;          /* last correction written to HW */
     int32_t pll_target_ppm_q16;           /* slew destination for applied */
+    /* Talker ADC rate against its gPTP-locked packet cadence, ppm x 256,
+     * positive = ADC fast: the settled ADC-following cadence trim
+     * (avtp.c), an exact measurement of the media clock's rate error.
+     * stamp_ms = esp_timer at publish (32 bits, so readers never see
+     * half a write), 0 = never. Read by avb_pll to refine a held trim. */
+    int32_t talker_adc_error_ppm_q8;
+    volatile uint32_t talker_adc_error_stamp_ms;
 
     /* Milan GET_COUNTERS media_reset counter — bumped by the PLL when
      * gPTP discontinuity detection resets the baseline. Read by

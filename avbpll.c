@@ -263,6 +263,11 @@ static struct {
   bool stream_ref_was_active;
   uint32_t stream_ref_epoch_seen;
   bool stream_ref_phase; /* sensing presentation phase, see read_sample */
+  /* Held-trim refinement from the talker's ADC, see avb_pll_tick. */
+  int64_t adc_steady_since_us; /* 0 = no steady reading */
+  int32_t adc_steady_ppm_q16;
+  int64_t adc_refined_us;  /* last refinement move */
+  bool adc_refine_landing; /* persist the trim when that slew lands */
 } s_pll;
 
 /* Nominal listener byte-rate. Set by avbcodec.c at I2S init time to
@@ -360,6 +365,17 @@ static struct {
  * bias releases the hold for a fresh acquisition. 36 ticks = 3 min. */
 #define AVB_PLL_HOLD_BREAK_PPM_Q16 ((int32_t)(30 * 65536))
 #define AVB_PLL_HOLD_BREAK_TICKS 36
+
+/* Held-trim refinement from the talker's ADC (see avb_pll_tick): a
+ * reading of at least 1 ppm, steady within 0.5 ppm for 5 min, moves
+ * the trim by at most 5 ppm, and at most once per 10 min while the
+ * ADC-following cadence settles on the new rate. */
+#define AVB_PLL_ADC_REFINE_MIN_PPM_Q16 (1 * 65536)
+#define AVB_PLL_ADC_REFINE_BAND_PPM_Q16 (65536 / 2)
+#define AVB_PLL_ADC_REFINE_SETTLE_US (5LL * 60 * 1000000LL)
+#define AVB_PLL_ADC_REFINE_INTERVAL_US (10LL * 60 * 1000000LL)
+#define AVB_PLL_ADC_REFINE_MAX_PPM_Q16 (5 * 65536)
+#define AVB_PLL_ADC_STALE_MS 15000u
 
 /* An INTERNAL acquisition counts as converged only while its last
  * cumulative residual is inside this band (the gPTP reference's
@@ -760,6 +776,17 @@ void avb_pll_print_stats(avb_state_s *state) {
   state->media_clock.stream_samples = 0;
 }
 
+/* Record trim_q16 as the converged trim against the current BTC and
+ * queue the deferred NVS write. */
+static void persist_trim(avb_state_s *state, int32_t trim_q16) {
+  state->media_clock.pll_converged_trim_q16 = trim_q16;
+  memcpy(state->media_clock.pll_trim_btc_id,
+         state->ptp_status.clock_source_info.btc_id,
+         sizeof(state->media_clock.pll_trim_btc_id));
+  avb_persist_request_save(state);
+  ESP_LOGI(TAG, "persisting media-clock trim %ld ppm", (long)(trim_q16 / 65536));
+}
+
 int avb_pll_init(uint32_t nominal_mclk_hz) {
   s_pll.valid = false;
   s_pll.next_print_us = 0;
@@ -1153,10 +1180,71 @@ void avb_pll_tick(avb_state_s *state) {
         s_pll.base_i2s_bytes = bytes_now;
         s_pll.base_gptp_ns = gptp_now_ns;
         s_pll.next_correction_us = now_us + correction_interval_us;
+        if (s_pll.adc_refine_landing && s_pll.internal_hold)
+          persist_trim(state, applied_q16);
+        s_pll.adc_refine_landing = false;
       }
     }
     return;
   }
+
+#if SOC_CLK_APLL_SUPPORTED
+  /* Held-trim refinement from the talker's ADC. The INTERNAL reference
+   * holds whatever it converged to, a few ppm off (observed: two APLL
+   * steps, 3.1 ppm fast), and every listener that keeps its own clock
+   * then drifts against this talker by that much and skips latency
+   * every few minutes. The talker's ADC-following cadence measures the
+   * same error exactly, so once that reading has stayed steady, move
+   * the held trim by it. The APLL lands on its nearest step (about
+   * 1.5 ppm), so the remaining error is at most half a step. */
+  if (internal_mode && s_pll.internal_hold && s_hw.nominal_apll_hz > 0) {
+    uint32_t stamp_ms = state->media_clock.talker_adc_error_stamp_ms;
+    int32_t adc_q16 = state->media_clock.talker_adc_error_ppm_q8 * 256;
+    bool fresh = stamp_ms != 0 &&
+                 (uint32_t)(now_us / 1000) - stamp_ms < AVB_PLL_ADC_STALE_MS;
+    int32_t abs_adc_q16 = adc_q16 < 0 ? -adc_q16 : adc_q16;
+    int32_t drift_q16 = adc_q16 - s_pll.adc_steady_ppm_q16;
+    if (!fresh || abs_adc_q16 < AVB_PLL_ADC_REFINE_MIN_PPM_Q16) {
+      s_pll.adc_steady_since_us = 0;
+    } else if (s_pll.adc_steady_since_us == 0 ||
+               drift_q16 > AVB_PLL_ADC_REFINE_BAND_PPM_Q16 ||
+               drift_q16 < -AVB_PLL_ADC_REFINE_BAND_PPM_Q16) {
+      s_pll.adc_steady_since_us = now_us;
+      s_pll.adc_steady_ppm_q16 = adc_q16;
+    } else if (now_us - s_pll.adc_steady_since_us >=
+                   AVB_PLL_ADC_REFINE_SETTLE_US &&
+               now_us - s_pll.adc_refined_us >= AVB_PLL_ADC_REFINE_INTERVAL_US) {
+      int32_t move_q16 = adc_q16;
+      if (move_q16 > AVB_PLL_ADC_REFINE_MAX_PPM_Q16)
+        move_q16 = AVB_PLL_ADC_REFINE_MAX_PPM_Q16;
+      if (move_q16 < -AVB_PLL_ADC_REFINE_MAX_PPM_Q16)
+        move_q16 = -AVB_PLL_ADC_REFINE_MAX_PPM_Q16;
+      /* From the rate the APLL runs, which the reading measures, not the
+       * requested trim it rounded to a step (observed: a 3.2 ppm reading
+       * applied to the request landed three steps down, not two). */
+      int32_t actual_q16 = (int32_t)(
+          ((int64_t)s_hw.actual_apll_hz - (int64_t)s_hw.nominal_apll_hz) *
+          1000000LL * 65536LL / (int64_t)s_hw.nominal_apll_hz);
+      int32_t new_target = actual_q16 - move_q16;
+      if (new_target > AVB_PLL_MAX_APPLIED_PPM_Q16)
+        new_target = AVB_PLL_MAX_APPLIED_PPM_Q16;
+      if (new_target < -AVB_PLL_MAX_APPLIED_PPM_Q16)
+        new_target = -AVB_PLL_MAX_APPLIED_PPM_Q16;
+      state->media_clock.pll_target_ppm_q16 = new_target;
+      s_pll.adc_refined_us = now_us;
+      s_pll.adc_steady_since_us = 0;
+      s_pll.adc_refine_landing = true;
+      int32_t adc_cppm = (int32_t)(((int64_t)adc_q16 * 100) / 65536);
+      int32_t abs_adc_cppm = adc_cppm < 0 ? -adc_cppm : adc_cppm;
+      ESP_LOGI(TAG, "ADC runs %s%ld.%02d ppm off, moving the held trim from "
+               "%ld to %ld ppm",
+               adc_cppm < 0 ? "-" : "+", (long)(abs_adc_cppm / 100),
+               (int)(abs_adc_cppm % 100), (long)(actual_q16 / 65536),
+               (long)(new_target / 65536));
+      return;
+    }
+  }
+#endif
 
   /* Time-boxed INTERNAL convergence: the gPTP reference's phase noise
    * on this hardware makes the instant and cumulative windows disagree
@@ -1301,15 +1389,8 @@ void avb_pll_tick(avb_state_s *state) {
     }
     int32_t trim_delta_q16 =
         applied_now_q16 - state->media_clock.pll_converged_trim_q16;
-    if (stable && (trim_delta_q16 > 2 * 65536 || trim_delta_q16 < -2 * 65536)) {
-      state->media_clock.pll_converged_trim_q16 = applied_now_q16;
-      memcpy(state->media_clock.pll_trim_btc_id,
-             state->ptp_status.clock_source_info.btc_id,
-             sizeof(state->media_clock.pll_trim_btc_id));
-      avb_persist_request_save(state);
-      ESP_LOGI(TAG, "persisting media-clock trim %ld ppm",
-               (long)(applied_now_q16 / 65536));
-    }
+    if (stable && (trim_delta_q16 > 2 * 65536 || trim_delta_q16 < -2 * 65536))
+      persist_trim(state, applied_now_q16);
   }
 
   /* Print is handled by AVB-STATS (see avb_pll_print_stats) — keep the

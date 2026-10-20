@@ -812,6 +812,10 @@ static void avb_stream_out_task(void *task_param) {
   const int64_t sched_warmup_pkts = SCHED_WARMUP_US / params->interval;
   int64_t sched_pkts_since_sample = 0;
   bool sched_locked = false; /* false = next sample is an acquire */
+  /* Tracking updates since the last acquire. The cadence is gPTP-true
+   * only after one EMA time constant, and only then does the
+   * ADC-following trim measure the ADC against gPTP. */
+  uint32_t sched_track_updates = 0;
   int64_t sched_gptp_ref_ns = 0;
   int64_t sched_esp_ref_us = 0;
   bool sched_ref_valid = false;
@@ -1141,6 +1145,7 @@ static void avb_stream_out_task(void *task_param) {
               gptp_resync_count++;
               sched_ns_adj_q16 = 0;
               sched_locked = false;
+              sched_track_updates = 0;
             } else if (!sched_locked) {
               /* Acquire: apply the warmup measurement directly — it is
                * dominated by the static crystal offset. The sample is
@@ -1175,6 +1180,7 @@ static void avb_stream_out_task(void *task_param) {
               else if (step_q16 < -sched_step_max_q16)
                 step_q16 = -sched_step_max_q16;
               sched_ns_adj_q16 += step_q16;
+              sched_track_updates++;
             }
             /* Track remaining_ns-like stat for diagnostics: the
              * accumulated diff is the slip over the sample window. */
@@ -1422,6 +1428,12 @@ static void avb_stream_out_task(void *task_param) {
         if (ppm_q8 < -200 * 256)
           ppm_q8 = -200 * 256;
         fill_ppm_q8 = (int32_t)ppm_q8;
+        if (sched_track_updates >= (1u << SCHED_FILTER_SHIFT)) {
+          state->media_clock.talker_adc_error_ppm_q8 = -fill_ppm_q8;
+          /* Never 0, which means no reading. */
+          state->media_clock.talker_adc_error_stamp_ms =
+              (uint32_t)(esp_timer_get_time() / 1000) | 1;
+        }
         /* ns per packet, Q16: interval_ns x ppm / 1e6. */
         fill_adj_q16 = (((int64_t)params->interval * 1000LL * ppm_q8) << 16) /
                        (256LL * 1000000LL);
