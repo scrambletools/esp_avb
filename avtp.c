@@ -2337,13 +2337,54 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
                         memory_order_release);
 }
 
+static inline int32_t ring_sample_get(const uint8_t *buf, uint32_t mask,
+                                      uint32_t pos);
+static inline void ring_sample_put(uint8_t *buf, uint32_t mask, uint32_t pos,
+                                   int32_t sample);
+
+/* Ring frames are two 32-bit big-endian slots holding 24 bits. */
+#define STREAM_FRAME_BYTES 8
+
+#if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0 || \
+    CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S > 0
+/* A trim joins the audio at the tail to the audio surplus_bytes later,
+ * a step in the waveform that clicks. Crossfade the join instead: the
+ * frames after the new tail fade from what would have played into what
+ * now plays. Backwards, because with a trim shorter than the fade the
+ * frames written are still to be read as the outgoing audio. */
+#define STREAM_TRIM_CROSSFADE_US 2000
+static void stream_trim_crossfade(stream_rx_ctx_t *ctx, uint32_t tail,
+                                  uint32_t surplus_bytes, uint32_t after_bytes) {
+  uint8_t *buf = ctx->ring.buf;
+  uint32_t mask = ctx->ring.capacity - 1;
+  uint32_t frames = (uint32_t)(((uint64_t)ctx->ring_bytes_per_sec *
+                                STREAM_TRIM_CROSSFADE_US / 1000000ULL) /
+                               STREAM_FRAME_BYTES);
+  if (frames > after_bytes / STREAM_FRAME_BYTES)
+    frames = after_bytes / STREAM_FRAME_BYTES;
+  for (uint32_t frame = frames; frame-- > 0;) {
+    uint32_t outgoing = tail + frame * STREAM_FRAME_BYTES;
+    uint32_t incoming = outgoing + surplus_bytes;
+    int64_t in_share = frame + 1;
+    int64_t out_share = frames + 1 - in_share;
+    for (int ch = 0; ch < 2; ch++) {
+      int64_t out_sample = ring_sample_get(buf, mask, outgoing + ch * 4);
+      int64_t in_sample = ring_sample_get(buf, mask, incoming + ch * 4);
+      ring_sample_put(buf, mask, incoming + ch * 4,
+                      (int32_t)((out_sample * out_share + in_sample * in_share) /
+                                (frames + 1)));
+    }
+  }
+}
+#endif
+
 /* Adaptive playout latency. Audio that arrives after its slot leaves
  * the DAC playing silence and playout that much later; the listener
  * keeps that latency, so the next equally late arrival plays. Once a
  * whole trim window has passed with more audio buffered at every
- * moment than STREAM_TRIM_MARGIN_US, it drops that surplus in one skip,
- * so latency follows the path instead of keeping its worst moment.
- * Never below presentation time. Whole DMA buffers only. */
+ * moment than STREAM_TRIM_MARGIN_US, it drops that surplus in one
+ * crossfaded skip, so latency follows the path instead of keeping its
+ * worst moment. Never below presentation time. Whole DMA buffers only. */
 #define STREAM_TRIM_MARGIN_US 3000
 static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
                                    int32_t ahead_us, uint32_t unit) {
@@ -2381,6 +2422,7 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
   if (surplus_bytes == 0)
     return;
   uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  stream_trim_crossfade(ctx, tail, surplus_bytes, avail - surplus_bytes);
   atomic_store_explicit(&ctx->ring.tail, tail + surplus_bytes,
                         memory_order_release);
   ctx->phase_trimmed += surplus_bytes;
@@ -2400,7 +2442,6 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
  * run faster and repeating one to run slower, at the rate the loop
  * asks. Slips count in the playout phase, which is how the loop sees
  * them work. */
-#define STREAM_FRAME_BYTES 8
 static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
   int32_t ppm_q16 = avb_pll_software_rate_ppm_q16();
   /* A few slips a second need no finer timing than every eighth drain
