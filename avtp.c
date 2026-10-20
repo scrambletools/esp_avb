@@ -2347,8 +2347,14 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
 #define STREAM_TRIM_MARGIN_US 3000
 static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
                                    int32_t ahead_us, uint32_t unit) {
-#if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0
+#if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0 || \
+    CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S > 0
   if (ctx->diag_gate_mode != 1)
+    return;
+  int64_t window_s = ctx->state->port[0].medium == avb_port_medium_wifi_ftm
+                         ? CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
+                         : CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S;
+  if (window_s == 0)
     return;
   int64_t now_us = esp_timer_get_time();
   if (ctx->trim_window_start_us == 0 || ahead_us < ctx->trim_min_ahead_us)
@@ -2357,8 +2363,7 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
     ctx->trim_window_start_us = now_us;
     return;
   }
-  if (now_us - ctx->trim_window_start_us <
-      (int64_t)CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S * 1000000LL)
+  if (now_us - ctx->trim_window_start_us < window_s * 1000000LL)
     return;
   int32_t surplus_us = ctx->trim_min_ahead_us - STREAM_TRIM_MARGIN_US;
   if (surplus_us > phase_ns / 1000)

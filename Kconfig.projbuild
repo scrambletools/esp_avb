@@ -470,7 +470,21 @@ menu "AVB Configuration"
             below presentation time. Latency then follows the worst
             lateness of the recent window instead of the worst ever,
             which also undoes a playout start that locked late. 0 keeps
-            any latency once taken.
+            any latency once taken. A station uses
+            ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S instead.
+
+    config ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
+        int "Latency trim window on a Wi-Fi listener (s, 0 = never)"
+        default 600
+        range 0 3600
+        depends on ESP_AVB
+        help
+            ESP_AVB_LISTENER_LATENCY_TRIM_S for a station. Wi-Fi delivery
+            stalls every minute or two, so a 60 s window trims away the
+            latency one stall added just before the next stall, which
+            then plays silence again (observed: a silence gap and a skip
+            about once a minute). A window longer than the stalls'
+            spacing keeps the latency of the worst recent stall.
 
     config ESP_AVB_AUTO_CRF_CLOCK_SOURCE
         bool "Auto-select CRF input as media clock source when live"
