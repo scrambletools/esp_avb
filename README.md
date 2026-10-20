@@ -6,10 +6,10 @@ endpoint, or as an Ethernet ↔ Wi-Fi bridge depending on per-port
 configuration.
 
 For a demo on how to use it, see the endpoint app on Github
-(scrambletoolsllc/ESP-AVB-Endpoint). For the bridge counterpart, see
-scrambletoolsllc/ESP-AVB-Bridge.
+(scrambletools/ESP-AVB-Endpoint). For the bridge counterpart, see
+scrambletools/ESP-AVB-Bridge.
 
-The source lives at <https://github.com/scrambletoolsllc/esp_avb>.
+The source lives at <https://github.com/scrambletools/esp_avb>.
 The component is published in the ESP Component Registry
 (<https://components.espressif.com>) under the **scrambletools**
 namespace, so depend on it as:
@@ -19,8 +19,8 @@ dependencies:
   scrambletools/esp_avb: "*"
 ```
 
-Old github.com/scrambletools/... links redirect to the
-scrambletoolsllc repos.
+Old github.com/scrambletoolsllc/... links redirect to the
+scrambletools repos.
 
 ## Terminology
 
