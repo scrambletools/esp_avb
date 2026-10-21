@@ -1765,6 +1765,8 @@ int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
 int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
                                       aecp_get_stream_info_s *msg,
                                       eth_addr_t *dest_addr);
+void avb_send_aecp_unsol_control(avb_state_s *state, uint16_t index,
+                                 uint8_t value);
 int avb_send_aecp_cmd_get_counters(avb_state_s *state, unique_id_t *target_id);
 int avb_send_aecp_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
                                    eth_addr_t *dest_addr);

@@ -225,7 +225,8 @@ static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
 #define AEM_MAX_NUM_CONFIGS 1       // only one config supported for now
 #define AEM_MAX_NUM_DESC 20         // max number of descriptors in a config
 #define AEM_MAX_DESC_COUNT 1        // max count of each descriptor in a config
-#define AEM_NUM_CONTROLS 3          // IDENTIFY, Speaker Volume, Mic Gain
+#define AEM_NUM_CONTROLS 4          // IDENTIFY, Speaker Volume, Mic Gain, Test Tone
+#define AEM_CONTROL_TEST_TONE 3     // control index of the talker's test tone
 #define AEM_MAX_NUM_SAMPLE_RATES 10 // max number of sample rates
 #define AEM_MAX_NUM_FORMATS 32      // AM824 + AAF 32/24 at two cadences and 8/2 channels, 5 rates
 #define AEM_MAX_NUM_MAPPINGS                                                   \
@@ -248,6 +249,7 @@ typedef enum {
   AVB_NAME_STREAM_INPUT_1, // CRF media clock input when audio input is present
   AVB_NAME_STREAM_OUTPUT_0,
   AVB_NAME_STREAM_OUTPUT_1, // CRF media clock output
+  AVB_NAME_CONTROL_3,       // Test Tone, last so persisted names keep their slots
   AVB_NAME_COUNT            // total number of settable names
 } avb_name_index_t;
 
@@ -795,6 +797,7 @@ typedef struct avb_state_s {
   uint8_t ctrl_identify;                     // IDENTIFY control (0=off, 255=on)
   float ctrl_speaker_vol;                    // speaker volume in dB
   float ctrl_mic_gain;                       // mic gain in dB
+  volatile uint8_t ctrl_test_tone;           // Test Tone control (0=off, 255=on)
   char descriptor_names[AVB_NAME_COUNT][64]; // user-settable descriptor names
   avb_persistent_data_s persist;             // persistent data (saved to NVS)
 
@@ -1303,6 +1306,7 @@ void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
 uint32_t aaf_code_to_sample_rate(uint8_t code);
 int avb_start_stream_out(avb_state_s *state, uint16_t index);
 int avb_stop_stream_out(avb_state_s *state, uint16_t index);
+bool avb_talker_audio_streaming(const avb_state_s *state);
 void avb_remove_talker_listener_by_index(avb_talker_stream_s *stream, int idx);
 
 #ifdef CONFIG_ESP_AVB_SUPERFAST_CONNECT

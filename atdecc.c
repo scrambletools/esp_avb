@@ -902,7 +902,8 @@ int avb_send_aecp_rsp_read_descr_audio_map(avb_state_s *state,
 }
 
 /* Send AECP response get descriptor for control message
- * Supports: 0=IDENTIFY, 1=Speaker Volume (listener), 2=Mic Gain (talker)
+ * Supports: 0=IDENTIFY, 1=Speaker Volume (listener), 2=Mic Gain (talker),
+ * 3=Test Tone (talker)
  */
 int avb_send_aecp_rsp_read_descr_control(avb_state_s *state,
                                          aecp_read_descriptor_rsp_s *msg,
@@ -1001,6 +1002,29 @@ int avb_send_aecp_rsp_read_descr_control(avb_state_s *state,
     int_to_octets(&value_string_ref, v + 12, 2);
     break;
   }
+  case AEM_CONTROL_TEST_TONE: { /* Test Tone (ENABLE control type) */
+    if (!state->config.talker) {
+      avbwarn("Control index 3 (test tone) not available: talker not enabled");
+      return OK;
+    }
+    int localized_desc_tone = 24;    /* strings desc 3, string_0 */
+    uint16_t control_value_type = 1; // CONTROL_LINEAR_UINT8
+    uint8_t control_type[8] = {0x90, 0xe0, 0xf0, 0x00,
+                               0x00, 0x00, 0x00, 0x00}; // ENABLE
+    aem_identify_control_value_s control_values = {
+        .values = {0, 255, 255, 0, state->ctrl_test_tone},
+        .units = {0},
+        .string_ref = {0, 25}, /* strings desc 3, string_1: Tone */
+    };
+    memcpy(descriptor.object_name, state->descriptor_names[AVB_NAME_CONTROL_3],
+           64);
+    int_to_octets(&localized_desc_tone, descriptor.localized_description, 2);
+    int_to_octets(&control_value_type, descriptor.control_value_type, 2);
+    memcpy(descriptor.control_type, control_type, 8);
+    memcpy(descriptor.value_details, &control_values,
+           sizeof(aem_identify_control_value_s));
+    break;
+  }
   default:
     avbwarn("Unsupported control descriptor index: %d", index);
     return OK;
@@ -1073,6 +1097,22 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
     avb_persist_request_save(state);
     break;
   }
+  case AEM_CONTROL_TEST_TONE: { /* Test Tone */
+    if (!state->config.talker) {
+      status = aecp_status_not_supported;
+      break;
+    }
+    /* Only a streaming talker plays the tone: otherwise the control
+     * stays off and the response says so. Not persisted, and it turns
+     * off when the talker stops (avb_stop_stream_out). */
+    bool on = values[0] != 0 && avb_talker_audio_streaming(state);
+    uint8_t tone = on ? 255 : 0;
+    changed = tone != state->ctrl_test_tone;
+    state->ctrl_test_tone = tone;
+    avbinfo("SET_CONTROL: Test Tone = %s%s", on ? "on" : "off",
+            values[0] != 0 && !on ? " (talker not streaming)" : "");
+    break;
+  }
   default:
     status = aecp_status_no_such_descriptor;
     break;
@@ -1100,13 +1140,17 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
       values[1] = cur & 0xFF;
       break;
     }
+    case AEM_CONTROL_TEST_TONE:
+      values[0] = state->ctrl_test_tone;
+      break;
     }
   }
 
   /* Compute exact response length from value size, not from the incoming
    * command length — some controllers send extra data (full value_details)
    * in the command that must not be echoed back. */
-  uint16_t values_len = (desc_index == 0) ? 1 : 2;
+  uint16_t values_len =
+      (desc_index == 0 || desc_index == AEM_CONTROL_TEST_TONE) ? 1 : 2;
   uint16_t control_data_len = sizeof(aecp_common_s) +
                               sizeof(aecp_common_aem_s) + 4 + values_len -
                               AVTP_CDL_PREAMBLE_LEN;
@@ -1122,6 +1166,31 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
     avb_unsol_notify(state, msg, msg_len, avb_unsol_kind_aem,
                      msg->common.controller_entity_id, src_addr);
   return ret;
+}
+
+/* A one-byte control the entity changed itself, reported as an unsolicited
+ * SET_CONTROL response (IEEE 1722.1-2021 §7.5.2) */
+void avb_send_aecp_unsol_control(avb_state_s *state, uint16_t index,
+                                 uint8_t value) {
+  struct __attribute__((packed)) {
+    aecp_aem_short_s aem;
+    uint8_t value;
+  } rsp;
+  memset(&rsp, 0, sizeof(rsp));
+  rsp.aem.common.header.subtype = avtp_subtype_aecp;
+  rsp.aem.common.header.msg_type = aecp_msg_type_aem_response;
+  rsp.aem.common.header.status_valtime = aecp_status_success;
+  uint16_t cdl = sizeof(rsp) - AVTP_CDL_PREAMBLE_LEN;
+  rsp.aem.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  rsp.aem.common.header.control_data_len = cdl & 0xFF;
+  memcpy(rsp.aem.common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  rsp.aem.aem.command_type = aecp_cmd_code_set_control;
+  uint16_t descriptor_type = aem_desc_type_control;
+  int_to_octets(&descriptor_type, rsp.aem.descriptor_type, 2);
+  int_to_octets(&index, rsp.aem.descriptor_index, 2);
+  rsp.value = value;
+  avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_aem, NULL, NULL);
 }
 
 /* Process AECP GET_CONTROL command (IEEE 1722.1 §7.4.26) */
@@ -1157,6 +1226,13 @@ int avb_process_aecp_cmd_get_control(avb_state_s *state, aecp_message_u *msg,
     values[1] = cur & 0xFF;
     break;
   }
+  case AEM_CONTROL_TEST_TONE: /* Test Tone */
+    if (!state->config.talker) {
+      status = aecp_status_not_supported;
+      break;
+    }
+    values[0] = state->ctrl_test_tone;
+    break;
   default:
     status = aecp_status_no_such_descriptor;
     break;
@@ -1166,7 +1242,8 @@ int avb_process_aecp_cmd_get_control(avb_state_s *state, aecp_message_u *msg,
   msg->header.status_valtime = status;
 
   /* Set control_data_len to include the values field */
-  uint16_t values_len = (desc_index == 0) ? 1 : 2;
+  uint16_t values_len =
+      (desc_index == 0 || desc_index == AEM_CONTROL_TEST_TONE) ? 1 : 2;
   uint16_t control_data_len = sizeof(aecp_common_s) +
                               sizeof(aecp_common_aem_s) + 4 + values_len -
                               AVTP_CDL_PREAMBLE_LEN;
@@ -1425,7 +1502,9 @@ static uint8_t *avb_resolve_name_ptr(avb_state_s *state, uint16_t desc_type,
           state->descriptor_names[AVB_NAME_STREAM_OUTPUT_0 + desc_index];
     return NULL;
   case aem_desc_type_control:
-    if (desc_index < AEM_NUM_CONTROLS && name_index == 0)
+    if (desc_index == AEM_CONTROL_TEST_TONE && name_index == 0)
+      return (uint8_t *)state->descriptor_names[AVB_NAME_CONTROL_3];
+    if (desc_index < AEM_CONTROL_TEST_TONE && name_index == 0)
       return (uint8_t *)
           state->descriptor_names[AVB_NAME_CONTROL_0 + desc_index];
     return NULL;

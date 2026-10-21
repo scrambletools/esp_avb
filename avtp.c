@@ -648,19 +648,18 @@ static void avb_stream_out_task(void *task_param) {
     goto err;
   }
 
-  /* Sine wave fallback */
-  if (params->use_sine_wave) {
-    lut_samples = build_sine_lut(&sine_lut, params->channels, params->bit_depth,
-                                 params->sample_rate, params->sine_freq);
-    if (!sine_lut) {
-      avberr("Stream out: Failed to build sine LUT");
-      goto err;
-    }
-    int bps = (params->bit_depth == 24) ? 4 : (params->bit_depth / 8);
-    pcm_buf = calloc(1, spp_max * params->channels * bps);
-    if (!pcm_buf)
-      goto err;
+  /* Sine table: the whole source in the test tone build, and what the
+   * Test Tone control plays in place of the codec input. */
+  lut_samples = build_sine_lut(&sine_lut, params->channels, params->bit_depth,
+                               params->sample_rate, params->sine_freq);
+  if (!sine_lut) {
+    avberr("Stream out: Failed to build sine LUT");
+    goto err;
   }
+  int bps = (params->bit_depth == 24) ? 4 : (params->bit_depth / 8);
+  pcm_buf = calloc(1, spp_max * params->channels * bps);
+  if (!pcm_buf)
+    goto err;
 
   /* Pre-build the TX frame — constant fields filled once.
    * Audio data offset depends on format (AAF vs AM824). */
@@ -1718,6 +1717,17 @@ static void avb_stream_out_task(void *task_param) {
       else
         i2s24_to_aaf_mono(i2s_buf, audio_dst, this_spp,
                           params->channels, &mic_dsp);
+      /* Test Tone control: the tone replaces the converted input, so the
+       * capture ring, its pacing and the input filters run as usual and
+       * the input resumes without a step when the tone stops. */
+      if (state->ctrl_test_tone) {
+        copy_sine_from_lut(pcm_buf, this_spp, params->channels,
+                           params->bit_depth, sine_lut, lut_samples, &lut_pos);
+        if (is_am824)
+          be32_to_am824(pcm_buf, audio_dst, total_samples);
+        else
+          be32_to_aaf(pcm_buf, audio_dst, total_samples);
+      }
     } /* end else (mic path) */
 
     /* Transmit via avbnet's medium-abstracted raw send. AVB Lite
@@ -4462,6 +4472,17 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   return OK;
 }
 
+/* True while an audio (not CRF) output stream is streaming. */
+bool avb_talker_audio_streaming(const avb_state_s *state) {
+  for (size_t i = 0; i < state->num_output_streams; i++) {
+    const avb_talker_stream_s *stream = &state->output_streams[i];
+    if (stream->streaming &&
+        stream->stream_format.aaf_pcm.subtype != avtp_subtype_crf)
+      return true;
+  }
+  return false;
+}
+
 /* Stop the AVB stream output task */
 int avb_stop_stream_out(avb_state_s *state, uint16_t index) {
   state->output_streams[index].stop_streaming = true;
@@ -4474,5 +4495,14 @@ int avb_stop_stream_out(avb_state_s *state, uint16_t index) {
     s_crf_out = NULL;
   }
   avbinfo("Stream out %d stopped", index);
+  /* The test tone lasts only while the talker streams: off with the last
+   * audio stream, so the next listener never starts on a tone. */
+  if (state->ctrl_test_tone && !avb_talker_audio_streaming(state)) {
+    state->ctrl_test_tone = 0;
+#ifdef CONFIG_ESP_AVB_ATDECC
+    avb_send_aecp_unsol_control(state, AEM_CONTROL_TEST_TONE, 0);
+#endif
+    avbinfo("Test Tone off: talker stopped");
+  }
   return OK;
 }

@@ -140,7 +140,7 @@
    .default_speaker_vol_tenth_db = -100}
 
 #define AVB_LOCALIZED_STRINGS_PER_DESCRIPTOR 7
-#define AVB_LOCALIZED_STRINGS_DESCRIPTORS 3
+#define AVB_LOCALIZED_STRINGS_DESCRIPTORS 4
 
 typedef struct {
   const char *locale_identifier;
@@ -182,6 +182,11 @@ static const avb_locale_strings_s AVB_LOCALIZED_STRINGS[] = {
                     "Gain",                /* 20: Mic Gain Value Name */
                     "Identify",            /* 21: Identify Value Name */
                     "Wi-Fi",               /* 22: Wi-Fi AVB Interface Name */
+                },
+                /* Strings descriptor 3: localized refs 24..30 */
+                {
+                    "Test Tone", /* 24: Test Tone Control Name */
+                    "Tone",      /* 25: Test Tone Value Name */
                 },
             },
     },
