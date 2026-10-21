@@ -2683,14 +2683,25 @@ int avb_process_aecp_cmd_entity_available(avb_state_s *state,
   int ret;
   struct timespec ts;
 
+  /* IEEE 1722.1-2021 Figure 7-29: the response reports who holds the
+   * entity acquired and locked. */
   aecp_entity_available_rsp_s response;
   memset(&response, 0, sizeof(aecp_entity_available_rsp_s));
   memcpy(&response.common, &msg->common, sizeof(aecp_common_s));
   memcpy(&response.aem, &msg->basic.aem, sizeof(aecp_common_aem_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
+  response.entity_acquired = state->acquired;
+  response.entity_locked = state->locked;
+  if (state->acquired)
+    memcpy(response.acquired_controller_id, state->acquired_by,
+           UNIQUE_ID_LEN);
+  if (state->locked)
+    memcpy(response.locked_controller_id, state->locked_by, UNIQUE_ID_LEN);
+  uint16_t cdl = sizeof(response) - AVTP_CDL_PREAMBLE_LEN;
+  response.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  response.common.header.control_data_len = cdl & 0xFF;
 
-  uint16_t msg_len =
-      sizeof(atdecc_header_s) + sizeof(aecp_entity_available_rsp_s);
+  uint16_t msg_len = sizeof(aecp_entity_available_rsp_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
   if (ret < 0) {
@@ -2714,8 +2725,11 @@ int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
   response.common.header.msg_type = aecp_msg_type_aem_response;
   size_t config_index = DEFAULT_CONFIG_INDEX;
   int_to_octets(&config_index, response.configuration_index, 2);
+  uint16_t cdl = sizeof(response) - AVTP_CDL_PREAMBLE_LEN;
+  response.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  response.common.header.control_data_len = cdl & 0xFF;
 
-  uint16_t msg_len = sizeof(atdecc_header_s) + sizeof(aecp_lock_entity_s);
+  uint16_t msg_len = sizeof(aecp_get_configuration_rsp_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
   if (ret < 0) {
