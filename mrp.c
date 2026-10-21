@@ -593,13 +593,16 @@ typedef struct {
   avb_sr_class_e admitted_class[CONFIG_ESP_AVB_NUM_PORTS];
 #endif
   /* Mid-life value change quarantine: after an Lv for the old value,
-   * hold off re-declaring the new one until the peer's LeaveTimer has
-   * fully deregistered the old attribute. Re-declaring the same
-   * StreamID with a new TSpec while the peer's registrar is still in
-   * LV leaves SRP switches with a limbo reservation — they stop
-   * propagating the stream's advertise entirely until a LeaveAll
-   * cycles it out (minutes). 0 = no quarantine. */
+   * hold off re-declaring the new one until the network has dropped
+   * the old attribute. Re-declaring the same StreamID with a new TSpec
+   * while a registrar still holds the old one leaves SRP switches with
+   * a limbo reservation, they stop propagating the stream's advertise
+   * entirely until a LeaveAll cycles it out (minutes).
+   * redeclare_after_us is the latest the quarantine can last, 0 = no
+   * quarantine; holdoff_leaveall_base is the port's Talker LeaveAll
+   * count at the withdrawal. */
   int64_t redeclare_after_us;
+  uint32_t holdoff_leaveall_base;
   /* CVU idle-timeout stamp (avb_lite.md §6, Declaration timing):
    * refreshed on every RX of this attribute; with LeaveAll disabled
    * in AVB Lite this is the only staleness mechanism. */
@@ -661,6 +664,12 @@ static msrp_listener_entry_t s_msrp_listeners[CONFIG_ESP_AVB_NUM_PORTS]
                                              [MSRP_LISTENER_TABLE_SIZE];
 static msrp_domain_entry_t s_msrp_domains[CONFIG_ESP_AVB_NUM_PORTS]
                                          [MSRP_DOMAIN_TABLE_SIZE];
+
+/* Talker Advertise LeaveAlls heard from the peer on each port, and when
+ * the last one came. A changed Talker Advertise waits for two of them
+ * (see MSRP_VALUE_CHANGE_LEAVEALLS). */
+static uint32_t s_talker_leaveall_count[CONFIG_ESP_AVB_NUM_PORTS];
+static int64_t s_talker_leaveall_us[CONFIG_ESP_AVB_NUM_PORTS];
 
 static bool stream_id_eq(const unique_id_t *a, const unique_id_t *b) {
   return memcmp(a, b, sizeof(unique_id_t)) == 0;
@@ -1759,6 +1768,10 @@ static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
   switch (attr_type) {
   case msrp_attr_type_talker_advertise:
   case msrp_attr_type_talker_failed:
+    if (attr_type == msrp_attr_type_talker_advertise) {
+      s_talker_leaveall_count[port]++;
+      s_talker_leaveall_us[port] = esp_timer_get_time();
+    }
     for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
       if (s_msrp_talkers[port][i].valid &&
           s_msrp_talkers[port][i].attr_type == attr_type) {
@@ -2726,7 +2739,12 @@ static void mrp_tx_talker_value_leave(avb_state_s *state, int port,
  * FirstValue field for an existing StreamID; a talker that brings the
  * stream back with a different value waits at least two LeaveAllTime
  * periods after withdrawing it, so every device has dropped the old one.
- * Milan v1.3 Table 5.3 says the same for a DA or priority change. Two of
+ * Milan v1.3 Table 5.3 says the same for a DA or priority change. The
+ * periods are the peer's own, counted as it sends its Talker LeaveAlls:
+ * each puts its Registrar for the old value in LV, and nothing declares
+ * that value any more, so a LeaveAll and a LeaveTime clear the peer, and
+ * the second LeaveAll gives the next hop a period of its own. A peer that
+ * sends none leaves the hold-off at MSRP_VALUE_CHANGE_HOLDOFF_US, two of
  * the longest Milan LeaveAll periods (15.5 s) and a LeaveTime. A bridge
  * re-declares a value its upstream talker already waited for, so it keeps
  * only the LeaveTime margin. Observed with 1.5 s: a MOTU switch kept the
@@ -2737,6 +2755,23 @@ static void mrp_tx_talker_value_leave(avb_state_s *state, int port,
 #else
 #define MSRP_VALUE_CHANGE_HOLDOFF_US (32 * 1000 * 1000)
 #endif
+#define MSRP_VALUE_CHANGE_LEAVEALLS 2
+
+/* True once a changed Talker Advertise may be declared again. */
+static bool mrp_value_change_holdoff_over(int port,
+                                          const msrp_talker_entry_t *e,
+                                          int64_t now_us) {
+  if (now_us >= e->redeclare_after_us)
+    return true;
+#ifdef CONFIG_ESP_AVB_ROLE_BRIDGE
+  (void)port;
+  return false;
+#else
+  return s_talker_leaveall_count[port] - e->holdoff_leaveall_base >=
+             MSRP_VALUE_CHANGE_LEAVEALLS &&
+         now_us - s_talker_leaveall_us[port] >= MRP_LEAVE_TIMER_US;
+#endif
+}
 
 /* Reset an entry's SMs so the next declare propagates as New!. */
 static void mrp_sm_reset_for_new_value(mrp_sm_state_t *sm) {
@@ -2814,8 +2849,10 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
       mrp_tx_talker_value_leave(state, port, e);
       e->redeclare_after_us =
           esp_timer_get_time() + MSRP_VALUE_CHANGE_HOLDOFF_US;
+      e->holdoff_leaveall_base = s_talker_leaveall_count[port];
       avbinfo("MSRP: talker advertise value changed, withdrew MaxFrameSize "
-              "%u, declaring %u in %d s",
+              "%u, declaring %u once the network has dropped it, at most "
+              "%d s",
               (unsigned)octets_to_uint(e->wire.talker.info.tspec_max_frame_size,
                                        2),
               (unsigned)max_frame_size,
@@ -2825,8 +2862,15 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
     e->wire = fresh;
   }
   if (e->redeclare_after_us != 0) {
-    if (esp_timer_get_time() < e->redeclare_after_us)
+    int64_t now_us = esp_timer_get_time();
+    if (!mrp_value_change_holdoff_over(port, e, now_us))
       return; /* periodic loop retries after the quarantine */
+    avbinfo("MSRP: declaring the changed talker advertise %lld ms after "
+            "the withdrawal, %lu Talker LeaveAlls heard",
+            (long long)((now_us - (e->redeclare_after_us -
+                                   MSRP_VALUE_CHANGE_HOLDOFF_US)) / 1000),
+            (unsigned long)(s_talker_leaveall_count[port] -
+                            e->holdoff_leaveall_base));
     e->redeclare_after_us = 0;
   }
   e->wire = fresh;
