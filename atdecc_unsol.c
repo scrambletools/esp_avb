@@ -245,7 +245,31 @@ static void avb_unsol_registrations_tick(avb_state_s *state, int64_t now_us) {
   }
 }
 
+/* An expired lock is released and every registered controller is told,
+ * the one that held it only if it registered (Milan v1.3 §5.4.2.2). */
+static void avb_unsol_lock_tick(avb_state_s *state, int64_t now_us) {
+  if (!state->locked || now_us < state->lock_expires_us)
+    return;
+  state->locked = false;
+  memset(state->locked_by, 0, UNIQUE_ID_LEN);
+  avbinfo("Entity lock expired");
+  aecp_lock_entity_s rsp;
+  memset(&rsp, 0, sizeof(rsp));
+  rsp.common.header.subtype = avtp_subtype_aecp;
+  rsp.common.header.msg_type = aecp_msg_type_aem_response;
+  rsp.common.header.status_valtime = aecp_status_success;
+  uint16_t cdl = sizeof(rsp) - AVTP_CDL_PREAMBLE_LEN;
+  rsp.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  rsp.common.header.control_data_len = cdl & 0xFF;
+  memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  rsp.aem.command_type = aecp_cmd_code_lock_entity;
+  rsp.unlock = 1;
+  avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_aem, NULL, NULL);
+}
+
 void avb_unsol_tick(avb_state_s *state) {
   int64_t now_us = esp_timer_get_time();
   avb_unsol_registrations_tick(state, now_us);
+  avb_unsol_lock_tick(state, now_us);
 }

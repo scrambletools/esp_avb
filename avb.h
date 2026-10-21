@@ -108,6 +108,8 @@ typedef struct i2s_channel_obj_t *i2s_chan_handle_t;
 /* Controllers registered for unsolicited notifications, Milan v1.3
  * §5.3.4.2 requires at least 16 per AVB interface. */
 #define AVB_MAX_UNSOL_CONTROLLERS 16
+/* Milan v1.3 §5.4.2.2: an entity lock lapses after one minute */
+#define AVB_LOCK_TIMEOUT_US (60 * 1000000LL)
 /* Poll interval for the dedicated NVS-save task. The task wakes every
  * N ms, and if state->persist_dirty is set, snapshots and writes to
  * flash. Naturally coalesces bursts of marks in one flash write. */
@@ -1004,7 +1006,7 @@ typedef struct avb_state_s {
   unique_id_t acquired_by;
   unique_id_t locked_by;
   struct timeval last_acquired;
-  struct timeval last_locked;
+  int64_t lock_expires_us; // esp_timer time the lock lapses
 
   /* Unsolicited notifications */
   avb_unsol_controller_s unsol_controllers[AVB_MAX_UNSOL_CONTROLLERS];

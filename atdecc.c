@@ -2501,28 +2501,37 @@ int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
   int ret;
   struct timespec ts;
 
-  // locked id
+  /* Only the owner unlocks, or locks again to restart the 60 s expiry
+   * (Milan v1.3 §5.4.2.2); anyone else gets ENTITY_LOCKED and the owner's
+   * ID. UNLOCK from a controller holding no lock is a query. */
   aecp_lock_entity_s response = {0};
   memcpy(&response, msg, sizeof(aecp_lock_entity_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
-  if (!msg->lock_entity.unlock) {
-    memcpy(response.locked_id, msg->common.controller_entity_id, UNIQUE_ID_LEN);
+  aecp_status_t status = aecp_status_success;
+  bool owner = state->locked &&
+               memcmp(state->locked_by, msg->common.controller_entity_id,
+                      UNIQUE_ID_LEN) == 0;
+  if (octets_to_uint(msg->lock_entity.descriptor_type, 2) !=
+      aem_desc_type_entity) {
+    status = aecp_status_not_supported;
+  } else if (state->locked && !owner) {
+    status = aecp_status_entity_locked;
+  } else if (msg->lock_entity.unlock) {
+    state->locked = false;
+    memset(state->locked_by, 0, UNIQUE_ID_LEN);
+  } else {
+    state->locked = true;
+    memcpy(state->locked_by, msg->common.controller_entity_id, UNIQUE_ID_LEN);
+    state->lock_expires_us = esp_timer_get_time() + AVB_LOCK_TIMEOUT_US;
   }
+  response.common.header.status_valtime = status;
+  memcpy(response.locked_id, state->locked_by, UNIQUE_ID_LEN);
 
   uint16_t msg_len = sizeof(aecp_lock_entity_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
   if (ret < 0) {
     avberr("send AECP Lock Entity response failed: %d", errno);
-  } else {
-    if (msg->lock_entity.unlock) {
-      state->locked = false;
-    } else {
-      state->locked = true;
-      memcpy(state->locked_by, msg->common.controller_entity_id, UNIQUE_ID_LEN);
-      state->last_locked.tv_sec = ts.tv_sec;
-      state->last_locked.tv_usec = (suseconds_t)(ts.tv_nsec / 1000);
-    }
   }
   return ret;
 }
@@ -3222,6 +3231,31 @@ int avb_process_aecp_rsp_get_counters(avb_state_s *state, aecp_message_u *msg) {
   return OK;
 }
 
+/* AEM commands that change the entity, refused to a controller other
+ * than the one holding the lock or acquisition (IEEE 1722.1-2021 §7.4.2). */
+static bool avb_aem_command_changes_state(uint8_t command_type) {
+  switch (command_type) {
+  case aecp_cmd_code_set_stream_format:
+  case aecp_cmd_code_set_clock_source:
+  case aecp_cmd_code_set_max_transit_time:
+  case aecp_cmd_code_set_name:
+  case aecp_cmd_code_set_control:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* Answer an AEM command with its own content and an error status */
+static int avb_reflect_aem_command(avb_state_s *state, aecp_message_u *msg,
+                                   eth_addr_t *src_addr, aecp_status_t status) {
+  struct timespec ts;
+  msg->header.msg_type = aecp_msg_type_aem_response;
+  msg->header.status_valtime = status;
+  return avb_net_send_to(state, ethertype_avtp, msg, avb_aecp_msg_len(msg),
+                         &ts, src_addr);
+}
+
 int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
                      eth_addr_t *src_addr) {
 
@@ -3318,6 +3352,14 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
 
   /* Process AECP AEM commands */
   if (msg->header.msg_type == aecp_msg_type_aem_command) {
+    if (avb_aem_command_changes_state(msg->basic.aem.command_type) &&
+        avb_acquired_or_locked_by_other(state,
+                                        &msg->common.controller_entity_id)) {
+      return avb_reflect_aem_command(
+          state, msg, src_addr,
+          state->acquired ? aecp_status_entity_acquired
+                          : aecp_status_entity_locked);
+    }
     switch (msg->basic.aem.command_type) {
     case aecp_cmd_code_register_unsol_notif:
       return avb_process_aecp_cmd_register_unsol_notif(state, msg, src_addr);
