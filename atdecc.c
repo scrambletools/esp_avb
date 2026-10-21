@@ -1778,12 +1778,15 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
    * SM-driven RX entry point on port 0. mrp_rx_msrp walks the single
    * attribute in the wrapped buffer, runs SM transitions, and fires
    * the endpoint-side bookkeeping callbacks (talker DB, latency,
-   * listener readiness). */
+   * listener readiness). Its length counts the ProtocolVersion octet,
+   * which the CVU wrapper doesn't carry; passing only the attribute
+   * size made every CVU message look one octet short and get dropped
+   * as malformed. */
   switch (attr->attr_type) {
   case msrp_attr_type_talker_advertise:
   case msrp_attr_type_talker_failed:
   case msrp_attr_type_listener:
-    mrp_rx_msrp(state, 0, &msrp_msg, attr_size, src_addr);
+    mrp_rx_msrp(state, 0, &msrp_msg, attr_size + 1, src_addr);
     break;
   default:
     avbdebug("CVU: unsupported MSRP attribute type 0x%02x", attr->attr_type);
