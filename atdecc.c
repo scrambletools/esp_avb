@@ -1020,10 +1020,12 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
   uint16_t desc_index = octets_to_uint(cmd->descriptor_index, 2);
   uint8_t *values = (uint8_t *)cmd + sizeof(aecp_aem_short_s);
   uint8_t status = aecp_status_success;
+  bool changed = false;
 
   switch (desc_index) {
   case 0: { /* IDENTIFY */
     uint8_t val = values[0];
+    changed = val != state->ctrl_identify;
     state->ctrl_identify = val;
     if (val != 0) {
       avb_identify_tone(state, 500);
@@ -1038,6 +1040,7 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
     }
     int16_t raw = (int16_t)((values[0] << 8) | values[1]);
     raw = avb_codec_quantize_tenth_db(&state->codec_ranges, false, raw);
+    changed = raw != (int16_t)(state->ctrl_speaker_vol * 10.0f);
     float vol = raw / 10.0f;
     state->ctrl_speaker_vol = vol;
     avb_codec_set_vol(state, vol);
@@ -1052,6 +1055,7 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
     }
     int16_t raw = (int16_t)((values[0] << 8) | values[1]);
     raw = avb_codec_quantize_tenth_db(&state->codec_ranges, true, raw);
+    changed = raw != (int16_t)(state->ctrl_mic_gain * 10.0f);
     float gain = raw / 10.0f;
     state->ctrl_mic_gain = gain;
     avb_codec_set_mic_gain(state, gain);
@@ -1104,6 +1108,9 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
   if (ret < 0) {
     avberr("send AECP SET_CONTROL response failed: %d", errno);
   }
+  if (status == aecp_status_success && changed)
+    avb_unsol_notify(state, msg, msg_len, avb_unsol_kind_aem,
+                     msg->common.controller_entity_id, src_addr);
   return ret;
 }
 
@@ -1429,10 +1436,12 @@ int avb_process_aecp_cmd_set_name(avb_state_s *state, aecp_message_u *msg,
   uint16_t name_index = (data[4] << 8) | data[5];
   uint8_t *name = data + 8; /* 64-byte name field at offset 8 */
   uint8_t status = aecp_status_success;
+  bool changed = false;
 
   uint8_t *target =
       avb_resolve_name_ptr(state, desc_type, desc_index, name_index);
   if (target) {
+    changed = memcmp(target, name, 64) != 0;
     memcpy(target, name, 64);
     /* Sync to canonical locations for descriptors that read from elsewhere */
     if (desc_type == aem_desc_type_entity && name_index == 0)
@@ -1463,6 +1472,9 @@ int avb_process_aecp_cmd_set_name(avb_state_s *state, aecp_message_u *msg,
   if (ret < 0) {
     avberr("send AECP SET_NAME response failed: %d", errno);
   }
+  if (status == aecp_status_success && changed)
+    avb_unsol_notify(state, msg, msg_len, avb_unsol_kind_aem,
+                     msg->common.controller_entity_id, src_addr);
   return ret;
 }
 
@@ -1789,6 +1801,8 @@ int avb_process_aecp_cmd_mvu_bind_stream(avb_state_s *state,
      * local listener state. Synthesize an ACMP message from the current binding
      * and route through the shared CONNECT/DISCONNECT_RX path. */
     avb_listener_stream_s *stream = &state->input_streams[desc_index];
+    static const uint8_t unbound[UNIQUE_ID_LEN] = {0};
+    bool was_bound = memcmp(stream->talker_id, unbound, UNIQUE_ID_LEN) != 0;
     acmp_message_s synth = {0};
     memcpy(synth.talker_entity_id, stream->talker_id, UNIQUE_ID_LEN);
     memcpy(synth.talker_uid, stream->talker_uid, 2);
@@ -1803,6 +1817,9 @@ int avb_process_aecp_cmd_mvu_bind_stream(avb_state_s *state,
       ret = avb_send_mvu_response(state, cmd, src_addr, sizeof(*cmd),
                                   aecp_status_success);
       avb_send_listener_talker_command(state, &synth, true, true);
+      if (was_bound)
+        avb_unsol_notify(state, cmd, sizeof(*cmd), avb_unsol_kind_mvu,
+                         msg->common.controller_entity_id, src_addr);
     } else {
       ret = avb_send_mvu_response(state, cmd, src_addr, sizeof(*cmd),
                                   aecp_status_bad_arguments);
@@ -1824,6 +1841,10 @@ int avb_process_aecp_cmd_mvu_bind_stream(avb_state_s *state,
   }
 
   avb_listener_stream_s *stream = &state->input_streams[desc_index];
+  bool was_wait = stream->stream_flags.streaming_wait;
+  bool same_talker =
+      memcmp(stream->talker_id, cmd->talker_entity_id, UNIQUE_ID_LEN) == 0 &&
+      memcmp(stream->talker_uid, cmd->talker_stream_index, 2) == 0;
   uint16_t flags = octets_to_uint(cmd->flags, 2);
   /* Milan v1.3 Table 5.19: the bit column labels STREAMING_WAIT as
    * "bit 15" (MSB-first labeling) but the value column gives the wire
@@ -1846,6 +1867,9 @@ int avb_process_aecp_cmd_mvu_bind_stream(avb_state_s *state,
     ret = avb_send_mvu_response(state, cmd, src_addr, sizeof(*cmd),
                                 aecp_status_success);
     avb_send_listener_talker_command(state, &synth, false, true);
+    if (!same_talker || was_wait != stream->stream_flags.streaming_wait)
+      avb_unsol_notify(state, cmd, sizeof(*cmd), avb_unsol_kind_mvu,
+                       msg->common.controller_entity_id, src_addr);
   } else {
     ret = avb_send_mvu_response(state, cmd, src_addr, sizeof(*cmd),
                                 aecp_status_bad_arguments);
@@ -1883,12 +1907,19 @@ int avb_process_aecp_cmd_mvu_media_clock_ref_info(avb_state_s *state,
 
   /* Milan Table 5.18: bit values are 0x01 (user_mcr_prio valid) and
    * 0x02 (media_clock_domain_name valid). We support changing both. */
+  bool changed = false;
   if (set) {
-    if (cmd->flags & 0x01)
+    if ((cmd->flags & 0x01) && s_mcr_user_prio != cmd->user_mcr_prio) {
       s_mcr_user_prio = cmd->user_mcr_prio;
-    if (cmd->flags & 0x02)
+      changed = true;
+    }
+    if ((cmd->flags & 0x02) &&
+        memcmp(s_mcr_domain_name, cmd->media_clock_domain_name,
+               sizeof(s_mcr_domain_name)) != 0) {
       memcpy(s_mcr_domain_name, cmd->media_clock_domain_name,
              sizeof(s_mcr_domain_name));
+      changed = true;
+    }
   }
 
   rsp.flags = 0x03;
@@ -1897,8 +1928,12 @@ int avb_process_aecp_cmd_mvu_media_clock_ref_info(avb_state_s *state,
   memcpy(rsp.media_clock_domain_name, s_mcr_domain_name,
          sizeof(rsp.media_clock_domain_name));
 
-  return avb_send_mvu_response(state, &rsp, src_addr, sizeof(rsp),
-                               aecp_status_success);
+  int ret = avb_send_mvu_response(state, &rsp, src_addr, sizeof(rsp),
+                                  aecp_status_success);
+  if (changed)
+    avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_mvu,
+                     msg->common.controller_entity_id, src_addr);
+  return ret;
 }
 
 /* GET_STREAM_INPUT_INFO_EX (MVU 0x0007)
@@ -2476,6 +2511,7 @@ int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
 
+  bool was_acquired = state->acquired;
   if (ret < 0) {
     avberr("send AECP Acquire Entity response failed: %d", errno);
   } else if (!refused) {
@@ -2492,6 +2528,9 @@ int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
       avb_unsol_register(state, &msg->common.controller_entity_id, src_addr,
                          false);
     }
+    if (was_acquired != state->acquired)
+      avb_unsol_notify(state, &response, msg_len, avb_unsol_kind_aem,
+                       msg->common.controller_entity_id, src_addr);
   }
   return ret;
 }
@@ -2508,6 +2547,7 @@ int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
   memcpy(&response, msg, sizeof(aecp_lock_entity_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
   aecp_status_t status = aecp_status_success;
+  bool was_locked = state->locked;
   bool owner = state->locked &&
                memcmp(state->locked_by, msg->common.controller_entity_id,
                       UNIQUE_ID_LEN) == 0;
@@ -2533,6 +2573,9 @@ int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
   if (ret < 0) {
     avberr("send AECP Lock Entity response failed: %d", errno);
   }
+  if (status == aecp_status_success && was_locked != state->locked)
+    avb_unsol_notify(state, &response, msg_len, avb_unsol_kind_aem,
+                     msg->common.controller_entity_id, src_addr);
   return ret;
 }
 
@@ -2660,6 +2703,7 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
                                            aecp_message_u *msg,
                                            eth_addr_t *src_addr) {
   uint8_t status = aecp_status_success;
+  bool changed = false;
   uint16_t descriptor_type =
       octets_to_uint(msg->stream_format.descriptor_type, 2);
   uint16_t index = octets_to_uint(msg->stream_format.descriptor_index, 2);
@@ -2736,6 +2780,10 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
               rate_change ? " (rate change needs all streams stopped)" : "");
       status = aecp_status_stream_is_running;
     } else {
+      avtp_stream_format_s *current =
+          is_output ? &state->output_streams[index].stream_format
+                    : &state->input_streams[index].stream_format;
+      changed = memcmp(current, requested, sizeof(avtp_stream_format_s)) != 0;
       if (rate_change && avb_audio_set_rate(state, new_rate) != ESP_OK) {
         status = aecp_status_entity_misbehaving;
       } else if (is_output) {
@@ -2752,6 +2800,10 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
   // timeout and can't distinguish "no such device" from "format rejected".
   msg->stream_format.common.header.status_valtime = status;
   avb_send_aecp_rsp_set_stream_format(state, &msg->stream_format, src_addr);
+  if (status == aecp_status_success && changed)
+    avb_unsol_notify(state, msg, sizeof(aecp_stream_format_s),
+                     avb_unsol_kind_aem, msg->common.controller_entity_id,
+                     src_addr);
 
   if (status != aecp_status_success) {
     return ERROR;
@@ -2851,6 +2903,7 @@ int avb_process_aecp_cmd_set_clock_source(avb_state_s *state,
   }
 
   aecp_status_t status = aecp_status_success;
+  bool changed = false;
   if (descriptor_type != aem_desc_type_clock_domain || descriptor_index != 0) {
     status = aecp_status_no_such_descriptor;
   } else if (requested_index > 1) {
@@ -2872,6 +2925,7 @@ int avb_process_aecp_cmd_set_clock_source(avb_state_s *state,
      * clock reference for any dependent output stream. */
     status = aecp_status_not_supported;
   } else {
+    changed = requested_index != state->media_clock.active_clock_source_index;
     state->media_clock.active_clock_source_index = requested_index;
     avb_persist_request_save(state);
     avbinfo("Clock source changed to %u (%s)", requested_index,
@@ -2895,6 +2949,9 @@ int avb_process_aecp_cmd_set_clock_source(avb_state_s *state,
   if (ret < 0) {
     avberr("send AECP SET_CLOCK_SOURCE response failed: %d", errno);
   }
+  if (status == aecp_status_success && changed)
+    avb_unsol_notify(state, cmd, msg_len, avb_unsol_kind_aem,
+                     cmd->common.controller_entity_id, src_addr);
   return ret;
 }
 
@@ -2913,6 +2970,7 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
   uint64_t requested_ns = is_set ? octets_to_uint(rsp->max_transit_time, 8) : 0;
 
   aecp_status_t status = aecp_status_success;
+  bool changed = false;
   if (descriptor_type != aem_desc_type_stream_output ||
       index >= state->num_output_streams) {
     status = aecp_status_no_such_descriptor;
@@ -2929,6 +2987,8 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
                     UNIQUE_ID_LEN) != 0) {
     status = aecp_status_entity_acquired;
   } else if (is_set) {
+    changed = state->output_streams[index].presentation_time_offset_ns !=
+              (uint32_t)requested_ns;
     state->output_streams[index].presentation_time_offset_ns =
         (uint32_t)requested_ns;
     avb_persist_append_output_stream(state, index);
@@ -2952,6 +3012,10 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
   if (ret < 0) {
     avberr("send AECP MAX_TRANSIT_TIME response failed: %d", errno);
   }
+  if (status == aecp_status_success && changed)
+    avb_unsol_notify(state, rsp, sizeof(aecp_max_transit_time_s),
+                     avb_unsol_kind_aem, rsp->common.controller_entity_id,
+                     src_addr);
   return ret;
 }
 
