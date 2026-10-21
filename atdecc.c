@@ -160,6 +160,13 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
     // input stream info
     avb_listener_stream_s *s = &state->input_streams[index];
     aem_stream_info_flags_s flags = s->stream_info_flags;
+    /* From the fields, not the stored flags: a disconnect clears those
+     * and a connect never sets them again. A superfast guess is not
+     * valid until the probe confirms it. */
+    flags.stream_id_valid =
+        memcmp(s->stream_id, zero_id, UNIQUE_ID_LEN) != 0 && !s->provisional;
+    flags.stream_vlan_id_valid =
+        flags.stream_id_valid && octets_to_uint(s->vlan_id, 2) != 0;
     flags.stream_format_valid = 1;
     flags.stream_dest_mac_valid =
         memcmp(s->stream_dest_addr, zero_mac, ETH_ADDR_LEN) != 0;
