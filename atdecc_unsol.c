@@ -24,8 +24,39 @@
 /* IEEE 1722.1-2021 §7.4.37.2: a TIME_LIMITED registration lapses 300 s
  * after the controller last registered. */
 #define UNSOL_TIME_LIMIT_US (300 * 1000000LL)
+/* State a controller would read is rebuilt every 100 ms and sent when it
+ * changed. GET_COUNTERS goes at most once a second per descriptor (Milan
+ * Table 5.20), every 10 s over Wi-Fi for its airtime. */
+#define UNSOL_ASYNC_PERIOD_US 100000
+#define UNSOL_COUNTERS_WIRED_US 1000000
+#define UNSOL_COUNTERS_WIFI_US 10000000
+/* Propagation delay jitters by a few ns; a smaller step is no change */
+#define UNSOL_PDELAY_STEP_NS 100
 
 static uint8_t s_frame[AVB_MAX_MSG_LEN];
+
+/* The response last sent for one asynchronous notification */
+typedef struct {
+  bool valid;
+  uint16_t msg_len;
+  union {
+    aecp_get_stream_info_rsp_s stream_info;
+    aecp_get_avb_info_rsp_s avb_info;
+    aecp_get_as_path_rsp_s as_path;
+    aecp_get_counters_rsp_s counters;
+    aecp_mvu_get_stream_input_info_ex_rsp_s stream_input_info_ex;
+  } rsp;
+} avb_unsol_sent_s;
+
+static avb_unsol_sent_s s_stream_info_in[AVB_MAX_NUM_INPUT_STREAMS];
+static avb_unsol_sent_s s_stream_info_out[AVB_MAX_NUM_OUTPUT_STREAMS];
+static avb_unsol_sent_s s_stream_input_info_ex[AVB_MAX_NUM_INPUT_STREAMS];
+static avb_unsol_sent_s s_avb_info;
+static avb_unsol_sent_s s_as_path;
+static avb_unsol_sent_s s_counters_in[AVB_MAX_NUM_INPUT_STREAMS];
+static avb_unsol_sent_s s_counters_out[AVB_MAX_NUM_OUTPUT_STREAMS];
+static int64_t s_async_due_us;
+static int64_t s_counters_due_us;
 
 static int64_t avb_unsol_check_delay_us(void) {
   return UNSOL_CHECK_MIN_US + (int64_t)(esp_random() % UNSOL_CHECK_SPAN_US);
@@ -268,8 +299,142 @@ static void avb_unsol_lock_tick(avb_state_s *state, int64_t now_us) {
   avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_aem, NULL, NULL);
 }
 
+/* Send a rebuilt response to every registered controller when it differs
+ * from the copy last sent. The first build only becomes the copy, so a
+ * controller registering later is not sent the state it reads anyway. */
+static void avb_unsol_send_changed(avb_state_s *state, avb_unsol_sent_s *sent,
+                                   const void *rsp, uint16_t msg_len,
+                                   avb_unsol_kind_t kind) {
+  if (msg_len == 0 || msg_len > sizeof(sent->rsp))
+    return;
+  if (sent->valid && sent->msg_len == msg_len &&
+      memcmp(&sent->rsp, rsp, msg_len) == 0)
+    return;
+  bool first = !sent->valid;
+  sent->valid = true;
+  sent->msg_len = msg_len;
+  memcpy(&sent->rsp, rsp, msg_len);
+  if (!first)
+    avb_unsol_notify(state, rsp, msg_len, kind, NULL, NULL);
+}
+
+/* A GET command as a controller would send it, for the shared builders */
+static void avb_unsol_get_command(avb_state_s *state, aecp_aem_short_s *cmd,
+                                  uint8_t command_type,
+                                  uint16_t descriptor_type,
+                                  uint16_t descriptor_index) {
+  memset(cmd, 0, sizeof(*cmd));
+  cmd->common.header.subtype = avtp_subtype_aecp;
+  cmd->common.header.msg_type = aecp_msg_type_aem_command;
+  memcpy(cmd->common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  cmd->aem.command_type = command_type;
+  int_to_octets(&descriptor_type, cmd->descriptor_type, 2);
+  int_to_octets(&descriptor_index, cmd->descriptor_index, 2);
+}
+
+static void avb_unsol_stream_info_tick(avb_state_s *state) {
+  aecp_get_stream_info_s cmd;
+  aecp_get_stream_info_rsp_s rsp;
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    avb_unsol_get_command(state, &cmd, aecp_cmd_code_get_stream_info,
+                          aem_desc_type_stream_input, i);
+    uint16_t msg_len = avb_fill_rsp_get_stream_info(state, &cmd, &rsp);
+    avb_unsol_send_changed(state, &s_stream_info_in[i], &rsp, msg_len,
+                           avb_unsol_kind_aem);
+  }
+  for (uint16_t i = 0; i < state->num_output_streams; i++) {
+    avb_unsol_get_command(state, &cmd, aecp_cmd_code_get_stream_info,
+                          aem_desc_type_stream_output, i);
+    uint16_t msg_len = avb_fill_rsp_get_stream_info(state, &cmd, &rsp);
+    avb_unsol_send_changed(state, &s_stream_info_out[i], &rsp, msg_len,
+                           avb_unsol_kind_aem);
+  }
+}
+
+static void avb_unsol_avb_info_tick(avb_state_s *state) {
+  aecp_get_avb_info_s cmd;
+  aecp_get_avb_info_rsp_s rsp;
+  avb_unsol_get_command(state, &cmd, aecp_cmd_code_get_avb_info,
+                        aem_desc_type_avb_interface, 0);
+  uint16_t msg_len = avb_fill_rsp_get_avb_info(state, &cmd, &rsp);
+  if (s_avb_info.valid) {
+    uint8_t *sent_delay = s_avb_info.rsp.avb_info.propagation_delay;
+    uint32_t sent_ns = (uint32_t)octets_to_uint(sent_delay, 4);
+    uint32_t now_ns = (uint32_t)octets_to_uint(rsp.propagation_delay, 4);
+    uint32_t step_ns = now_ns > sent_ns ? now_ns - sent_ns : sent_ns - now_ns;
+    if (step_ns < UNSOL_PDELAY_STEP_NS)
+      memcpy(rsp.propagation_delay, sent_delay, 4);
+  }
+  avb_unsol_send_changed(state, &s_avb_info, &rsp, msg_len,
+                         avb_unsol_kind_aem);
+
+  aecp_get_as_path_s path_cmd;
+  aecp_get_as_path_rsp_s path_rsp;
+  memset(&path_cmd, 0, sizeof(path_cmd));
+  memcpy(&path_cmd, &cmd, sizeof(aecp_common_s));
+  path_cmd.aem.command_type = aecp_cmd_code_get_as_path;
+  msg_len = avb_fill_rsp_get_as_path(state, &path_cmd, &path_rsp);
+  avb_unsol_send_changed(state, &s_as_path, &path_rsp, msg_len,
+                         avb_unsol_kind_aem);
+}
+
+/* Milan Table 5.21: the binding as GET_STREAM_INPUT_INFO_EX reports it */
+static void avb_unsol_stream_input_info_ex_tick(avb_state_s *state) {
+  aecp_mvu_get_stream_input_info_ex_s cmd;
+  aecp_mvu_get_stream_input_info_ex_rsp_s rsp;
+  uint8_t protocol_id[] = MVU_PROTOCOL_ID;
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.mvu.common.header.subtype = avtp_subtype_aecp;
+    cmd.mvu.common.header.msg_type = aecp_msg_type_vendor_unique_command;
+    memcpy(cmd.mvu.common.target_entity_id,
+           state->own_entity.summary.entity_id, UNIQUE_ID_LEN);
+    memcpy(cmd.mvu.protocol_id, protocol_id, sizeof(cmd.mvu.protocol_id));
+    cmd.mvu.command_type = mvu_cmd_get_stream_input_info_ex;
+    uint16_t descriptor_type = aem_desc_type_stream_input;
+    int_to_octets(&descriptor_type, cmd.descriptor_type, 2);
+    int_to_octets(&i, cmd.descriptor_index, 2);
+    avb_fill_rsp_mvu_stream_input_info_ex(state, &cmd, &rsp);
+    avb_unsol_send_changed(state, &s_stream_input_info_ex[i], &rsp,
+                           sizeof(rsp), avb_unsol_kind_mvu);
+  }
+}
+
+static void avb_unsol_counters_tick(avb_state_s *state) {
+  aecp_get_counters_s cmd;
+  aecp_get_counters_rsp_s rsp;
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    avb_unsol_get_command(state, &cmd, aecp_cmd_code_get_counters,
+                          aem_desc_type_stream_input, i);
+    uint16_t msg_len = avb_fill_rsp_get_counters(state, &cmd, &rsp);
+    avb_unsol_send_changed(state, &s_counters_in[i], &rsp, msg_len,
+                           avb_unsol_kind_aem);
+  }
+  for (uint16_t i = 0; i < state->num_output_streams; i++) {
+    avb_unsol_get_command(state, &cmd, aecp_cmd_code_get_counters,
+                          aem_desc_type_stream_output, i);
+    uint16_t msg_len = avb_fill_rsp_get_counters(state, &cmd, &rsp);
+    avb_unsol_send_changed(state, &s_counters_out[i], &rsp, msg_len,
+                           avb_unsol_kind_aem);
+  }
+}
+
 void avb_unsol_tick(avb_state_s *state) {
   int64_t now_us = esp_timer_get_time();
   avb_unsol_registrations_tick(state, now_us);
   avb_unsol_lock_tick(state, now_us);
+  if (now_us >= s_async_due_us) {
+    s_async_due_us = now_us + UNSOL_ASYNC_PERIOD_US;
+    avb_unsol_stream_info_tick(state);
+    avb_unsol_avb_info_tick(state);
+    if (state->config.milan_compliant)
+      avb_unsol_stream_input_info_ex_tick(state);
+  }
+  if (now_us >= s_counters_due_us) {
+    bool wifi = state->port[0].medium == avb_port_medium_wifi_ftm;
+    s_counters_due_us =
+        now_us + (wifi ? UNSOL_COUNTERS_WIFI_US : UNSOL_COUNTERS_WIRED_US);
+    avb_unsol_counters_tick(state);
+  }
 }

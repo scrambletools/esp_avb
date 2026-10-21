@@ -101,11 +101,11 @@ int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
   return ret;
 }
 
-int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
+/* Build the GET_STREAM_INFO response for a command; 0 when the
+ * descriptor does not exist. */
+uint16_t avb_fill_rsp_get_stream_info(avb_state_s *state,
                                       aecp_get_stream_info_s *msg,
-                                      eth_addr_t *dest_addr) {
-  int ret = OK;
-  struct timespec ts;
+                                      aecp_get_stream_info_rsp_s *response) {
   uint16_t index = octets_to_uint(msg->descriptor_index, 2);
   uint16_t descriptor_type = octets_to_uint(msg->descriptor_type, 2);
 
@@ -116,12 +116,12 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
   if ((is_output && index >= state->num_output_streams) ||
       (!is_output && index >= state->num_input_streams)) {
     avberr("stream descriptor index out of range: %d", index);
-    ret = ERROR;
+    return 0;
   }
 
-  aecp_get_stream_info_rsp_s response = {0};
-  memcpy(&response, msg, sizeof(aecp_get_stream_info_s));
-  response.common.header.msg_type = aecp_msg_type_aem_response;
+  memset(response, 0, sizeof(*response));
+  memcpy(response, msg, sizeof(aecp_get_stream_info_s));
+  response->common.header.msg_type = aecp_msg_type_aem_response;
 
   // populate the response message from the appropriate stream
   static const uint8_t zero_id[UNIQUE_ID_LEN] = {0};
@@ -140,16 +140,16 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
         memcmp(s->msrp_accumulated_latency, zero_lat, 4) != 0;
     flags.msrp_failure_valid = s->msrp_failure_code[0] != 0;
     flags.connected = count_acmp_connected_talker_listeners(s) > 0;
-    memcpy(&response.stream.flags, &flags, sizeof(aem_stream_info_flags_s));
-    memcpy(&response.stream.stream_format, &s->stream_format,
+    memcpy(&response->stream.flags, &flags, sizeof(aem_stream_info_flags_s));
+    memcpy(&response->stream.stream_format, &s->stream_format,
            sizeof(avtp_stream_format_s));
-    memcpy(&response.stream.stream_id, &s->stream_id, UNIQUE_ID_LEN);
-    memcpy(&response.stream.msrp_accumulated_latency,
+    memcpy(&response->stream.stream_id, &s->stream_id, UNIQUE_ID_LEN);
+    memcpy(&response->stream.msrp_accumulated_latency,
            &s->msrp_accumulated_latency, 4);
-    memcpy(&response.stream.dest_addr, &s->stream_dest_addr,
+    memcpy(&response->stream.dest_addr, &s->stream_dest_addr,
            sizeof(eth_addr_t));
-    memcpy(&response.stream.msrp_failure_code, &s->msrp_failure_code, 2);
-    memcpy(&response.vlan_id, &s->vlan_id, 2);
+    memcpy(&response->stream.msrp_failure_code, &s->msrp_failure_code, 2);
+    memcpy(&response->vlan_id, &s->vlan_id, 2);
   } else {
     // input stream info
     avb_listener_stream_s *s = &state->input_streams[index];
@@ -168,27 +168,37 @@ int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
         memcmp(s->msrp_accumulated_latency, zero_lat, 4) != 0;
     flags.msrp_failure_valid = s->msrp_failure_code[0] != 0;
     flags.connected = s->connected;
-    memcpy(&response.stream.flags, &flags, sizeof(aem_stream_info_flags_s));
-    memcpy(&response.stream.stream_format, &s->stream_format,
+    memcpy(&response->stream.flags, &flags, sizeof(aem_stream_info_flags_s));
+    memcpy(&response->stream.stream_format, &s->stream_format,
            sizeof(avtp_stream_format_s));
-    memcpy(&response.stream.stream_id, &s->stream_id, UNIQUE_ID_LEN);
-    memcpy(&response.stream.msrp_accumulated_latency,
+    memcpy(&response->stream.stream_id, &s->stream_id, UNIQUE_ID_LEN);
+    memcpy(&response->stream.msrp_accumulated_latency,
            &s->msrp_accumulated_latency, 4);
-    memcpy(&response.stream.dest_addr, &s->stream_dest_addr,
+    memcpy(&response->stream.dest_addr, &s->stream_dest_addr,
            sizeof(eth_addr_t));
-    memcpy(&response.stream.msrp_failure_code, &s->msrp_failure_code, 2);
-    memcpy(&response.vlan_id, &s->vlan_id, 2);
+    memcpy(&response->stream.msrp_failure_code, &s->msrp_failure_code, 2);
+    memcpy(&response->vlan_id, &s->vlan_id, 2);
   }
 
   uint16_t control_data_len =
       sizeof(aecp_get_stream_info_rsp_s) - AVTP_CDL_PREAMBLE_LEN;
 
-  response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
-  response.common.header.control_data_len = control_data_len & 0xFF;
+  response->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
+  response->common.header.control_data_len = control_data_len & 0xFF;
 
-  uint16_t msg_len = sizeof(aecp_get_stream_info_rsp_s);
-  ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
-                        dest_addr);
+  return sizeof(aecp_get_stream_info_rsp_s);
+}
+
+int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
+                                      aecp_get_stream_info_s *msg,
+                                      eth_addr_t *dest_addr) {
+  struct timespec ts;
+  aecp_get_stream_info_rsp_s response;
+  uint16_t msg_len = avb_fill_rsp_get_stream_info(state, msg, &response);
+  if (msg_len == 0)
+    return ERROR;
+  int ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
+                            dest_addr);
   if (ret < 0) {
     avberr("send AECP get stream info response failed: %d", errno);
   }
@@ -1708,10 +1718,7 @@ int avb_process_aecp_cmd_cvu_srp(avb_state_s *state, aecp_message_u *msg,
 /* Send an MVU response. The caller passes a pointer to a struct whose first
  * member is aecp_mvu_common_s (which starts with aecp_common_s.header).
  * Sets msg_type, status, control_data_length, then sends. */
-static int avb_send_mvu_response(avb_state_s *state, void *msg,
-                                 eth_addr_t *src_addr, uint16_t msg_len,
-                                 uint8_t status) {
-  struct timespec ts;
+static void avb_mvu_rsp_header(void *msg, uint16_t msg_len, uint8_t status) {
   aecp_mvu_common_s *mvu = (aecp_mvu_common_s *)msg;
   mvu->common.header.msg_type = aecp_msg_type_vendor_unique_response;
   mvu->common.header.status_valtime = status;
@@ -1719,6 +1726,13 @@ static int avb_send_mvu_response(avb_state_s *state, void *msg,
   mvu->common.header.control_data_len_h = (cdl >> 8) & 0x07;
   mvu->common.header.control_data_len = cdl & 0xFF;
   mvu->u = 0; /* direct response, not notification */
+}
+
+static int avb_send_mvu_response(avb_state_s *state, void *msg,
+                                 eth_addr_t *src_addr, uint16_t msg_len,
+                                 uint8_t status) {
+  struct timespec ts;
+  avb_mvu_rsp_header(msg, msg_len, status);
   int ret = avb_net_send_to(state, ethertype_avtp, msg, msg_len, &ts, src_addr);
   if (ret < 0)
     avberr("send MVU response failed: %d", errno);
@@ -1936,6 +1950,32 @@ int avb_process_aecp_cmd_mvu_media_clock_ref_info(avb_state_s *state,
   return ret;
 }
 
+/* Build the GET_STREAM_INPUT_INFO_EX response, header included */
+aecp_status_t avb_fill_rsp_mvu_stream_input_info_ex(
+    avb_state_s *state, aecp_mvu_get_stream_input_info_ex_s *cmd,
+    aecp_mvu_get_stream_input_info_ex_rsp_s *rsp) {
+  uint16_t desc_index = octets_to_uint(cmd->descriptor_index, 2);
+  memset(rsp, 0, sizeof(*rsp));
+  memcpy(&rsp->mvu, &cmd->mvu, sizeof(aecp_mvu_common_s));
+  memcpy(rsp->descriptor_type, cmd->descriptor_type, 2);
+  memcpy(rsp->descriptor_index, cmd->descriptor_index, 2);
+  aecp_status_t status = aecp_status_success;
+  if (desc_index >= state->num_input_streams) {
+    status = aecp_status_no_such_descriptor;
+  } else {
+    avb_listener_stream_s *stream = &state->input_streams[desc_index];
+    memcpy(rsp->talker_entity_id, stream->talker_id, UNIQUE_ID_LEN);
+    memcpy(rsp->talker_unique_id, stream->talker_uid, 2);
+    /* probing_status (Milan Table 5.22): 0=Disabled, 3=Completed.
+     * acmp_status mirrors IEEE 1722.1 ACMP status (0=SUCCESS). */
+    uint8_t probing = stream->connected ? 3 : 0;
+    uint8_t acmp = 0;
+    rsp->probing_acmp_status = ((probing << 5) & 0xe0) | (acmp & 0x1f);
+  }
+  avb_mvu_rsp_header(rsp, sizeof(*rsp), status);
+  return status;
+}
+
 /* GET_STREAM_INPUT_INFO_EX (MVU 0x0007)
  * Command layout after aecp_mvu_s: reserved(2) descriptor_type(2)
  *   descriptor_index(2)
@@ -1946,30 +1986,9 @@ int avb_process_aecp_cmd_mvu_get_stream_input_info_ex(avb_state_s *state,
                                                       eth_addr_t *src_addr) {
   aecp_mvu_get_stream_input_info_ex_s *cmd =
       (aecp_mvu_get_stream_input_info_ex_s *)msg;
-  uint16_t desc_index = octets_to_uint(cmd->descriptor_index, 2);
-
   aecp_mvu_get_stream_input_info_ex_rsp_s rsp;
-  memset(&rsp, 0, sizeof(rsp));
-  memcpy(&rsp.mvu, &cmd->mvu, sizeof(aecp_mvu_common_s));
-  memcpy(rsp.descriptor_type, cmd->descriptor_type, 2);
-  memcpy(rsp.descriptor_index, cmd->descriptor_index, 2);
-
-  if (desc_index >= state->num_input_streams) {
-    return avb_send_mvu_response(state, &rsp, src_addr, sizeof(rsp),
-                                 aecp_status_no_such_descriptor);
-  }
-
-  avb_listener_stream_s *stream = &state->input_streams[desc_index];
-  memcpy(rsp.talker_entity_id, stream->talker_id, UNIQUE_ID_LEN);
-  memcpy(rsp.talker_unique_id, stream->talker_uid, 2);
-  /* probing_status (Milan Table 5.22): 0=Disabled, 3=Completed.
-   * acmp_status mirrors IEEE 1722.1 ACMP status (0=SUCCESS). */
-  uint8_t probing = stream->connected ? 3 : 0;
-  uint8_t acmp = 0;
-  rsp.probing_acmp_status = ((probing << 5) & 0xe0) | (acmp & 0x1f);
-
-  return avb_send_mvu_response(state, &rsp, src_addr, sizeof(rsp),
-                               aecp_status_success);
+  aecp_status_t status = avb_fill_rsp_mvu_stream_input_info_ex(state, cmd, &rsp);
+  return avb_send_mvu_response(state, &rsp, src_addr, sizeof(rsp), status);
 }
 
 
@@ -3047,14 +3066,11 @@ int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
                                            src_addr);
 }
 
-int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
-                                   eth_addr_t *dest_addr) {
-  int ret;
-  struct timespec ts;
-
-  aecp_get_avb_info_rsp_s response = {0};
-  memcpy(&response, msg, sizeof(aecp_get_avb_info_s));
-  response.common.header.msg_type = aecp_msg_type_aem_response;
+uint16_t avb_fill_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
+                                   aecp_get_avb_info_rsp_s *response) {
+  memset(response, 0, sizeof(*response));
+  memcpy(response, msg, sizeof(aecp_get_avb_info_s));
+  response->common.header.msg_type = aecp_msg_type_aem_response;
 
   // Populate gPTP BTC ID from PTP status. Two cases:
   //   1. Syncing to a remote BTC → report that BTC's id.
@@ -3063,36 +3079,43 @@ int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
   //      zero and looks like "no BTC" to controllers like Hive.
   //      Applies in both gPTP and standard PTP profiles.
   if (state->ptp_status.clock_source_selected) {
-    memcpy(&response.gptp_btc_id, state->ptp_status.clock_source_info.btc_id,
+    memcpy(&response->gptp_btc_id, state->ptp_status.clock_source_info.btc_id,
            UNIQUE_ID_LEN);
   } else {
-    memcpy(&response.gptp_btc_id, state->ptp_status.own_identity_info.id,
+    memcpy(&response->gptp_btc_id, state->ptp_status.own_identity_info.id,
            UNIQUE_ID_LEN);
   }
 
   // populate propagation delay from PTP peer delay measurement
   uint32_t prop_delay = (uint32_t)state->ptp_status.peer_delay_ns;
-  int_to_octets(&prop_delay, response.propagation_delay, 4);
+  int_to_octets(&prop_delay, response->propagation_delay, 4);
 
-  response.gptp_domain_number = state->avb_interface.domain_number;
-  response.flags.as_capable = state->ptp_status.as_capable;
-  response.flags.gptp_enabled = state->avb_interface.flags.gptp_supported;
-  response.flags.srp_enabled = state->avb_interface.flags.srp_supported;
+  response->gptp_domain_number = state->avb_interface.domain_number;
+  response->flags.as_capable = state->ptp_status.as_capable;
+  response->flags.gptp_enabled = state->avb_interface.flags.gptp_supported;
+  response->flags.srp_enabled = state->avb_interface.flags.srp_supported;
 
   // populate MSRP mappings from state
-  int_to_octets(&state->msrp_mappings_count, response.msrp_mappings_count, 2);
-  memcpy(response.msrp_mappings, state->msrp_mappings,
+  int_to_octets(&state->msrp_mappings_count, response->msrp_mappings_count, 2);
+  memcpy(response->msrp_mappings, state->msrp_mappings,
          state->msrp_mappings_count * sizeof(aem_msrp_mapping_s));
 
   uint16_t control_data_len =
       sizeof(aecp_get_avb_info_rsp_s) - AVTP_CDL_PREAMBLE_LEN;
 
-  response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
-  response.common.header.control_data_len = control_data_len & 0xFF;
+  response->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
+  response->common.header.control_data_len = control_data_len & 0xFF;
 
-  uint16_t msg_len = sizeof(aecp_get_avb_info_rsp_s);
-  ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
-                        dest_addr);
+  return sizeof(aecp_get_avb_info_rsp_s);
+}
+
+int avb_send_aecp_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
+                                   eth_addr_t *dest_addr) {
+  struct timespec ts;
+  aecp_get_avb_info_rsp_s response;
+  uint16_t msg_len = avb_fill_rsp_get_avb_info(state, msg, &response);
+  int ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
+                            dest_addr);
   if (ret < 0) {
     avberr("send AECP Get AVB Info response failed: %d", errno);
   }
@@ -3122,28 +3145,33 @@ int avb_process_aecp_cmd_get_avb_info(avb_state_s *state, aecp_message_u *msg,
   return avb_send_aecp_rsp_get_avb_info(state, &msg->get_avb_info, src_addr);
 }
 
-int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
-                                  eth_addr_t *dest_addr) {
-  int ret;
-  struct timespec ts;
-
-  aecp_get_as_path_rsp_s response = {0};
-  memcpy(&response, msg, sizeof(aecp_get_as_path_s));
-  response.common.header.msg_type = aecp_msg_type_aem_response;
+uint16_t avb_fill_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
+                                  aecp_get_as_path_rsp_s *response) {
+  memset(response, 0, sizeof(*response));
+  memcpy(response, msg, sizeof(aecp_get_as_path_s));
+  response->common.header.msg_type = aecp_msg_type_aem_response;
 
   uint16_t count = ptpd_status_path(&state->ptp_status,
-                                    response.path_sequence, AECP_MAX_AS_PATH_COUNT);
-  int_to_octets(&count, response.count, 2);
+                                    response->path_sequence, AECP_MAX_AS_PATH_COUNT);
+  int_to_octets(&count, response->count, 2);
 
   uint16_t msg_len = offsetof(aecp_get_as_path_rsp_s, path_sequence) +
                      count * UNIQUE_ID_LEN;
   uint16_t control_data_len = msg_len - AVTP_CDL_PREAMBLE_LEN;
 
-  response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
-  response.common.header.control_data_len = control_data_len & 0xFF;
+  response->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
+  response->common.header.control_data_len = control_data_len & 0xFF;
 
-  ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
-                        dest_addr);
+  return msg_len;
+}
+
+int avb_send_aecp_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
+                                  eth_addr_t *dest_addr) {
+  struct timespec ts;
+  aecp_get_as_path_rsp_s response;
+  uint16_t msg_len = avb_fill_rsp_get_as_path(state, msg, &response);
+  int ret = avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts,
+                            dest_addr);
   if (ret < 0) {
     avberr("send AECP Get AS Path response failed: %d", errno);
   }
@@ -3164,54 +3192,44 @@ int avb_process_aecp_cmd_get_as_path(avb_state_s *state, aecp_message_u *msg,
   return avb_send_aecp_rsp_get_as_path(state, &msg->get_as_path, src_addr);
 }
 
-// counters can be for entity, stream input, stream output, avb interface or
-// clock domain
-int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
-                                      eth_addr_t *src_addr) {
-  int ret;
-  struct timespec ts;
-  uint16_t control_data_len =
-      sizeof(aecp_get_counters_rsp_s) - sizeof(atdecc_header_s);
-
-  aecp_get_counters_rsp_s response;
-  memset(&response, 0, sizeof(aecp_get_counters_rsp_s));
+/* Build the GET_COUNTERS response for a command; 0 for a descriptor type
+ * without counters. Counters exist for entity, stream input, stream
+ * output, avb interface and clock domain. */
+uint16_t avb_fill_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
+                                   aecp_get_counters_rsp_s *response) {
+  (void)state;
+  memset(response, 0, sizeof(*response));
   /* Copy the command only; copying the full response size pulled stale
    * RX buffer bytes into the counters block. */
-  memcpy(&response, msg, sizeof(aecp_get_counters_s));
-  response.common.header.msg_type = aecp_msg_type_aem_response;
-  uint16_t descriptor_type = octets_to_uint(msg->get_counters.descriptor_type, 2);
-  uint16_t descriptor_index = octets_to_uint(msg->get_counters.descriptor_index, 2);
+  memcpy(response, msg, sizeof(aecp_get_counters_s));
+  response->common.header.msg_type = aecp_msg_type_aem_response;
+  uint16_t descriptor_type = octets_to_uint(msg->descriptor_type, 2);
+  uint16_t descriptor_index = octets_to_uint(msg->descriptor_index, 2);
 
   // check if the descriptor type is supported
   switch (descriptor_type) {
   case aem_desc_type_entity:
-    // create entity counters valid flags
-    aem_entity_counters_val_s entity_counters_val;
-    memset(&entity_counters_val, 0, sizeof(aem_entity_counters_val_s));
-    // create entity counters block
-    aem_entity_counters_s entity_counters;
-    memset(&entity_counters, 0, sizeof(aem_entity_counters_s));
     /* no entity specific counters */
     break;
   case aem_desc_type_stream_input:
-    avb_get_stream_in_counters(&response.counters_valid.stream_in_counters_val,
-                               &response.counters_block.stream_in_counters);
+    avb_get_stream_in_counters(&response->counters_valid.stream_in_counters_val,
+                               &response->counters_block.stream_in_counters);
     /* Only stream input 0 carries AVTPDU counters; CRF and other inputs
      * report their valid flags with zero counts. */
     if (descriptor_index != 0)
-      memset(&response.counters_block, 0, sizeof(response.counters_block));
+      memset(&response->counters_block, 0, sizeof(response->counters_block));
     break;
   case aem_desc_type_stream_output:
     avb_get_stream_out_counters(
-        &response.counters_valid.stream_out_counters_val,
-        &response.counters_block.stream_out_counters);
+        &response->counters_valid.stream_out_counters_val,
+        &response->counters_block.stream_out_counters);
     if (descriptor_index != 0)
-      memset(&response.counters_block, 0, sizeof(response.counters_block));
+      memset(&response->counters_block, 0, sizeof(response->counters_block));
     break;
   case aem_desc_type_avb_interface: {
     /* Set valid flags for Milan mandatory counters (Table 5.10) */
     aem_avb_interface_counters_val_s *iface_valid =
-        &response.counters_valid.avb_interface_counters_val;
+        &response->counters_valid.avb_interface_counters_val;
     iface_valid->link_up = true;
     iface_valid->link_down = true;
     iface_valid->gptp_btc_changed = true;
@@ -3220,12 +3238,29 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
   case aem_desc_type_clock_domain: {
     /* Set valid flags for Milan mandatory counters (Table 5.12) */
     aem_clock_domain_counters_val_s *clock_valid =
-        &response.counters_valid.clock_domain_counters_val;
+        &response->counters_valid.clock_domain_counters_val;
     clock_valid->locked = true;
     clock_valid->unlocked = true;
     break;
   }
   default:
+    return 0;
+  }
+
+  uint16_t control_data_len =
+      sizeof(aecp_get_counters_rsp_s) - AVTP_CDL_PREAMBLE_LEN;
+  response->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
+  response->common.header.control_data_len = control_data_len & 0xFF;
+  return sizeof(aecp_get_counters_rsp_s);
+}
+
+int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
+                                      eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_get_counters_rsp_s response;
+  uint16_t msg_len =
+      avb_fill_rsp_get_counters(state, &msg->get_counters, &response);
+  if (msg_len == 0) {
     char desc_type_str[7];
     octets_to_hex_string(msg->get_counters.descriptor_type, 2, desc_type_str,
                          '-');
@@ -3233,12 +3268,7 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
            desc_type_str);
     return ERROR;
   }
-
-  response.common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
-  response.common.header.control_data_len = control_data_len & 0xFF;
-
-  uint16_t msg_len = sizeof(atdecc_header_s) + control_data_len;
-  ret =
+  int ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
   if (ret < 0) {
     avberr("send AECP Get Counters response failed: %d", errno);

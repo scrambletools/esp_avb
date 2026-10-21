@@ -1941,6 +1941,22 @@ typedef enum {
   avb_unsol_kind_vendor, // AVB Lite / Wireless, the caller sets the u bit
 } avb_unsol_kind_t;
 
+/* GET response builders shared by the command handlers and the
+ * asynchronous notifications; each returns the frame length, 0 when the
+ * descriptor has no such response. */
+uint16_t avb_fill_rsp_get_stream_info(avb_state_s *state,
+                                      aecp_get_stream_info_s *msg,
+                                      aecp_get_stream_info_rsp_s *response);
+uint16_t avb_fill_rsp_get_avb_info(avb_state_s *state, aecp_get_avb_info_s *msg,
+                                   aecp_get_avb_info_rsp_s *response);
+uint16_t avb_fill_rsp_get_as_path(avb_state_s *state, aecp_get_as_path_s *msg,
+                                  aecp_get_as_path_rsp_s *response);
+uint16_t avb_fill_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
+                                   aecp_get_counters_rsp_s *response);
+aecp_status_t avb_fill_rsp_mvu_stream_input_info_ex(
+    avb_state_s *state, aecp_mvu_get_stream_input_info_ex_s *cmd,
+    aecp_mvu_get_stream_input_info_ex_rsp_s *rsp);
+
 aecp_status_t avb_unsol_register(avb_state_s *state, unique_id_t *controller_id,
                                  eth_addr_t *controller_addr,
                                  bool time_limited);
