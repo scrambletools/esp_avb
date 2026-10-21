@@ -2526,17 +2526,22 @@ int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
   aecp_acquire_entity_s response = {0};
   memcpy(&response, msg, sizeof(aecp_acquire_entity_s));
   response.common.header.msg_type = aecp_msg_type_aem_response;
-  if (!msg->acquire_entity.release) {
+  /* Milan v1.3 §5.4.2.1: never SUCCESS, LOCK_ENTITY covers a controller's
+   * atomic sequences. */
+  bool refused = state->config.milan_compliant;
+  if (refused) {
+    response.common.header.status_valtime = aecp_status_not_supported;
+  } else if (!msg->acquire_entity.release) {
     memcpy(response.owner_id, msg->common.controller_entity_id, UNIQUE_ID_LEN);
   }
 
-  uint16_t msg_len = sizeof(atdecc_header_s) + sizeof(aecp_acquire_entity_s);
+  uint16_t msg_len = sizeof(aecp_acquire_entity_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
 
   if (ret < 0) {
     avberr("send AECP Acquire Entity response failed: %d", errno);
-  } else {
+  } else if (!refused) {
     if (msg->acquire_entity.release) {
       state->acquired = false;
     } else {
@@ -2563,7 +2568,7 @@ int avb_process_aecp_cmd_lock_entity(avb_state_s *state, aecp_message_u *msg,
     memcpy(response.locked_id, msg->common.controller_entity_id, UNIQUE_ID_LEN);
   }
 
-  uint16_t msg_len = sizeof(atdecc_header_s) + sizeof(aecp_lock_entity_s);
+  uint16_t msg_len = sizeof(aecp_lock_entity_s);
   ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
   if (ret < 0) {
@@ -4425,13 +4430,12 @@ bool avb_valid_talker_listener_uid(avb_state_s *state, uint16_t uid,
 /* Check if the entity is acquired or locked by another entity */
 bool avb_acquired_or_locked_by_other(avb_state_s *state,
                                      unique_id_t *entity_id) {
-  if (!state->locked && !state->acquired) {
-    return false;
-  }
-  if (memcmp(state->acquired_by, entity_id, UNIQUE_ID_LEN) != 0) {
+  if (state->acquired &&
+      memcmp(state->acquired_by, entity_id, UNIQUE_ID_LEN) != 0) {
     return true;
   }
-  if (memcmp(state->locked_by, entity_id, UNIQUE_ID_LEN) != 0) {
+  if (state->locked &&
+      memcmp(state->locked_by, entity_id, UNIQUE_ID_LEN) != 0) {
     return true;
   }
   return false;
