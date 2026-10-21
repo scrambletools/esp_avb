@@ -1198,6 +1198,13 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
           state->input_streams[i].msrp_failure_code[0] = 0;
           state->input_streams[i].msrp_failure_code[1] = 0;
         }
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+        /* The listener declaration follows the talker's registration
+         * now, not at its next periodic redeclaration up to 1 s on. */
+        if (tr != mrp_reg_transition_none && state->input_streams[i].connected)
+          mrp_declare_listener(state, port, &state->input_streams[i].stream_id,
+                               avb_listener_decl_event(state, (uint16_t)i));
+#endif
         break;
       }
     }
@@ -2874,7 +2881,14 @@ void mrp_declare_listener(avb_state_s *state, int port,
   mrp_applicant_state_e applicant_before = e->sm.applicant;
   bool decl_changed = e->decl_event != decl;
   e->decl_event = decl;
-  mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
+  /* A changed declaration type goes out as New. A bridge is to treat the
+   * change as a withdrawal and a new declaration (802.1Q §35.2.6), but
+   * the MOTU passes a Join carrying a new type on only at its next
+   * LeaveAll, up to 10 s later, while it passes a New at once. */
+  mrp_event_e event = mrp_declare_event(&e->sm);
+  if (!state->avb_lite && decl_changed && event == mrp_event_join)
+    event = mrp_event_new;
+  mrp_applicant_step(&e->sm, event);
   /* AVB Lite: a changed declaration type goes out at once and again
    * JoinTime later, Join from a quiet or anxious Applicant would not
    * send it until the next 10 to 15 s redeclaration. */
