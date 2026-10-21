@@ -481,7 +481,6 @@ typedef struct {
   unique_id_t entity_id;       // entity ID
   unique_id_t model_id;        // model ID
   eth_addr_t mac_addr;         // mac address
-  talker_adv_info_s info;      // from talker advertise
   aem_stream_summary_s stream; // from get stream info
   uint8_t talker_uid[2];       // stream output descr index
   uint8_t failure_code;        // msrp failure code

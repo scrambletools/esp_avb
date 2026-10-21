@@ -1042,25 +1042,30 @@ static int find_or_add_msrp_listener(avb_state_s *state,
   if (idx >= 0)
     return idx;
 
-#ifdef CONFIG_ESP_AVB_ATDECC
-  int listener_idx =
-      avb_find_entity_by_addr(state, mac_addr, avb_entity_type_listener);
-#else
-  int listener_idx = NOT_FOUND; /* bridge has no local ATDECC entity table */
-#endif
-  if (listener_idx != NOT_FOUND) {
-    idx = find_connected_listener_by_entity(
-        stream, state->listeners[listener_idx].entity_id);
+  /* One host can advertise several listener entities from one MAC: merge
+   * into the ACMP row of any of them, and name a new row only when the MAC
+   * belongs to a single listener entity. */
+  int entities_at_mac = 0;
+  int sole_listener_idx = NOT_FOUND;
+#ifdef CONFIG_ESP_AVB_ATDECC /* bridge has no local ATDECC entity table */
+  for (size_t i = 0; i < state->num_listeners; i++) {
+    if (memcmp(state->listeners[i].mac_addr, mac_addr, ETH_ADDR_LEN) != 0)
+      continue;
+    idx = find_connected_listener_by_entity(stream,
+                                            state->listeners[i].entity_id);
     if (idx >= 0) {
       memcpy(stream->connected_listeners[idx].mac_addr, mac_addr, ETH_ADDR_LEN);
       return idx;
     }
+    entities_at_mac++;
+    sole_listener_idx = (int)i;
   }
+#endif
 
   idx = add_connected_listener(stream, mac_addr);
-  if (idx >= 0 && listener_idx != NOT_FOUND) {
+  if (idx >= 0 && entities_at_mac == 1) {
     memcpy(stream->connected_listeners[idx].identity.id,
-           state->listeners[listener_idx].entity_id, UNIQUE_ID_LEN);
+           state->listeners[sole_listener_idx].entity_id, UNIQUE_ID_LEN);
     memset(stream->connected_listeners[idx].identity.uid, 0, 2);
   }
   return idx;
@@ -1149,21 +1154,10 @@ static void mrp_on_talker_registrar_change(avb_state_s *state, int port,
   const talker_adv_info_s *info = &wire->talker.info;
 
   /* ----- Endpoint-side bookkeeping — runs every RX -----
-   * Updates the local talker discovery DB and the per-input_stream
-   * MSRP state (accumulated_latency, talker_advertised flag, failure
-   * code) used by avb_input_stream_decl_event to drive our outgoing
-   * listener declarations per Milan §5.5. */
-  eth_addr_t talker_addr;
-  memcpy(&talker_addr, info->stream_id, ETH_ADDR_LEN);
-#ifdef CONFIG_ESP_AVB_ATDECC
-  int idx =
-      avb_find_entity_by_addr(state, &talker_addr, avb_entity_type_talker);
-  if (idx >= 0) {
-    memcpy(&state->talkers[idx].info, info, sizeof(talker_adv_info_s));
-  }
-#else
-  (void)talker_addr; /* bridge has no local ATDECC talker table */
-#endif
+   * Updates the per-input_stream MSRP state (accumulated_latency,
+   * talker_advertised flag, failure code) used by
+   * avb_input_stream_decl_event to drive our outgoing listener
+   * declarations per Milan §5.5. */
   /* Mirror the §35.2.2.8.4 failure_code into our input_stream slot
    * for ATDECC stream_info responses. decl_event derivation in
    * avb_input_stream_decl_event queries the MRP SM directly, so it

@@ -1941,8 +1941,6 @@ int avb_process_acmp_get_tx_connection_command(avb_state_s *state,
 
 int avb_find_entity_by_id(avb_state_s *state, unique_id_t *entity_id,
                           avb_entity_type_t entity_typ);
-int avb_find_entity_by_addr(avb_state_s *state, eth_addr_t *entity_addr,
-                            avb_entity_type_t entity_type);
 const char *get_adp_message_type_name(adp_msg_type_t message_type);
 const char *get_aecp_command_code_name(aecp_cmd_code_t command_code);
 const char *get_acmp_message_type_name(acmp_msg_type_t message_type);

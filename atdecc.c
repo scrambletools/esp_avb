@@ -1254,15 +1254,15 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
       }
     }
 #endif
-    int talker_idx =
-        avb_find_entity_by_addr(state, src_addr, avb_entity_type_talker);
+    int talker_idx = avb_find_entity_by_id(state, &msg->entity.entity_id,
+                                           avb_entity_type_talker);
     if (talker_idx != NOT_FOUND) {
       memmove(&state->talkers[talker_idx], &state->talkers[talker_idx + 1],
               (state->num_talkers - 1 - talker_idx) * sizeof(avb_talker_s));
       state->num_talkers--;
     }
-    int listener_idx =
-        avb_find_entity_by_addr(state, src_addr, avb_entity_type_listener);
+    int listener_idx = avb_find_entity_by_id(state, &msg->entity.entity_id,
+                                             avb_entity_type_listener);
     if (listener_idx != NOT_FOUND) {
       memmove(&state->listeners[listener_idx],
               &state->listeners[listener_idx + 1],
@@ -1273,7 +1273,8 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
     return OK;
   }
 
-  /* Process ADP Entity Available message */
+  /* Process ADP Entity Available message. The discovery tables are keyed
+   * by entity ID: one host can advertise several entities from one MAC. */
   if (msg->header.msg_type == adp_msg_type_entity_available) {
 
     // If the entity is an audio talker, then remember it
@@ -1281,8 +1282,8 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
         msg->entity.talker_capabilities.audio_source) {
 
       // if the talker is not already known, add it to the list
-      int index =
-          avb_find_entity_by_addr(state, src_addr, avb_entity_type_talker);
+      int index = avb_find_entity_by_id(state, &msg->entity.entity_id,
+                                        avb_entity_type_talker);
       if (index == NOT_FOUND) {
         // create talker struct
         avb_talker_s talker;
@@ -1303,14 +1304,10 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
           state->talkers[state->num_talkers - 1] = talker;
         }
       }
-      // if it is already known, then update the entity id and model id if
-      // missing or changed
+      // if it is already known, then update the mac address and model id if
+      // changed
       else {
-        if (memcmp(state->talkers[index].entity_id, msg->entity.entity_id,
-                   UNIQUE_ID_LEN) != 0) {
-          memcpy(&state->talkers[index].entity_id, msg->entity.entity_id,
-                 UNIQUE_ID_LEN);
-        }
+        memcpy(state->talkers[index].mac_addr, src_addr, ETH_ADDR_LEN);
         if (memcmp(state->talkers[index].model_id, msg->entity.model_id,
                    UNIQUE_ID_LEN) != 0) {
           memcpy(&state->talkers[index].model_id, msg->entity.model_id,
@@ -1323,8 +1320,8 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
         msg->entity.listener_capabilities.audio_sink) {
 
       // if the listener is not already known, add it to the list
-      int index =
-          avb_find_entity_by_addr(state, src_addr, avb_entity_type_listener);
+      int index = avb_find_entity_by_id(state, &msg->entity.entity_id,
+                                        avb_entity_type_listener);
       if (index == NOT_FOUND) {
 
         // create listener struct
@@ -1346,14 +1343,10 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
           state->listeners[state->num_listeners - 1] = listener;
         }
       }
-      // if it is already known, then update the entity id and model id if
-      // missing or changed
+      // if it is already known, then update the mac address and model id if
+      // changed
       else {
-        if (memcmp(state->listeners[index].entity_id, msg->entity.entity_id,
-                   UNIQUE_ID_LEN) != 0) {
-          memcpy(&state->listeners[index].entity_id, msg->entity.entity_id,
-                 UNIQUE_ID_LEN);
-        }
+        memcpy(state->listeners[index].mac_addr, src_addr, ETH_ADDR_LEN);
         if (memcmp(state->listeners[index].model_id, msg->entity.model_id,
                    UNIQUE_ID_LEN) != 0) {
           memcpy(&state->listeners[index].model_id, msg->entity.model_id,
@@ -1365,8 +1358,8 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
     if (msg->entity.controller_capabilities.implemented) {
 
       // if the controller is not already known, add it to the list
-      int index =
-          avb_find_entity_by_addr(state, src_addr, avb_entity_type_controller);
+      int index = avb_find_entity_by_id(state, &msg->entity.entity_id,
+                                        avb_entity_type_controller);
       if (index == NOT_FOUND) {
 
         // create controller struct
@@ -1388,14 +1381,10 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
           state->controllers[state->num_controllers - 1] = controller;
         }
       }
-      // if it is already known, then update the entity id and model id if
-      // missing or changed
+      // if it is already known, then update the mac address and model id if
+      // changed
       else {
-        if (memcmp(state->controllers[index].entity_id, msg->entity.entity_id,
-                   UNIQUE_ID_LEN) != 0) {
-          memcpy(&state->controllers[index].entity_id, msg->entity.entity_id,
-                 UNIQUE_ID_LEN);
-        }
+        memcpy(state->controllers[index].mac_addr, src_addr, ETH_ADDR_LEN);
         if (memcmp(state->controllers[index].model_id, msg->entity.model_id,
                    UNIQUE_ID_LEN) != 0) {
           memcpy(&state->controllers[index].model_id, msg->entity.model_id,
@@ -1966,12 +1955,14 @@ int avb_process_aecp_cmd_mvu_get_stream_input_info_ex(avb_state_s *state,
 /* AVB Lite status query, profiles/avb_lite.md §2.4. */
 
 static int avb_lite_controller_index(avb_state_s *state,
-                                     const uint8_t *controller_id,
+                                     unique_id_t *controller_id,
                                      eth_addr_t *src_addr) {
   int index =
-      avb_find_entity_by_addr(state, src_addr, avb_entity_type_controller);
-  if (index != NOT_FOUND)
+      avb_find_entity_by_id(state, controller_id, avb_entity_type_controller);
+  if (index != NOT_FOUND) {
+    memcpy(state->controllers[index].mac_addr, src_addr, ETH_ADDR_LEN);
     return index;
+  }
   avb_controller_s controller;
   memset(&controller, 0, sizeof(controller));
   memcpy(controller.entity_id, controller_id, UNIQUE_ID_LEN);
@@ -2480,7 +2471,7 @@ int avb_process_aecp_cmd_register_unsol_notif(avb_state_s *state,
   } else {
     state->unsol_notif_enabled = true;
     int index = avb_lite_controller_index(
-        state, msg->common.controller_entity_id, src_addr);
+        state, &msg->common.controller_entity_id, src_addr);
     state->controllers[index].unsol_registered = true;
   }
   return ret;
@@ -2511,8 +2502,8 @@ int avb_process_aecp_cmd_deregister_unsol_notif(avb_state_s *state,
            errno);
   } else {
     state->unsol_notif_enabled = false;
-    int index = avb_find_entity_by_addr(state, src_addr,
-                                        avb_entity_type_controller);
+    int index = avb_find_entity_by_id(state, &msg->common.controller_entity_id,
+                                      avb_entity_type_controller);
     if (index != NOT_FOUND)
       state->controllers[index].unsol_registered = false;
   }
@@ -4332,39 +4323,6 @@ int avb_find_entity_by_id(avb_state_s *state, unique_id_t *entity_id,
   case avb_entity_type_controller:
     for (int i = 0; i < state->num_controllers; i++) {
       if (memcmp(state->controllers[i].entity_id, entity_id, UNIQUE_ID_LEN) ==
-          0) {
-        return i;
-      }
-    }
-    break;
-  default:
-    return NOT_FOUND;
-  }
-  return NOT_FOUND;
-}
-
-/* Find an entity in the known list of talkers, listeners, or controllers */
-int avb_find_entity_by_addr(avb_state_s *state, eth_addr_t *entity_addr,
-                            avb_entity_type_t entity_type) {
-  switch (entity_type) {
-  case avb_entity_type_talker:
-    for (int i = 0; i < state->num_talkers; i++) {
-      if (memcmp(state->talkers[i].mac_addr, entity_addr, ETH_ADDR_LEN) == 0) {
-        return i;
-      }
-    }
-    break;
-  case avb_entity_type_listener:
-    for (int i = 0; i < state->num_listeners; i++) {
-      if (memcmp(state->listeners[i].mac_addr, entity_addr, ETH_ADDR_LEN) ==
-          0) {
-        return i;
-      }
-    }
-    break;
-  case avb_entity_type_controller:
-    for (int i = 0; i < state->num_controllers; i++) {
-      if (memcmp(state->controllers[i].mac_addr, entity_addr, ETH_ADDR_LEN) ==
           0) {
         return i;
       }
