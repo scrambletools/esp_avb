@@ -67,7 +67,7 @@ typedef enum {
   aecp_cmd_code_acquire_entity = 0x0000,
   aecp_cmd_code_lock_entity = 0x0001,
   aecp_cmd_code_entity_available = 0x0002,
-  aecp_cmd_code_controller_available = 0x0003, // unsupported
+  aecp_cmd_code_controller_available = 0x0003,
   aecp_cmd_code_read_descriptor = 0x0004,
   aecp_cmd_code_get_configuration = 0x0007,
   aecp_cmd_code_set_stream_format = 0x0008,
@@ -506,10 +506,12 @@ typedef struct {
 } aecp_common_s;                    // 22 bytes
 
 /* AECP AEM common data */
+/* Bit fields fill from the least significant bit: u is the first bit on
+ * the wire (IEEE 1722.1-2021 Figure 9-2), so it is declared last. */
 typedef struct {
+  uint8_t command_type_h : 6; // high order bits of command type
   uint8_t cr : 1;             // request for controller to perform an action
   uint8_t unsolicited : 1;    // unsolicited notification
-  uint8_t command_type_h : 6; // high order bits of command type
   uint8_t command_type;       // command type
 } aecp_common_aem_s;          // 2 bytes
 
@@ -1522,8 +1524,8 @@ typedef struct {
 typedef struct {
   aecp_common_s common;
   uint8_t protocol_id[6];     // MVU protocol ID (00-1B-C5-0A-C1-00)
-  uint8_t u : 1;              // 0=command/response, 1=notification
   uint8_t command_type_h : 7; // command type high bits
+  uint8_t u : 1;              // 0=command/response, 1=notification
   uint8_t command_type;       // command type low byte
 } aecp_mvu_common_s;          // 30 bytes
 
@@ -1756,8 +1758,6 @@ typedef struct {
 
 /* ATDECC send functions */
 int avb_send_adp_entity_available(avb_state_s *state);
-int avb_send_aecp_cmd_controller_available(avb_state_s *state,
-                                           unique_id_t *target_id);
 int avb_send_aecp_cmd_entity_available(avb_state_s *state,
                                        unique_id_t *target_id);
 int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
@@ -1765,14 +1765,9 @@ int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
 int avb_send_aecp_rsp_get_stream_info(avb_state_s *state,
                                       aecp_get_stream_info_s *msg,
                                       eth_addr_t *dest_addr);
-int avb_send_aecp_unsol_get_stream_info(avb_state_s *state, uint16_t index,
-                                        bool is_output);
 int avb_send_aecp_cmd_get_counters(avb_state_s *state, unique_id_t *target_id);
 int avb_send_aecp_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
                                    eth_addr_t *dest_addr);
-int avb_send_aecp_unsol_get_counters(avb_state_s *state,
-                                     aem_desc_type_t descriptor_type,
-                                     uint16_t index);
 int avb_send_aecp_rsp_read_descr_entity(avb_state_s *state,
                                         aecp_read_descriptor_rsp_s *msg,
                                         eth_addr_t *dest_addr);
@@ -1936,6 +1931,28 @@ int avb_process_acmp_get_tx_state_command(avb_state_s *state,
 int avb_process_acmp_get_tx_connection_command(avb_state_s *state,
                                                acmp_message_s *msg, bool tx);
 
+
+/* ===== Unsolicited notifications (atdecc_unsol.c) ===== */
+
+/* Which sequence counter and u bit a notification uses */
+typedef enum {
+  avb_unsol_kind_aem,    // AEM response, u bit in the command_type field
+  avb_unsol_kind_mvu,    // Milan MVU response, u bit after the protocol ID
+  avb_unsol_kind_vendor, // AVB Lite / Wireless, the caller sets the u bit
+} avb_unsol_kind_t;
+
+aecp_status_t avb_unsol_register(avb_state_s *state, unique_id_t *controller_id,
+                                 eth_addr_t *controller_addr,
+                                 bool time_limited);
+void avb_unsol_deregister(avb_state_s *state, unique_id_t *controller_id,
+                          eth_addr_t *controller_addr);
+void avb_unsol_heard(avb_state_s *state, unique_id_t *controller_id,
+                     eth_addr_t *controller_addr);
+void avb_unsol_controller_replied(avb_state_s *state, aecp_message_u *msg);
+void avb_unsol_notify(avb_state_s *state, const void *rsp, uint16_t msg_len,
+                      avb_unsol_kind_t kind, const uint8_t *requester_id,
+                      const eth_addr_t *requester_addr);
+void avb_unsol_tick(avb_state_s *state);
 
 /* ===== ATDECC helpers ===== */
 

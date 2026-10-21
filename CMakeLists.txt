@@ -20,6 +20,8 @@
 # Gated by CONFIG_ESP_AVB_ATDECC (defaults n on bridge, y on endpoint):
 #   - atdecc.c (IEEE 1722.1 ADP/AECP/ACMP). avb.c's AVTP RX
 #     dispatcher #ifdef-routes the ATDECC subtypes through it.
+#   - atdecc_unsol.c (registered controllers and unsolicited
+#     notifications).
 
 set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c)
 set(avb_embed "")
@@ -31,7 +33,7 @@ else()
 endif()
 
 if(CONFIG_ESP_AVB_ATDECC)
-    list(APPEND avb_srcs atdecc.c)
+    list(APPEND avb_srcs atdecc.c atdecc_unsol.c)
     list(APPEND avb_embed logo.png)
 endif()
 

@@ -72,12 +72,6 @@ int avb_send_adp_entity_available(avb_state_s *state) {
   return ret;
 }
 
-int avb_send_aecp_cmd_controller_available(avb_state_s *state,
-                                           unique_id_t *target_id) {
-  // not implemented
-  return OK;
-}
-
 int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
                                       unique_id_t *target_id) {
   aecp_get_stream_info_s msg;
@@ -224,13 +218,6 @@ int avb_send_aecp_rsp_set_stream_format(avb_state_s *state,
   return ret;
 }
 
-// sends to all regitered notification recipients
-int avb_send_aecp_unsol_get_stream_info(avb_state_s *state, uint16_t index,
-                                        bool is_output) {
-  // not implemented
-  return OK;
-}
-
 int avb_send_aecp_cmd_get_counters(avb_state_s *state, unique_id_t *target_id) {
   // not implemented
   return OK;
@@ -239,14 +226,6 @@ int avb_send_aecp_cmd_get_counters(avb_state_s *state, unique_id_t *target_id) {
 // may be sent as an unsolicited notification
 int avb_send_aecp_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
                                    eth_addr_t *dest_addr) {
-  // not implemented
-  return OK;
-}
-
-// sends to all regitered notification recipients
-int avb_send_aecp_unsol_get_counters(avb_state_s *state,
-                                     aem_desc_type_t descriptor_type,
-                                     uint16_t index) {
   // not implemented
   return OK;
 }
@@ -1961,29 +1940,6 @@ int avb_process_aecp_cmd_mvu_get_stream_input_info_ex(avb_state_s *state,
 
 /* AVB Lite status query, profiles/avb_lite.md §2.4. */
 
-static int avb_lite_controller_index(avb_state_s *state,
-                                     unique_id_t *controller_id,
-                                     eth_addr_t *src_addr) {
-  int index =
-      avb_find_entity_by_id(state, controller_id, avb_entity_type_controller);
-  if (index != NOT_FOUND) {
-    memcpy(state->controllers[index].mac_addr, src_addr, ETH_ADDR_LEN);
-    return index;
-  }
-  avb_controller_s controller;
-  memset(&controller, 0, sizeof(controller));
-  memcpy(controller.entity_id, controller_id, UNIQUE_ID_LEN);
-  memcpy(controller.mac_addr, src_addr, ETH_ADDR_LEN);
-  if (state->num_controllers < AVB_MAX_NUM_CONTROLLERS) {
-    state->controllers[state->num_controllers] = controller;
-    return state->num_controllers++;
-  }
-  memmove(&state->controllers[0], &state->controllers[1],
-          (state->num_controllers - 1) * sizeof(avb_controller_s));
-  state->controllers[state->num_controllers - 1] = controller;
-  return state->num_controllers - 1;
-}
-
 static void avb_put_be32(uint8_t *out, uint32_t value) {
   out[0] = (uint8_t)(value >> 24);
   out[1] = (uint8_t)(value >> 16);
@@ -2046,16 +2002,22 @@ static void avb_lite_status_fill(avb_state_s *state, uint8_t *body) {
   avb_put_be32(&body[24], (uint32_t)(int32_t)offset);
 }
 
+/* Header of an AVB Lite / AVB Wireless vendor unique response */
+static void avb_vendor_rsp_header(aecp_common_s *common, uint16_t msg_len,
+                                  uint8_t status) {
+  common->header.subtype = avtp_subtype_aecp;
+  common->header.msg_type = aecp_msg_type_vendor_unique_response;
+  common->header.status_valtime = status;
+  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
+  common->header.control_data_len_h = (cdl >> 8) & 0x07;
+  common->header.control_data_len = cdl & 0xFF;
+}
+
 static int avb_lite_status_send(avb_state_s *state, aecp_lite_status_s *rsp,
                                 uint16_t msg_len, uint8_t status,
                                 eth_addr_t *dest_addr) {
   struct timespec ts;
-  rsp->common.header.subtype = avtp_subtype_aecp;
-  rsp->common.header.msg_type = aecp_msg_type_vendor_unique_response;
-  rsp->common.header.status_valtime = status;
-  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
-  rsp->common.header.control_data_len_h = (cdl >> 8) & 0x07;
-  rsp->common.header.control_data_len = cdl & 0xFF;
+  avb_vendor_rsp_header(&rsp->common, msg_len, status);
   int ret =
       avb_net_send_to(state, ethertype_avtp, rsp, msg_len, &ts, dest_addr);
   if (ret < 0)
@@ -2170,25 +2132,16 @@ void avb_lite_status_tick(avb_state_s *state) {
   state->lite_offset_alarm = alarm;
 
   uint8_t protocol_id[] = LITE_STATUS_PROTOCOL_ID;
-  for (size_t i = 0; i < state->num_controllers; i++) {
-    avb_controller_s *controller = &state->controllers[i];
-    if (!controller->unsol_registered)
-      continue;
-    aecp_lite_status_s rsp;
-    memset(&rsp, 0, sizeof(rsp));
-    memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
-           UNIQUE_ID_LEN);
-    memcpy(rsp.common.controller_entity_id, controller->entity_id,
-           UNIQUE_ID_LEN);
-    uint16_t seq_id = state->unsol_seq_id++;
-    rsp.common.seq_id[0] = (uint8_t)(seq_id >> 8);
-    rsp.common.seq_id[1] = (uint8_t)seq_id;
-    memcpy(rsp.protocol_id, protocol_id, sizeof(rsp.protocol_id));
-    rsp.command_type[0] = 0x80; // u = 1, GET_LITE_STATUS
-    memcpy(rsp.body, body, LITE_STATUS_BODY_LEN);
-    avb_lite_status_send(state, &rsp, sizeof(rsp), aecp_status_success,
-                         &controller->mac_addr);
-  }
+  aecp_lite_status_s rsp;
+  memset(&rsp, 0, sizeof(rsp));
+  memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  memcpy(rsp.protocol_id, protocol_id, sizeof(rsp.protocol_id));
+  rsp.command_type[0] = 0x80; // u = 1, GET_LITE_STATUS
+  memcpy(rsp.body, body, LITE_STATUS_BODY_LEN);
+  avb_vendor_rsp_header(&rsp.common, sizeof(rsp), aecp_status_success);
+  avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_vendor, NULL,
+                   NULL);
 }
 
 /* AVB Wireless (profiles/avb_wireless.md §5). A station answers for its
@@ -2314,14 +2267,8 @@ static void avb_wireless_status_fill(avb_state_s *state, uint8_t *body) {
 
 static int avb_wireless_send(avb_state_s *state, void *rsp, uint16_t msg_len,
                              uint8_t status, eth_addr_t *dest_addr) {
-  aecp_common_s *common = rsp;
   struct timespec ts;
-  common->header.subtype = avtp_subtype_aecp;
-  common->header.msg_type = aecp_msg_type_vendor_unique_response;
-  common->header.status_valtime = status;
-  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
-  common->header.control_data_len_h = (cdl >> 8) & 0x07;
-  common->header.control_data_len = cdl & 0xFF;
+  avb_vendor_rsp_header(rsp, msg_len, status);
   int ret =
       avb_net_send_to(state, ethertype_avtp, rsp, msg_len, &ts, dest_addr);
   if (ret < 0)
@@ -2425,25 +2372,16 @@ void avb_wireless_status_tick(avb_state_s *state) {
   state->wireless_status_sent_valid = true;
 
   uint8_t protocol_id[] = WIRELESS_STATUS_PROTOCOL_ID;
-  for (size_t i = 0; i < state->num_controllers; i++) {
-    avb_controller_s *controller = &state->controllers[i];
-    if (!controller->unsol_registered)
-      continue;
-    aecp_wireless_status_s rsp;
-    memset(&rsp, 0, sizeof(rsp));
-    memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
-           UNIQUE_ID_LEN);
-    memcpy(rsp.common.controller_entity_id, controller->entity_id,
-           UNIQUE_ID_LEN);
-    uint16_t seq_id = state->unsol_seq_id++;
-    rsp.common.seq_id[0] = (uint8_t)(seq_id >> 8);
-    rsp.common.seq_id[1] = (uint8_t)seq_id;
-    memcpy(rsp.protocol_id, protocol_id, sizeof(rsp.protocol_id));
-    rsp.command_type[0] = 0x80; // u = 1, GET_WIRELESS_STATUS
-    memcpy(rsp.body, body, WIRELESS_STATUS_BODY_LEN);
-    avb_wireless_send(state, &rsp, sizeof(rsp), aecp_status_success,
-                      &controller->mac_addr);
-  }
+  aecp_wireless_status_s rsp;
+  memset(&rsp, 0, sizeof(rsp));
+  memcpy(rsp.common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  memcpy(rsp.protocol_id, protocol_id, sizeof(rsp.protocol_id));
+  rsp.command_type[0] = 0x80; // u = 1, GET_WIRELESS_STATUS
+  memcpy(rsp.body, body, WIRELESS_STATUS_BODY_LEN);
+  avb_vendor_rsp_header(&rsp.common, sizeof(rsp), aecp_status_success);
+  avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_vendor, NULL,
+                   NULL);
 }
 
 /* Process AECP command register unsolicited notification.
@@ -2460,10 +2398,19 @@ int avb_process_aecp_cmd_register_unsol_notif(avb_state_s *state,
   int ret = OK;
   struct timespec ts;
 
+  /* A command without the flags field registers as if they were 0
+   * (IEEE 1722.1-2021 §7.4.37.1). */
   aecp_register_unsol_notif_s response;
   memset(&response, 0, sizeof(response));
-  memcpy(&response, msg, sizeof(aecp_register_unsol_notif_s));
+  bool has_flags =
+      avb_aecp_msg_len(msg) >= sizeof(aecp_register_unsol_notif_s);
+  memcpy(&response, msg,
+         has_flags ? sizeof(response)
+                   : offsetof(aecp_register_unsol_notif_s, flags));
   response.common.header.msg_type = aecp_msg_type_aem_response;
+  response.common.header.status_valtime =
+      avb_unsol_register(state, &msg->common.controller_entity_id, src_addr,
+                         response.flags.time_limited);
 
   uint16_t cdl = sizeof(aecp_register_unsol_notif_s) - AVTP_CDL_PREAMBLE_LEN;
   response.common.header.control_data_len_h = (cdl >> 8) & 0x07;
@@ -2475,11 +2422,6 @@ int avb_process_aecp_cmd_register_unsol_notif(avb_state_s *state,
   if (ret < 0) {
     avberr("send AECP register unsolicited notification response failed: %d",
            errno);
-  } else {
-    state->unsol_notif_enabled = true;
-    int index = avb_lite_controller_index(
-        state, &msg->common.controller_entity_id, src_addr);
-    state->controllers[index].unsol_registered = true;
   }
   return ret;
 }
@@ -2507,13 +2449,8 @@ int avb_process_aecp_cmd_deregister_unsol_notif(avb_state_s *state,
   if (ret < 0) {
     avberr("send AECP deregister unsolicited notification response failed: %d",
            errno);
-  } else {
-    state->unsol_notif_enabled = false;
-    int index = avb_find_entity_by_id(state, &msg->common.controller_entity_id,
-                                      avb_entity_type_controller);
-    if (index != NOT_FOUND)
-      state->controllers[index].unsol_registered = false;
   }
+  avb_unsol_deregister(state, &msg->common.controller_entity_id, src_addr);
   return ret;
 }
 
@@ -2550,6 +2487,10 @@ int avb_process_aecp_cmd_acquire_entity(avb_state_s *state, aecp_message_u *msg,
              UNIQUE_ID_LEN);
       state->last_acquired.tv_sec = ts.tv_sec;
       state->last_acquired.tv_usec = (suseconds_t)(ts.tv_nsec / 1000);
+      /* The acquiring controller is implicitly registered (IEEE
+       * 1722.1-2021 §7.5.2). */
+      avb_unsol_register(state, &msg->common.controller_entity_id, src_addr,
+                         false);
     }
   }
   return ret;
@@ -3249,6 +3190,7 @@ int avb_process_aecp_rsp_entity_available(avb_state_s *state,
 
 int avb_process_aecp_rsp_controller_available(avb_state_s *state,
                                               aecp_message_u *msg) {
+  avb_unsol_controller_replied(state, msg);
   return OK;
 }
 
@@ -3302,6 +3244,8 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
              UNIQUE_ID_LEN) != 0) {
     return OK;
   }
+  if (is_command && !is_cvu_command)
+    avb_unsol_heard(state, &msg->common.controller_entity_id, src_addr);
 
   /* CVU SRP is never answered; earlier implementations did answer, and
    * those responses must be ignored rather than matched to anything. */

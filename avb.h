@@ -105,7 +105,9 @@ typedef struct i2s_channel_obj_t *i2s_chan_handle_t;
  * cadence for fast-connect retries while a saved binding waits for
  * its talker to be discovered / respond. */
 #define AVB_FAST_CONNECT_RETRY_MSEC 4000
-#define UNSOL_NOTIF_INTERVAL_MSEC 2000
+/* Controllers registered for unsolicited notifications, Milan v1.3
+ * §5.3.4.2 requires at least 16 per AVB interface. */
+#define AVB_MAX_UNSOL_CONTROLLERS 16
 /* Poll interval for the dedicated NVS-save task. The task wakes every
  * N ms, and if state->persist_dirty is set, snapshots and writes to
  * flash. Naturally coalesces bursts of marks in one flash write. */
@@ -508,8 +510,23 @@ typedef struct {
   unique_id_t model_id;  // model ID
   eth_addr_t mac_addr;   // mac address
   bool ready;            // status
-  bool unsol_registered; // asked for unsolicited notifications
 } avb_controller_s;
+
+/* A controller registered for unsolicited notifications (Milan v1.3
+ * §5.3.4.2). RAM only, a power cycle clears the list. */
+typedef struct {
+  unique_id_t entity_id; // controller entity ID
+  eth_addr_t mac_addr;   // controller MAC address
+  uint16_t aem_seq_id;   // next AEM notification sequence ID
+  uint16_t mvu_seq_id;   // next MVU notification sequence ID
+  uint16_t vu_seq_id;    // next AVB Lite / Wireless sequence ID
+  bool time_limited;     // IEEE 1722.1 §7.4.37.2, re-registers every 100 s
+  int64_t expires_us;    // time-limited registration deadline
+  int64_t check_due_us;  // Milan §5.4.5.4 CONTROLLER_AVAILABLE due
+  int64_t reply_due_us;  // nonzero while a CONTROLLER_AVAILABLE is pending
+  uint16_t check_seq_id; // sequence ID of the pending CONTROLLER_AVAILABLE
+  uint8_t checks_sent;   // CONTROLLER_AVAILABLE sent without a reply
+} avb_unsol_controller_s;
 
 /* Listener stream flags */
 typedef struct {
@@ -990,8 +1007,8 @@ typedef struct avb_state_s {
   struct timeval last_locked;
 
   /* Unsolicited notifications */
-  bool unsol_notif_enabled;
-  struct timespec last_unsol_notif;
+  avb_unsol_controller_s unsol_controllers[AVB_MAX_UNSOL_CONTROLLERS];
+  size_t num_unsol_controllers;
   uint8_t lite_status_sent[28]; // last AVB Lite status body sent unsolicited
   bool lite_status_sent_valid;
   bool lite_offset_alarm;       // |offset| above the §9 50 us threshold
@@ -1037,12 +1054,10 @@ typedef struct avb_state_s {
    * into avb_port_s; these two stay in state because they are not
    * tied to a specific port). */
   struct timespec last_ptp_status_update;
-  struct timespec last_transmitted_unsol_notif;
 
   /* Sequence IDs for outbound ATDECC messages */
   uint32_t adp_seq_id;
   uint16_t aecp_seq_id;
-  uint16_t unsol_seq_id; // unsolicited responses have their own counter
   int16_t acmp_seq_id;
 
   /* Logo */

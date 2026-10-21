@@ -1353,9 +1353,6 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // Set stop to false
   state->stop = false;
 
-  // Set unsolicited notifications disabled
-  state->unsol_notif_enabled = false;
-
   // Set global state
   s_state = state;
   return OK;
@@ -1648,40 +1645,7 @@ static int avb_periodic_send(avb_state_s *state) {
    * wired, 30–60 s Wi-Fi per §10.7.11); Applicants re-declare on rLA. */
 
 #ifdef CONFIG_ESP_AVB_ATDECC
-  // Send Unsolicited notifications
-  if (state->unsol_notif_enabled) {
-
-    if (state->config.talker) {
-      // Send get counters stream_output notification
-      for (int i = 0; i < state->num_output_streams; i++) {
-        // if the output stream is active
-        if (octets_to_uint(state->output_streams[i].connection_count, 2) > 0) {
-          timespecsub(&time_now,
-                                  &state->last_transmitted_unsol_notif, &delta);
-          if (timespec_to_ms(&delta) > UNSOL_NOTIF_INTERVAL_MSEC) {
-            state->last_transmitted_unsol_notif = time_now;
-            avb_send_aecp_unsol_get_counters(state, aem_desc_type_stream_output,
-                                             i);
-          }
-        }
-      }
-    }
-    if (state->config.listener) {
-      // Send get counters stream_input notification
-      for (int i = 0; i < state->num_input_streams; i++) {
-        // if the input stream is active
-        if (state->input_streams[i].connected) {
-          timespecsub(&time_now,
-                                  &state->last_transmitted_unsol_notif, &delta);
-          if (timespec_to_ms(&delta) > UNSOL_NOTIF_INTERVAL_MSEC) {
-            state->last_transmitted_unsol_notif = time_now;
-            avb_send_aecp_unsol_get_counters(state, aem_desc_type_stream_input,
-                                             i);
-          }
-        }
-      }
-    }
-  }
+  avb_unsol_tick(state);
 
   /* Process ACMP/AECP command timeouts. This is especially important for
    * listener DISCONNECT_RX: if the talker does not answer our forwarded
