@@ -416,6 +416,53 @@ menu "AVB Configuration"
             cadence modulation, or when an external media-clock chain
             cannot tolerate any talker-side rate steering.
 
+    config ESP_AVB_STATION_TALKER_BATCHED
+        bool "Single-core talker sends in timed batches"
+        default y
+        depends on ESP_AVB && FREERTOS_UNICORE
+        help
+            On a single-core chip the talker cannot spin on its own core
+            until each packet's slot. Without this option it spins at a
+            low priority and yields, so every higher-priority task holds
+            it off and it sends what it missed in a burst afterwards.
+            With it, the talker blocks, a GPTimer alarm wakes it when the
+            packet that fills a Wi-Fi bundle (ESP_AVB_WIFI_BUNDLE_FRAMES)
+            is due, and it sends what is due, each packet stamped for its
+            own slot, at a priority just below the Wi-Fi and AVB protocol
+            tasks. A packet leaves up to a bundle's frames, less one,
+            after its slot, about as long as it waited in the bundle
+            before. Applies to the codec input; the test tone keeps the
+            spin.
+
+    config ESP_AVB_STATION_TALKER_PRIORITY
+        int "Single-core talker task priority while batched"
+        default 19
+        range 3 23
+        depends on ESP_AVB_STATION_TALKER_BATCHED
+        help
+            Below the Wi-Fi task, PTPD, the AVB task and the system event
+            task, above lwIP's tcpip task.
+
+    config ESP_AVB_STATION_RX_WORKER
+        bool "Station handles received frames in a worker task"
+        default y
+        depends on ESP_AVB && FREERTOS_UNICORE && !ESP_AVB_ROLE_BRIDGE
+        help
+            Hand received frames from the Wi-Fi task to a worker below the
+            talker instead of handling them in the Wi-Fi task, where
+            unpacking a burst of stream bundles held a single-core
+            station's talker off for milliseconds. The listener's buffer
+            absorbs the wait. A full queue drops the frame (STREAM
+            rx_drops=).
+
+    config ESP_AVB_STATION_RX_WORKER_PRIORITY
+        int "Station receive worker priority"
+        default 18
+        range 2 22
+        depends on ESP_AVB_STATION_RX_WORKER
+        help
+            Below the batched talker (ESP_AVB_STATION_TALKER_PRIORITY).
+
     config ESP_AVB_LISTENER_CONCEAL_REPEAT
         bool "Conceal lost audio by repeating the waveform"
         default n

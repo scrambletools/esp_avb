@@ -11,6 +11,7 @@
  */
 
 #include "avb.h"
+#include "driver/gptimer.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
 #include "esp_log.h"
@@ -83,6 +84,8 @@ typedef struct {
   volatile uint32_t ts_reanchors;      /* timestamp re-anchored to gPTP (tu) */
   volatile uint32_t i2s_dropped_bytes; /* captured audio the RX DMA overwrote */
   volatile int32_t ts_err_ns;          /* stamp error vs gPTP schedule */
+  volatile uint32_t wakes;             /* batched pacing: sleeps ended */
+  volatile uint32_t stalls;            /* packets sent TALKER_STALL_US late */
 } stream_tx_ctx_t;
 
 static stream_tx_ctx_t *s_stream_tx_ctx = NULL;
@@ -576,6 +579,75 @@ static inline void be32_to_aaf(const uint8_t *in, uint8_t *out, int n) {
   memcpy(out, in, n * 4);
 }
 
+/* A packet sent this long after its slot counts as a talker stall
+ * (STREAM-OUT stalls=), whatever the pacing. */
+#define TALKER_STALL_US 4000
+
+#if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
+/* Batched pacing on a single-core station (see the top of the talker
+ * loop): a GPTimer alarm wakes the talker when its next batch is due.
+ * One talker at a time owns it; the timer is made once and kept.
+ * gptimer_set_alarm_action() wants its config in internal RAM. */
+static gptimer_handle_t s_talker_timer;
+static TaskHandle_t volatile s_talker_task;
+static DRAM_ATTR gptimer_alarm_config_t s_talker_alarm;
+static portMUX_TYPE s_talker_timer_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static bool IRAM_ATTR
+talker_batch_alarm(gptimer_handle_t timer,
+                   const gptimer_alarm_event_data_t *event, void *arg) {
+  (void)timer;
+  (void)event;
+  (void)arg;
+  TaskHandle_t task = s_talker_task;
+  BaseType_t woken = pdFALSE;
+  if (task)
+    vTaskNotifyGiveFromISR(task, &woken);
+  return woken == pdTRUE;
+}
+
+/* Claim the batch timer for the calling task, making it on first use.
+ * False when another talker holds it or the timer cannot be made. */
+static bool talker_batch_timer_claim(void) {
+  bool claimed = false;
+  portENTER_CRITICAL(&s_talker_timer_lock);
+  if (s_talker_task == NULL) {
+    s_talker_task = xTaskGetCurrentTaskHandle();
+    claimed = true;
+  }
+  portEXIT_CRITICAL(&s_talker_timer_lock);
+  if (!claimed || s_talker_timer)
+    return claimed;
+  gptimer_config_t timer_config = {.clk_src = GPTIMER_CLK_SRC_DEFAULT,
+                                   .direction = GPTIMER_COUNT_UP,
+                                   .resolution_hz = 1000000};
+  gptimer_event_callbacks_t callbacks = {.on_alarm = talker_batch_alarm};
+  gptimer_handle_t timer = NULL;
+  if (gptimer_new_timer(&timer_config, &timer) != ESP_OK ||
+      gptimer_register_event_callbacks(timer, &callbacks, NULL) != ESP_OK ||
+      gptimer_enable(timer) != ESP_OK || gptimer_start(timer) != ESP_OK) {
+    avberr("Stream out: no batch timer, spinning");
+    if (timer) {
+      gptimer_disable(timer);
+      gptimer_del_timer(timer);
+    }
+    s_talker_task = NULL;
+    return false;
+  }
+  s_talker_timer = timer;
+  return true;
+}
+
+/* Wake the claiming talker in delay_us. */
+static void talker_batch_timer_arm(int64_t delay_us) {
+  uint64_t now_ticks = 0;
+  gptimer_get_raw_count(s_talker_timer, &now_ticks);
+  s_talker_alarm.alarm_count =
+      now_ticks + (uint64_t)(delay_us < 5 ? 5 : delay_us);
+  gptimer_set_alarm_action(s_talker_timer, &s_talker_alarm);
+}
+#endif
+
 /* Frame layout constants for ETH+VLAN+AVTP */
 #define TX_ETH_HDR_LEN 14  /* dst(6) + src(6) + ethertype(2) */
 #define TX_VLAN_TAG_LEN 4  /* TCI(2) + inner ethertype(2) */
@@ -1056,7 +1128,53 @@ static void avb_stream_out_task(void *task_param) {
     }
   }
 
+  /* Batched pacing on a single-core station (see the top of the
+   * loop). One talker can hold the batch timer; another, or the test
+   * tone, keeps the spin. */
+  int64_t late_allowance_us = 0;
+  uint32_t wake_count = 0;
+  uint32_t stall_count = 0;
+#if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
+  /* A batch is one full Wi-Fi bundle of the stream's frames. */
+#ifdef CONFIG_ESP_AVB_WIFI_BUNDLE
+  const int batch_packets = CONFIG_ESP_AVB_WIFI_BUNDLE_FRAMES;
+#else
+  const int batch_packets = 8;
+#endif
+  bool batched = !params->use_sine_wave && talker_batch_timer_claim();
+  if (batched) {
+    late_allowance_us = (int64_t)(batch_packets - 1) * params->interval;
+    vTaskPrioritySet(NULL, CONFIG_ESP_AVB_STATION_TALKER_PRIORITY);
+    avbinfo("Stream out: batched, %d packets per wake, priority %d",
+            batch_packets, CONFIG_ESP_AVB_STATION_TALKER_PRIORITY);
+  }
+#endif
+
   while (!state->output_streams[params->stream_index].stop_streaming) {
+#if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
+    /* Batched pacing. With nothing due, sleep until the slot of the
+     * packet that fills the open Wi-Fi bundle (a batch's worth when none
+     * is open), then send what is due, each packet stamped for its own
+     * slot: sending early packets late moves only their arrival, and
+     * bundles fill as they did when every packet went out in its slot.
+     * The talker yields to everything below it between batches instead
+     * of spinning under it. The one-tick timeout lets a stop request
+     * through. */
+    if (batched) {
+      int64_t until_due_us = next_send_time - esp_timer_get_time();
+      if (until_due_us > 0) {
+        int open_frames = avb_net_tx_bundle_frames(avtp + 4);
+        int to_fill = batch_packets - open_frames % batch_packets;
+        /* 20 us past that slot, which whole-us cadence rounding can
+         * move by a microsecond. */
+        talker_batch_timer_arm(until_due_us +
+                               (int64_t)(to_fill - 1) * params->interval + 20);
+        ulTaskNotifyTake(pdTRUE, 1);
+        wake_count++;
+        continue;
+      }
+    }
+#endif
     /* Busy-wait until next send time. Prio 24 on core 1 — nothing else
      * needs that capacity (emac_rx is unpinned and lands on core 0 when
      * core 1 spins, AVB-IN is on core 0). Sub-µs precision required for
@@ -1087,11 +1205,15 @@ static void avb_stream_out_task(void *task_param) {
     int64_t now = esp_timer_get_time();
     int64_t packet_sched_us = next_send_time;
     int64_t overrun = now - next_send_time;
-    if (overrun > params->interval / 2) {
+    /* Late beyond the pacing's own allowance: half an interval, plus a
+     * batch when batched. */
+    if (overrun > late_allowance_us + params->interval / 2) {
       overrun_count++;
       if (overrun > overrun_max)
         overrun_max = overrun;
     }
+    if (overrun >= TALKER_STALL_US)
+      stall_count++;
     /* Filtered gPTP cadence: most packets advance by (interval_ns +
      * sched_ns_adj) with Q16-fixed-point carry to preserve sub-ns
      * precision. Every SCHED_RESYNC_PKTS packets we read gPTP, measure
@@ -1210,7 +1332,8 @@ static void avb_stream_out_task(void *task_param) {
      * the rate-locked one: skipping slots without advancing the stamps
      * put them behind gPTP and dropped the audio meant for those
      * slots. */
-    if (!gptp_seeded && overrun > params->interval * 10) {
+    if (!gptp_seeded &&
+        overrun > params->interval * 10 + late_allowance_us) {
       next_send_time = now + params->interval;
     } else {
       next_send_time += us_to_wait;
@@ -1410,10 +1533,23 @@ static void avb_stream_out_task(void *task_param) {
             atomic_load_explicit(&state->media_clock.i2s_bytes_dropped,
                                  memory_order_relaxed) -
             adc_bytes_base;
-        int64_t backlog_err =
-            capture_ring
-                ? (int64_t)(i2s_ring_head - i2s_ring_tail) - ring_setpoint
-                : (int64_t)captured - (int64_t)i2s_ring_tail;
+        int64_t backlog_err;
+        if (capture_ring) {
+          /* Backlog as of this packet's slot: a packet sent late (in a
+           * batch, or after a stall) finds the capture of its lateness
+           * already in the ring, which is not surplus. */
+          i2s_ring_head = atomic_load_explicit(
+              &state->media_clock.capture_head, memory_order_acquire);
+          int64_t late_us = esp_timer_get_time() - packet_sched_us;
+          if (late_us < 0)
+            late_us = 0;
+          int64_t late_bytes = late_us * (int64_t)params->sample_rate *
+                               i2s_frame_bytes / 1000000;
+          backlog_err = (int64_t)(i2s_ring_head - i2s_ring_tail) -
+                        late_bytes - ring_setpoint;
+        } else {
+          backlog_err = (int64_t)captured - (int64_t)i2s_ring_tail;
+        }
         fill_err_ema_q8 += ((backlog_err << 8) - fill_err_ema_q8) >> 3;
         int64_t err_pkts_q8 = fill_err_ema_q8 / i2s_read_nominal;
         fill_integ_ppm_q8 -= err_pkts_q8 / 16;
@@ -1462,6 +1598,8 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->gptp_resync_count = gptp_resync_count;
         tx_ctx->ts_reanchors = ts_reanchors;
         tx_ctx->ts_err_ns = ts_err_last;
+        tx_ctx->wakes = wake_count;
+        tx_ctx->stalls = stall_count;
         tx_ctx->i2s_dropped_bytes =
             capture_ring
                 ? (uint32_t)capture_dropped
@@ -1806,6 +1944,11 @@ static void avb_stream_out_task(void *task_param) {
 
 err:
   esp_log_level_set("*", ESP_LOG_INFO);
+#if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
+  /* Release the batch timer; a pending alarm then finds no task. */
+  if (s_talker_task == xTaskGetCurrentTaskHandle())
+    s_talker_task = NULL;
+#endif
   if (wdt_handle)
     esp_task_wdt_delete_user(wdt_handle);
   free(sine_lut);
@@ -3608,11 +3751,13 @@ void avb_stream_out_print_diag(void) {
   static uint32_t last_slip = 0, last_slip_pkts = 0;
   static uint32_t last_resync = 0;
   static uint32_t last_anchors = 0, last_dropped = 0;
+  static uint32_t last_wakes = 0, last_stalls = 0;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = last_under = 0;
     last_slip = last_slip_pkts = 0;
     last_anchors = last_dropped = 0;
+    last_wakes = last_stalls = 0;
   }
 
   uint32_t pkts = ctx->pkt_count;
@@ -3627,6 +3772,8 @@ void avb_stream_out_print_diag(void) {
   uint32_t resync = ctx->gptp_resync_count;
   uint32_t anchors = ctx->ts_reanchors;
   uint32_t dropped = ctx->i2s_dropped_bytes;
+  uint32_t wakes = ctx->wakes;
+  uint32_t stalls = ctx->stalls;
   uint32_t wbundles = 0, wbundle_frames = 0, wnacks = 0, wretx = 0;
   uint32_t wretx_late = 0, wretx_evicted = 0;
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
@@ -3653,6 +3800,7 @@ void avb_stream_out_print_diag(void) {
   long backlog_bytes = (long)ctx->fill_backlog_bytes;
 
   avbinfo("STREAM-OUT: pkts=%lu fail=%lu over=%lu(max=%lldus) "
+          "stalls=%lu wakes=%lu "
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
           "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus "
@@ -3660,6 +3808,8 @@ void avb_stream_out_print_diag(void) {
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
+          (unsigned long)(stalls - last_stalls),
+          (unsigned long)(wakes - last_wakes),
           (unsigned long)(z - last_z),
           (unsigned long)(nz - last_nz),
           (unsigned long)(under - last_under),
@@ -3694,6 +3844,8 @@ void avb_stream_out_print_diag(void) {
   last_pkts = pkts;
   last_fail = fail;
   last_over = over;
+  last_wakes = wakes;
+  last_stalls = stalls;
   last_z = z;
   last_nz = nz;
   last_under = under;

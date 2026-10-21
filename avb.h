@@ -1112,10 +1112,15 @@ int avb_net_recv_ctrl(avb_state_s *state, int *protocol_idx, int *ingress_port,
 esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
                                size_t frame_len);
 
+/* Frames in the stream's open Wi-Fi bundle, not yet sent; 0 where
+ * frames are not bundled. Only the task that sends the stream may ask. */
+int avb_net_tx_bundle_frames(const uint8_t *stream_id);
+
 void avb_net_set_stream_rx_handler(avb_stream_rx_handler_t handler, void *ctx);
 
-/* Number of incoming stream frames dropped because the AVB-IN queue
- * was full. Diagnostic counter; persistent across the session. */
+/* Number of received frames dropped because a receive queue was full
+ * (a single-core station's Wi-Fi receive worker). Diagnostic counter;
+ * persistent across the session. */
 uint32_t avb_net_stream_rx_drops(void);
 /* Total PTP (0x88f7) frames seen in the EMAC RX callback — before the
  * L2TAP filter/forward layer. Compare against ptpd's rx_sync counter to

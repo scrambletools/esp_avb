@@ -2294,6 +2294,57 @@ static void wifi_rx_lock_init(void) {
   if (esp_timer_create(&args, &s_hold_timer) != ESP_OK)
     s_hold_timer = NULL;
 }
+
+#if CONFIG_ESP_AVB_STATION_RX_WORKER
+/* Received frames leave the Wi-Fi task for a worker just below the
+ * station's talker: unpacking a downlink bundle costs a few hundred
+ * microseconds, and a burst of them in the Wi-Fi task held the talker
+ * off for milliseconds. The listener's buffer absorbs the wait. Every
+ * frame goes, so the Wi-Fi task never waits on s_wifi_rx_lock: the
+ * worker holds it while it may transmit (a NACK), and a transmit can
+ * wait on the Wi-Fi task (that deadlocked receive and transmit when
+ * control frames stayed in the Wi-Fi task). */
+typedef struct {
+  uint8_t *buf;
+  uint16_t len;
+} wifi_rx_item_t;
+#define WIFI_RX_WORKER_DEPTH 64
+static QueueHandle_t s_wifi_rx_queue;
+
+static void wifi_rx_worker(void *arg) {
+  (void)arg;
+  wifi_rx_item_t item;
+  for (;;) {
+    if (xQueueReceive(s_wifi_rx_queue, &item, portMAX_DELAY) != pdTRUE)
+      continue;
+    xSemaphoreTake(s_wifi_rx_lock, portMAX_DELAY);
+    avb_unified_rx_cb(NULL /* no eth_handle */, item.buf, (uint32_t)item.len,
+                      NULL, NULL);
+    wifi_hold_timer_arm();
+    xSemaphoreGive(s_wifi_rx_lock);
+  }
+}
+
+/* Runs in the Wi-Fi task, its only caller. */
+static bool wifi_rx_worker_ready(void) {
+  static bool s_failed;
+  if (s_wifi_rx_queue || s_failed)
+    return s_wifi_rx_queue != NULL;
+  QueueHandle_t queue =
+      xQueueCreate(WIFI_RX_WORKER_DEPTH, sizeof(wifi_rx_item_t));
+  if (!queue ||
+      xTaskCreate(wifi_rx_worker, "avb_wifi_rx", 4096, NULL,
+                  CONFIG_ESP_AVB_STATION_RX_WORKER_PRIORITY, NULL) != pdPASS) {
+    avberr("Wi-Fi RX worker not started, frames stay in the Wi-Fi task");
+    if (queue)
+      vQueueDelete(queue);
+    s_failed = true;
+    return false;
+  }
+  s_wifi_rx_queue = queue;
+  return true;
+}
+#endif
 #endif
 
 static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
@@ -2308,6 +2359,18 @@ static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
   len = (uint16_t)wifi_vi_unwrap(buf, len);
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   wifi_rx_lock_init();
+#if CONFIG_ESP_AVB_STATION_RX_WORKER
+  /* To the worker; a full queue drops the frame rather than make the
+   * Wi-Fi task wait. */
+  if (s_wifi_rx_lock && wifi_rx_worker_ready()) {
+    wifi_rx_item_t item = {.buf = buf, .len = len};
+    if (xQueueSend(s_wifi_rx_queue, &item, 0) == pdTRUE)
+      return ESP_OK;
+    free(buf);
+    s_stream_rx_drops++;
+    return ESP_OK;
+  }
+#endif
   if (s_wifi_rx_lock) {
     xSemaphoreTake(s_wifi_rx_lock, portMAX_DELAY);
     esp_err_t result = avb_unified_rx_cb(NULL /* no eth_handle */, buf,
@@ -2960,7 +3023,11 @@ extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
  * lock. */
 #define WIFI_TX_BUNDLE_SLOTS 2
 #define WIFI_TX_BUNDLE_MAX_AGE_US 2000
-#define WIFI_TX_HISTORY 16
+/* Enough sent bundles, about 2 ms each, to cover the resend age below.
+ * Each entry is a full-size buffer, and a single-core station is short
+ * of internal RAM: 16 entries left the Wi-Fi driver without TX buffers
+ * once received frames queued for the receive worker. */
+#define WIFI_TX_HISTORY 10
 #define WIFI_TX_RETX_MAX_AGE_US 18000 /* NACKs without a waiting time */
 #define WIFI_TX_RETX_SPACING_US 12000
 typedef struct {
@@ -3083,6 +3150,19 @@ static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
   return true;
 }
 
+static int wifi_tx_bundle_frames(const uint8_t *stream_id) {
+  int frames = 0;
+  portENTER_CRITICAL(&s_tx_bundle_lock);
+  for (int i = 0; s_tx_bundles && i < WIFI_TX_BUNDLE_SLOTS; i++)
+    if (s_tx_bundles[i].valid &&
+        memcmp(s_tx_bundles[i].stream_id, stream_id, UNIQUE_ID_LEN) == 0) {
+      frames = s_tx_bundles[i].count;
+      break;
+    }
+  portEXIT_CRITICAL(&s_tx_bundle_lock);
+  return frames;
+}
+
 /* The bridge asks for uplink bundles it missed. Runs on the Wi-Fi
  * task, concurrently with the talker that sends. */
 static void wifi_tx_nack_handle(const uint8_t *nack) {
@@ -3174,6 +3254,15 @@ esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle,
    * driver's dynamic TX buffers before returning, so the caller's buffer
    * is free again at once; no copy of its own is needed. */
   return esp_wifi_internal_tx(0 /* WIFI_IF_STA */, (void *)frame, frame_len);
+}
+
+int avb_net_tx_bundle_frames(const uint8_t *stream_id) {
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+  return wifi_tx_bundle_frames(stream_id);
+#else
+  (void)stream_id;
+  return 0;
+#endif
 }
 
 /* Register stream RX handler. Invoked inline from the EMAC RX callback
