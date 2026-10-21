@@ -1,4 +1,4 @@
-version: "2.35.1"
+version: "2.35.2"
 description: "AVB implementation for ESP-IDF"
 url: "https://github.com/scrambletools/esp_avb"
 license: "MIT"
