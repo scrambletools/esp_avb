@@ -1339,6 +1339,9 @@ void avb_persist_journal_tick(avb_state_s *state);
  * the P4's latched RX FIFO. Call every main-loop pass; no-op on targets
  * without an on-chip EMAC. */
 void avb_emac_rx_unwedge_tick(void);
+/* esp_timer time of the last frame the EMAC dropped on receive, 0 if
+ * none; registered as esp_ptp's receive-drop probe. */
+int64_t avb_emac_rx_drop_probe(void);
 bool avb_persist_ingress_quiet(void);
 
 /* Lock-free TX-side snapshot of a stream's published unicast DAs.

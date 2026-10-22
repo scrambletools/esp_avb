@@ -30,7 +30,39 @@ extern esp_err_t emac_esp_rx_full_recover(void) __attribute__((weak));
 static uint32_t s_emac_kick_count = 0;
 static uint32_t s_emac_toggle_count = 0;
 static uint32_t s_emac_recover_count = 0;
+
+/* EMAC_DMA.dmamissedfr clears on read, so one reader sums it for the
+ * stats line and stamps the last drop for esp_ptp, which holds the AVB
+ * Lite fallback while the receiver drops frames (avb_emac_rx_drop_probe). */
+static portMUX_TYPE s_emac_drop_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_emac_missed_frames = 0;   /* host receive buffer full */
+static uint32_t s_emac_overflow_frames = 0; /* MTL RX FIFO overflow */
+static bool s_emac_missed_wrapped = false;
+static bool s_emac_overflow_wrapped = false;
+static int64_t s_emac_last_drop_us = 0;
+
+static void avb_emac_poll_drops(void) {
+  portENTER_CRITICAL(&s_emac_drop_lock);
+  uint32_t dma_miss = EMAC_DMA.dmamissedfr.val;
+  if (dma_miss != 0) {
+    s_emac_missed_frames += dma_miss & 0xFFFF;
+    s_emac_overflow_frames += (dma_miss >> 17) & 0x7FF;
+    s_emac_missed_wrapped |= ((dma_miss >> 16) & 1) != 0;
+    s_emac_overflow_wrapped |= ((dma_miss >> 28) & 1) != 0;
+    s_emac_last_drop_us = esp_timer_get_time();
+  }
+  portEXIT_CRITICAL(&s_emac_drop_lock);
+}
 #endif
+
+int64_t avb_emac_rx_drop_probe(void) {
+#if SOC_EMAC_SUPPORTED
+  avb_emac_poll_drops();
+  return s_emac_last_drop_us;
+#else
+  return 0;
+#endif
+}
 
 /* EMAC RX un-wedge guard, call every main loop pass.
  *
@@ -55,6 +87,7 @@ static uint32_t s_emac_recover_count = 0;
  * so a transient overflow never triggers it. */
 void avb_emac_rx_unwedge_tick(void) {
 #if SOC_EMAC_SUPPORTED
+  avb_emac_poll_drops();
   uint32_t status = EMAC_DMA.dmastatus.val;
   uint32_t recv_state = (status >> 17) & 0x7; /* RS, bits 19:17 */
 
@@ -381,15 +414,21 @@ static void avb_cpu_stats_tick(void) {
    * Wi-Fi-only targets (e.g. esp32c6 endpoint) the AVB ingress comes
    * from esp_wifi instead and these registers don't exist. */
 #if SOC_EMAC_SUPPORTED
-  uint32_t dma_miss = EMAC_DMA.dmamissedfr.val;
-  /* Quiet when clean: these registers are all-zero in normal operation,
+  avb_emac_poll_drops();
+  portENTER_CRITICAL(&s_emac_drop_lock);
+  uint32_t missed_frames = s_emac_missed_frames;
+  uint32_t overflow_frames = s_emac_overflow_frames;
+  bool missed_wrapped = s_emac_missed_wrapped;
+  bool overflow_wrapped = s_emac_overflow_wrapped;
+  s_emac_missed_frames = s_emac_overflow_frames = 0;
+  s_emac_missed_wrapped = s_emac_overflow_wrapped = false;
+  portEXIT_CRITICAL(&s_emac_drop_lock);
+  /* Quiet when clean: these counters are all-zero in normal operation,
    * so an info-level line only appears when frames were actually lost. */
-  if (dma_miss != 0) {
+  if (missed_frames || overflow_frames || missed_wrapped || overflow_wrapped) {
     avbinfo("  ====> EMAC DMA missed_fc=%u overflow_fc=%u bmfc_ovf=%u bfoc_ovf=%u",
-            (unsigned)(dma_miss & 0xFFFF),
-            (unsigned)((dma_miss >> 17) & 0x7FF),
-            (unsigned)((dma_miss >> 16) & 1),
-            (unsigned)((dma_miss >> 28) & 1));
+            (unsigned)missed_frames, (unsigned)overflow_frames,
+            (unsigned)missed_wrapped, (unsigned)overflow_wrapped);
   }
   /* Un-wedge guard activity (avb_emac_rx_unwedge_tick): all zero in
    * normal operation. */

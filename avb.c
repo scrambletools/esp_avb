@@ -1932,6 +1932,8 @@ static void avb_task(void *task_param) {
    * access to media_clock data. */
   avb_cpu_stats_set_state(state);
   avb_cpu_stats_start();
+  /* Pdelay responses our own receiver dropped hold the AVB Lite fallback. */
+  ptpd_set_rx_drop_probe(avb_emac_rx_drop_probe);
 
   // Apply persisted codec values to hardware
   if (state->codec_enabled) {
