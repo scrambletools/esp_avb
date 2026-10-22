@@ -95,6 +95,10 @@ void avb_emac_rx_unwedge_tick(void) {
                   "full EMAC reset %s",
                   (unsigned long)status, (unsigned long)cur_rx_buf,
                   err == ESP_OK ? "done" : "failed");
+          /* Pdelay responses lost to the lockup could have sprung the
+           * AVB Lite fallback latch; the restart re-arms it. */
+          if (err == ESP_OK)
+            ptpd_eth_rx_restarted();
         } else if (!warned_no_full_recover) {
           warned_no_full_recover = true;
           avberr("EMAC RX FIFO lockup (dmastatus=0x%08lx rxbuf=0x%08lx): "
