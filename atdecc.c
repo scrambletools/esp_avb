@@ -4190,6 +4190,9 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
       if (mapping_index < state->msrp_mappings_count) {
         memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
       }
+      /* Boot in this class next time: the listener asks for it again when
+       * it reconnects, and a change of class costs two LeaveAll periods. */
+      avb_persist_append_output_stream(state, talker_uid);
     }
 
     avbinfo(

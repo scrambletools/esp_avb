@@ -358,10 +358,28 @@ static const eth_addr_t *avb_declared_dest_addr(avb_state_s *state,
  * value it learned (observed: a switch still forwarding Class A 30 s
  * after the talker re-declared Class B), so the boot declaration has
  * to carry the class the format was built for. */
+/* Class each output stream's last ACMP listener chose, from the stream
+ * journal: 0 when none was saved, else 1 + class_b. A listener that
+ * reconnects after this talker restarts asks for the class it saved,
+ * and changing class then withdraws the Talker Advertise for two
+ * LeaveAll periods (observed: 19 s without audio after a reboot reset
+ * a Class A stream to the Class B of its frame interval). */
+static uint8_t s_output_class_journaled[AVB_PERSIST_MAX_OUTPUT_STREAMS];
+
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
 static void avb_output_streams_class_from_format(avb_state_s *state) {
   for (uint16_t i = 0; i < state->num_output_streams; i++) {
     avb_talker_stream_s *stream = &state->output_streams[i];
+    if (i < AVB_PERSIST_MAX_OUTPUT_STREAMS && s_output_class_journaled[i]) {
+      bool class_b = s_output_class_journaled[i] == 2;
+      stream->stream_info_flags.class_b = class_b ? 1 : 0;
+      int mapping_index = class_b ? 1 : 0;
+      if (mapping_index < state->msrp_mappings_count)
+        memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
+      avbinfo("Stream out %u: class %c as its listener last chose", i,
+              class_b ? 'B' : 'A');
+      continue;
+    }
     avtp_stream_format_s *fmt = &stream->stream_format;
     if (fmt->aaf_pcm.subtype != avtp_subtype_aaf)
       continue;
@@ -2502,7 +2520,11 @@ typedef struct {
 
 typedef struct {
   avb_persist_output_stream_s stream;
-  uint8_t reserved[20];
+  /* Stream class; records written before it existed read class_valid 0
+   * and take the class of the stream's frame interval. */
+  uint8_t class_valid;
+  uint8_t class_b;
+  uint8_t reserved[18];
 } avb_persist_output_stream_journal_s;
 
 _Static_assert(sizeof(avb_persist_input_stream_journal_s) == 32,
@@ -2554,6 +2576,8 @@ static void avb_persist_fill_output_stream_record(
   const avb_talker_stream_s *src = &state->output_streams[index];
   memcpy(dst->stream.stream_format, &src->stream_format, 8);
   dst->stream.presentation_time_offset_ns = src->presentation_time_offset_ns;
+  dst->class_valid = 1;
+  dst->class_b = src->stream_info_flags.class_b ? 1 : 0;
 }
 
 /* Rewrite the stream journal as one latest record per stream and erase
@@ -2869,6 +2893,8 @@ static void avb_persist_replay_stream_journal(avb_state_s *state) {
     if (!latest_out[i])
       continue;
     state->persist.output_streams[i] = out_rec[i].stream;
+    s_output_class_journaled[i] =
+        out_rec[i].class_valid ? (out_rec[i].class_b ? 2 : 1) : 0;
   }
 
   if (replayed || s_persist_journal_seq) {
