@@ -70,12 +70,21 @@ void avb_emac_rx_unwedge_tick(void) {
   static uint32_t last_rx_buf = 0;
   static uint32_t stagnant_passes = 0;
   static int64_t last_restart_us = 0;
+  static int64_t last_toggle_us = 0;
   static bool warned_no_full_recover = false;
   uint32_t cur_rx_buf = EMAC_DMA.dmarxcurraddr_buf;
   bool overflow_latched = (status & 0x10) != 0;
   if (recv_state == 3 && overflow_latched && cur_rx_buf == last_rx_buf) {
     stagnant_passes++;
-    if (stagnant_passes == 3) {
+    int64_t now_us = esp_timer_get_time();
+    /* After a toggle the pass count starts over, so a latch the toggle
+     * cannot clear kept the escalation from reaching the full reset
+     * (observed: 126 toggles over 43 s). A lockup seen again within 2 s
+     * of a toggle goes straight to it. */
+    bool toggle_failed =
+        last_toggle_us != 0 && now_us - last_toggle_us < 2 * 1000 * 1000;
+    bool may_restart = now_us - last_restart_us > 10 * 1000 * 1000;
+    if (stagnant_passes == 3 && !(toggle_failed && may_restart)) {
       /* Cheap attempt: receiver toggle and poll demand. */
       EMAC_DMA.dmaoperation_mode.start_stop_rx = 0;
       EMAC_MAC.gmacconfig.rx = 0;
@@ -84,9 +93,9 @@ void avb_emac_rx_unwedge_tick(void) {
       EMAC_DMA.dmaoperation_mode.start_stop_rx = 1;
       EMAC_DMA.dmarxpolldemand = 1;
       s_emac_toggle_count++;
-    } else if (stagnant_passes >= 6) {
-      int64_t now_us = esp_timer_get_time();
-      if (now_us - last_restart_us > 10 * 1000 * 1000) {
+      last_toggle_us = now_us;
+    } else if (stagnant_passes >= 6 || stagnant_passes == 3) {
+      if (may_restart) {
         last_restart_us = now_us;
         if (emac_esp_rx_full_recover) {
           s_emac_recover_count++;
