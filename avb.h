@@ -1434,6 +1434,12 @@ void avb_persist_request_save(avb_state_s *state);
  * paths where a full NVS blob write is too disruptive. */
 esp_err_t avb_persist_append_input_stream(avb_state_s *state, uint16_t index);
 esp_err_t avb_persist_append_output_stream(avb_state_s *state, uint16_t index);
+/* SR class an AAF output format's frame interval implies (250 us: Class B,
+ * 125 us: Class A); false for any other format. */
+bool avb_output_format_class(const avtp_stream_format_s *fmt, bool *class_b);
+/* Set an output stream's class and VLAN to the class its format implies;
+ * false, changing nothing, when the format implies none. */
+bool avb_output_stream_class_from_format(avb_state_s *state, uint16_t index);
 /* FreeRTOS task entry point for the deferred NVS writer. */
 void avb_persist_task(void *arg);
 void i2s_task(void *arg);

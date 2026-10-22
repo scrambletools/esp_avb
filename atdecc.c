@@ -2902,8 +2902,18 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
       if (rate_change && avb_audio_set_rate(state, new_rate) != ESP_OK) {
         status = aecp_status_entity_misbehaving;
       } else if (is_output) {
+        bool old_class_b = false, new_class_b = false;
+        bool old_class_known = avb_output_format_class(current, &old_class_b);
         memcpy(&state->output_streams[index].stream_format, requested,
                sizeof(avtp_stream_format_s));
+        /* A class a listener chose belongs to the frame interval it chose
+         * it for: a format with another interval takes that interval's
+         * class, which the journal record below then keeps (observed: a
+         * Class B kept from 250 us frames carried 125 us frames through
+         * a reboot). */
+        if (avb_output_format_class(requested, &new_class_b) &&
+            (!old_class_known || old_class_b != new_class_b))
+          avb_output_stream_class_from_format(state, index);
       } else {
         memcpy(&state->input_streams[index].stream_format, requested,
                sizeof(avtp_stream_format_s));

@@ -352,52 +352,67 @@ static const eth_addr_t *avb_declared_dest_addr(avb_state_s *state,
   return &stream->stream_dest_addr;
 }
 
+/* Class each output stream last ran in, as an ACMP listener or a format
+ * change set it, from the stream journal: 0 when none was saved, else
+ * 1 + class_b. A listener that reconnects after this talker restarts
+ * asks for the class it saved, and changing class then withdraws the
+ * Talker Advertise for two LeaveAll periods (observed: 19 s without
+ * audio after a reboot reset a Class A stream to the Class B of its
+ * frame interval). */
+static uint8_t s_output_class_journaled[AVB_PERSIST_MAX_OUTPUT_STREAMS];
+
 /* An AAF output's frame interval is its SR class: 250 us of samples per
  * frame is Class B, 125 us is Class A. Talkers advertise from boot,
  * before any listener picks a class, and a switch may keep the first
  * value it learned (observed: a switch still forwarding Class A 30 s
  * after the talker re-declared Class B), so the boot declaration has
  * to carry the class the format was built for. */
-/* Class each output stream's last ACMP listener chose, from the stream
- * journal: 0 when none was saved, else 1 + class_b. A listener that
- * reconnects after this talker restarts asks for the class it saved,
- * and changing class then withdraws the Talker Advertise for two
- * LeaveAll periods (observed: 19 s without audio after a reboot reset
- * a Class A stream to the Class B of its frame interval). */
-static uint8_t s_output_class_journaled[AVB_PERSIST_MAX_OUTPUT_STREAMS];
+bool avb_output_format_class(const avtp_stream_format_s *fmt, bool *class_b) {
+  if (fmt->aaf_pcm.subtype != avtp_subtype_aaf)
+    return false;
+  uint32_t sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
+  uint32_t samples_per_frame = (fmt->aaf_pcm.samples_per_frame_h << 4) |
+                               fmt->aaf_pcm.samples_per_frame;
+  if (sample_rate == 0 || samples_per_frame == 0)
+    return false;
+  uint32_t interval_us = samples_per_frame * 1000000u / sample_rate;
+  if (interval_us != 125 && interval_us != 250)
+    return false;
+  *class_b = interval_us == 250;
+  return true;
+}
+
+static void avb_output_stream_set_class(avb_state_s *state, uint16_t index,
+                                        bool class_b) {
+  avb_talker_stream_s *stream = &state->output_streams[index];
+  stream->stream_info_flags.class_b = class_b ? 1 : 0;
+  int mapping_index = class_b ? 1 : 0;
+  if (mapping_index < state->msrp_mappings_count)
+    memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
+}
+
+bool avb_output_stream_class_from_format(avb_state_s *state, uint16_t index) {
+  bool class_b = false;
+  if (!avb_output_format_class(&state->output_streams[index].stream_format,
+                               &class_b))
+    return false;
+  avb_output_stream_set_class(state, index, class_b);
+  avbinfo("Stream out %u: class %c from its %u us frames", index,
+          class_b ? 'B' : 'A', class_b ? 250u : 125u);
+  return true;
+}
 
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
 static void avb_output_streams_class_from_format(avb_state_s *state) {
   for (uint16_t i = 0; i < state->num_output_streams; i++) {
-    avb_talker_stream_s *stream = &state->output_streams[i];
     if (i < AVB_PERSIST_MAX_OUTPUT_STREAMS && s_output_class_journaled[i]) {
       bool class_b = s_output_class_journaled[i] == 2;
-      stream->stream_info_flags.class_b = class_b ? 1 : 0;
-      int mapping_index = class_b ? 1 : 0;
-      if (mapping_index < state->msrp_mappings_count)
-        memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
-      avbinfo("Stream out %u: class %c as its listener last chose", i,
+      avb_output_stream_set_class(state, i, class_b);
+      avbinfo("Stream out %u: class %c as last saved", i,
               class_b ? 'B' : 'A');
       continue;
     }
-    avtp_stream_format_s *fmt = &stream->stream_format;
-    if (fmt->aaf_pcm.subtype != avtp_subtype_aaf)
-      continue;
-    uint32_t sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
-    uint32_t samples_per_frame = (fmt->aaf_pcm.samples_per_frame_h << 4) |
-                                 fmt->aaf_pcm.samples_per_frame;
-    if (sample_rate == 0 || samples_per_frame == 0)
-      continue;
-    uint32_t interval_us = samples_per_frame * 1000000u / sample_rate;
-    if (interval_us != 125 && interval_us != 250)
-      continue;
-    bool class_b = interval_us == 250;
-    stream->stream_info_flags.class_b = class_b ? 1 : 0;
-    int mapping_index = class_b ? 1 : 0;
-    if (mapping_index < state->msrp_mappings_count)
-      memcpy(stream->vlan_id, state->msrp_mappings[mapping_index].vlan_id, 2);
-    avbinfo("Stream out %u: class %c from its %lu us frames", i,
-            class_b ? 'B' : 'A', (unsigned long)interval_us);
+    avb_output_stream_class_from_format(state, i);
   }
 }
 #endif
