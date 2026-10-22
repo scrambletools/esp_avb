@@ -1558,8 +1558,8 @@ static void mrp_on_listener_registrar_change(
           }
         }
         avbinfo("MSRP: listener registration aged out for stream %d "
-                "(count=%d)",
-                i, octets_to_uint(stream->connection_count, 2));
+                "(count=%u)",
+                i, (unsigned)octets_to_uint(stream->connection_count, 2));
         bool should_stop = !any_listener_ready(stream) ||
                            (!state->config.milan_compliant &&
                             !any_listener_acmp_connected(stream));
@@ -1613,8 +1613,8 @@ static void mrp_on_listener_registrar_change(
       stream->connected_listeners[lidx].msrp_ready_live = true;
       stream->connected_listeners[lidx].asking_failed_since_us = 0;
       if (!was_ready) {
-        avbinfo("MSRP: listener ready for stream %d (count=%d, acmp=%d)", i,
-                octets_to_uint(stream->connection_count, 2),
+        avbinfo("MSRP: listener ready for stream %d (count=%u, acmp=%d)", i,
+                (unsigned)octets_to_uint(stream->connection_count, 2),
                 stream->connected_listeners[lidx].acmp_connected);
       }
       stream->connected_listeners[lidx].asking_failed = false;

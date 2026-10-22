@@ -4118,8 +4118,8 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
      * stream while we wait for an MSRP Leave (which may be delayed or lost). */
     if (listener_idx != NOT_FOUND) {
       avb_remove_talker_listener_by_index(stream, listener_idx);
-      avbinfo("ACMP: listener disconnected from stream %d (count=%d)",
-              talker_uid, octets_to_uint(stream->connection_count, 2));
+      avbinfo("ACMP: listener disconnected from stream %d (count=%u)",
+              talker_uid, (unsigned)octets_to_uint(stream->connection_count, 2));
     } else {
       avbwarn("ACMP: disconnect for unknown listener on stream %d", talker_uid);
     }
@@ -4193,8 +4193,8 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
     }
 
     avbinfo(
-        "ACMP: listener connected to stream %d (count=%d, msrp=%d, class=%c)",
-        talker_uid, octets_to_uint(stream->connection_count, 2),
+        "ACMP: listener connected to stream %d (count=%u, msrp=%d, class=%c)",
+        talker_uid, (unsigned)octets_to_uint(stream->connection_count, 2),
         stream->connected_listeners[listener_idx].msrp_ready,
         stream->stream_info_flags.class_b ? 'B' : 'A');
 
