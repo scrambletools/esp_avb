@@ -2118,6 +2118,16 @@ typedef struct {
   bool conceal_step_pending;          /* measure the step into real audio */
   uint64_t conceal_step_sum[2];       /* |step| into and out of inserts */
   uint32_t conceal_step_count[2];
+  uint32_t conceal_repeat_head;       /* ring position of the last repetition */
+  /* Standing ring depth, sampled before writing each packet that
+   * arrives in sequence while playout is locked (Q4 fixed point), and
+   * how many samples it holds. A concealment insert may restore the
+   * depth a loss took away but never push the ring past it. Sampling
+   * pauses for STANDING_DEPTH_HOLD_PACKETS after every gap, so repeated
+   * gaps cannot ratchet the reference up with their own inserts. */
+  uint32_t standing_depth_q4;
+  uint32_t standing_depth_samples;
+  uint32_t standing_depth_hold;
   uint32_t ring_bytes_per_sec;        /* ring byte rate at nominal DAC rate */
   volatile uint32_t ts_uncertain_count; /* AVTPDU with tu=1 received */
   uint8_t last_seq_num;               /* last received sequence number */
@@ -3088,6 +3098,16 @@ static void avb_crf_rx_handler(uint8_t *avtp_data, uint16_t len,
 #define CONCEAL_LAG_STEP 4      /* 83 us at 48 kHz */
 #define CONCEAL_FADE_FRAMES 960 /* 20 ms */
 #define CONCEAL_CROSSFADE_FRAMES 48
+/* Reciprocals of the fade and crossfade lengths (Q22, Q20), so a gain
+ * is a multiply and a shift: these loops run inline in emac_rx, where a
+ * 64-bit division per sample cost a whole packet interval per insert. */
+#define CONCEAL_FADE_RECIP_Q22 ((1u << 22) / CONCEAL_FADE_FRAMES)
+#define CONCEAL_CROSSFADE_RECIP_Q20 ((1u << 20) / CONCEAL_CROSSFADE_FRAMES)
+/* In-sequence packets sampled before the standing depth caps inserts,
+ * and in-sequence packets after a gap before sampling resumes (about
+ * 30-60 ms). */
+#define STANDING_DEPTH_MIN_SAMPLES 64
+#define STANDING_DEPTH_HOLD_PACKETS 256
 #if CONFIG_ESP_AVB_LISTENER_CONCEAL_REPEAT
 static volatile bool s_conceal_repeat = true;
 #else
@@ -3150,8 +3170,9 @@ static inline int32_t stream_conceal_sample(const stream_rx_ctx_t *ctx,
       buf, mask,
       ctx->conceal_src + (produced % ctx->conceal_period) * CONCEAL_FRAME_BYTES +
           ch * 4);
-  return (int32_t)((int64_t)sample * (CONCEAL_FADE_FRAMES - produced) /
-                   CONCEAL_FADE_FRAMES);
+  uint32_t gain_q16 =
+      ((CONCEAL_FADE_FRAMES - produced) * CONCEAL_FADE_RECIP_Q22) >> 6;
+  return (int32_t)(((int64_t)sample * gain_q16) >> 16);
 }
 
 /* Writes fill_bytes of concealment at head (not yet published). */
@@ -3162,7 +3183,15 @@ static void stream_conceal_fill(stream_rx_ctx_t *ctx, uint32_t head,
   uint32_t frames = fill_bytes / CONCEAL_FRAME_BYTES;
   int32_t before = ring_sample_get(buf, mask, head - CONCEAL_FRAME_BYTES);
   uint32_t repeated = 0;
-  if (s_conceal_repeat) {
+  /* The pitch search is too costly to run for every packet. When gaps
+   * come back to back, as from a stream a switch cuts down to its old
+   * reservation, an insert that starts within one fade of the last
+   * repetition is silence (observed: a gap on nearly every packet held
+   * emac_rx on core 0 for 11 s, and the lost Pdelay responses sprang
+   * the AVB Lite fallback). */
+  if (s_conceal_repeat && head - ctx->conceal_repeat_head >=
+                              CONCEAL_FADE_FRAMES * CONCEAL_FRAME_BYTES) {
+    ctx->conceal_repeat_head = head;
     ctx->conceal_period = stream_conceal_period(buf, mask, head);
     ctx->conceal_src = head - ctx->conceal_period * CONCEAL_FRAME_BYTES;
     /* Past the fade the repetition is silence, written below. */
@@ -3202,16 +3231,16 @@ static void stream_conceal_after_write(stream_rx_ctx_t *ctx, uint32_t head,
        frame < frames && ctx->conceal_crossfade > 0 && ctx->conceal_period;
        frame++) {
     uint32_t real_share = CONCEAL_CROSSFADE_FRAMES - ctx->conceal_crossfade + 1;
+    uint32_t real_q16 = (real_share * CONCEAL_CROSSFADE_RECIP_Q20) >> 4;
     for (int ch = 0; ch < 2; ch++) {
       uint32_t pos = head + frame * CONCEAL_FRAME_BYTES + ch * 4;
       int32_t real = ring_sample_get(buf, mask, pos);
       int32_t repeated =
           stream_conceal_sample(ctx, buf, mask, ctx->conceal_produced, ch);
       ring_sample_put(buf, mask, pos,
-                      (int32_t)(((int64_t)real * real_share +
-                                 (int64_t)repeated *
-                                     (CONCEAL_CROSSFADE_FRAMES - real_share)) /
-                                CONCEAL_CROSSFADE_FRAMES));
+                      (int32_t)(((int64_t)real * real_q16 +
+                                 (int64_t)repeated * (65536u - real_q16)) >>
+                                16));
     }
     ctx->conceal_produced++;
     ctx->conceal_crossfade--;
@@ -3477,6 +3506,26 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
       }
       fill_bytes = n_fill * total;
     }
+    /* A loss can take at most the ring's standing depth plus what the
+     * I2S DMA played while no packet arrived, so an insert may refill
+     * the ring to that, with 1 ms for the drain's own swing. A gap that
+     * cost no playout time, such as two talkers sending one stream ID
+     * or a restarted sequence count, then cannot grow the ring
+     * (observed: 160 stray packets over 2 s filled the 64 KB ring and
+     * held it full for a minute, +170 ms). */
+    if (fill_bytes > 0 &&
+        ctx->standing_depth_samples >= STANDING_DEPTH_MIN_SAMPLES) {
+      uint64_t pause_bytes =
+          pause_us > 0
+              ? (uint64_t)pause_us * ctx->ring_bytes_per_sec / 1000000
+              : 0;
+      uint64_t ceiling = (ctx->standing_depth_q4 >> 4) +
+                         ctx->ring_bytes_per_sec / 1000 + pause_bytes;
+      uint32_t readable = ring_readable(&ctx->ring);
+      uint64_t room = ceiling > readable ? (ceiling - readable) & ~7ull : 0;
+      if (fill_bytes > room)
+        fill_bytes = (uint32_t)room;
+    }
     if (fill_bytes > 0 && ring_writable(&ctx->ring) >= fill_bytes + total) {
       uint32_t fh = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
       stream_conceal_fill(ctx, fh, fill_bytes);
@@ -3490,6 +3539,23 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   }
 
   uint32_t pre_fill = ring_readable(&ctx->ring);
+  if (!ctx->drain_locked) {
+    ctx->standing_depth_samples = 0;
+  } else if (lost_frames > 0) {
+    ctx->standing_depth_hold = STANDING_DEPTH_HOLD_PACKETS;
+  } else if (ctx->standing_depth_hold > 0) {
+    ctx->standing_depth_hold--;
+  } else {
+    int32_t sample_q4 = (int32_t)(pre_fill << 4);
+    if (ctx->standing_depth_samples == 0)
+      ctx->standing_depth_q4 = (uint32_t)sample_q4;
+    else
+      ctx->standing_depth_q4 = (uint32_t)(
+          (int32_t)ctx->standing_depth_q4 +
+          ((sample_q4 - (int32_t)ctx->standing_depth_q4) >> 6));
+    if (ctx->standing_depth_samples < STANDING_DEPTH_MIN_SAMPLES)
+      ctx->standing_depth_samples++;
+  }
   if (total > 0 && ring_writable(&ctx->ring) >= total) {
     uint32_t h = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
     uint32_t mask = ctx->ring.capacity - 1;
