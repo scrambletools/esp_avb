@@ -77,8 +77,11 @@ int64_t avb_emac_rx_drop_probe(void) {
  * demand is always safe.
  *
  * Case 2, MTL RX FIFO lockup: the P4 RX FIFO is only 256 B, which
- * forces threshold mode, and a threshold-mode FIFO can latch dead after
- * an overflow. Observed state: receive process Running-waiting (RS=3),
+ * forces cut-through mode, where an EMAC IP erratum lets a DMA flush of
+ * a timestamped frame on descriptor exhaustion stop the FIFO read
+ * controller. An IDF with receive frame flushing disabled avoids it;
+ * this stays as the fallback. Observed state: receive process
+ * Running-waiting (RS=3),
  * descriptors free, overflow flag latched, RX buffer pointer frozen
  * while the wire carries traffic. Escalation: receiver toggle and poll
  * demand first; if the pointer is still frozen, a full EMAC core reset
@@ -405,10 +408,12 @@ static void avb_cpu_stats_tick(void) {
   /* EMAC DMA hardware missed-frame counter. missed_fc counts frames the
    * DMA discarded because the Host Receive Buffer was unavailable (the
    * RX descriptor ring was full). overflow_fc counts frames lost inside
-   * the MTL FIFO (before DMA). Both fields clear on read. If missed_fc
-   * is non-zero we're losing packets at the NIC because emac_rx isn't
-   * draining fast enough — the most likely explanation for PTP frames
-   * visible on the wire but never reaching avb_unified_rx_cb.
+   * the MTL FIFO (before DMA). Both fields clear on read. Either one
+   * non-zero means emac_rx isn't draining fast enough, the most likely
+   * explanation for PTP frames visible on the wire but never reaching
+   * avb_unified_rx_cb. With receive frame flushing disabled, a full
+   * ring backs up into the FIFO, so its drops land in the 11-bit
+   * overflow_fc, which can wrap between reads (bfoc_ovf).
    *
    * Only meaningful on targets with on-chip EMAC (e.g. esp32p4). On
    * Wi-Fi-only targets (e.g. esp32c6 endpoint) the AVB ingress comes
