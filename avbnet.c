@@ -1812,10 +1812,25 @@ void avb_bridge_bundle_ingress_stats(uint32_t *lost, uint32_t *late,
 }
 #endif
 
+/* esp_timer time (low 32 bits, made odd so it is never 0) at which the
+ * EMAC frame now in the callback entered it, 0 while none is inside. */
+static volatile uint32_t s_emac_rx_cb_entered_us = 0;
+
+uint32_t avb_emac_rx_cb_busy_ms(void) {
+  uint32_t entered_us = s_emac_rx_cb_entered_us;
+  if (entered_us == 0)
+    return 0;
+  return ((uint32_t)esp_timer_get_time() - entered_us) / 1000;
+}
+
 static esp_err_t avb_unified_rx_cb(esp_eth_handle_t eth_handle, uint8_t *buf,
                                    uint32_t len, void *priv, void *info) {
   uint32_t c0 = esp_cpu_get_cycle_count();
+  if (eth_handle)
+    s_emac_rx_cb_entered_us = (uint32_t)esp_timer_get_time() | 1;
   esp_err_t r = avb_unified_rx_cb_inner(eth_handle, buf, len, priv, info);
+  if (eth_handle)
+    s_emac_rx_cb_entered_us = 0;
   s_prof_cb_cycles += esp_cpu_get_cycle_count() - c0;
   s_prof_cb_frames++;
   return r;

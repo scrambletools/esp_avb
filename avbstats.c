@@ -70,88 +70,137 @@ int64_t avb_emac_rx_drop_probe(void) {
  * descriptor exhaustion (bursts, or the cache-off window of a flash
  * write at stream rate) and both otherwise permanent:
  *
- * Case 1, RX DMA Suspended with free descriptors: the driver's recovery
- * (free descriptors, then the receive poll demand) can lose a race
- * against the DMA entering Suspended; the demand is ignored and a
+ * Case 1, RX DMA Suspended (descriptor unavailable): the driver's
+ * recovery (free descriptors, then the receive poll demand) can lose a
+ * race against the DMA entering Suspended; the demand is ignored and a
  * suspended DMA raises no further interrupts. Re-issuing the poll
- * demand is always safe.
+ * demand is always safe. While the ring drains, the DMA's descriptor
+ * pointer moves between demands. With receive frame flushing disabled
+ * it has also stayed frozen through demands for hours; after 1 s
+ * frozen, case 1 escalates like case 2.
  *
  * Case 2, MTL RX FIFO lockup: the P4 RX FIFO is only 256 B, which
  * forces cut-through mode, where an EMAC IP erratum lets a DMA flush of
  * a timestamped frame on descriptor exhaustion stop the FIFO read
  * controller. An IDF with receive frame flushing disabled avoids it;
  * this stays as the fallback. Observed state: receive process
- * Running-waiting (RS=3),
- * descriptors free, overflow flag latched, RX buffer pointer frozen
- * while the wire carries traffic. Escalation: receiver toggle and poll
- * demand first; if the pointer is still frozen, a full EMAC core reset
- * (emac_esp_rx_full_recover), rate-limited so a persistent fault cannot
- * become a reset storm. Detection is debounced on the frozen pointer,
- * so a transient overflow never triggers it. */
+ * Running-waiting (RS=3), descriptors free, overflow flag latched, RX
+ * buffer pointer frozen while the wire carries traffic. Detection is
+ * debounced on the frozen pointer, so a transient overflow never
+ * triggers it.
+ *
+ * Escalation: receiver toggle and poll demand first; if the pointer is
+ * still frozen, a full EMAC core reset (emac_esp_rx_full_recover),
+ * rate-limited so a persistent fault cannot become a reset storm. */
+#if SOC_EMAC_SUPPORTED
+static int64_t s_emac_last_toggle_us = 0;
+static int64_t s_emac_last_restart_us = 0;
+
+/* Cheap attempt: receiver toggle and poll demand. */
+static void avb_emac_rx_toggle(int64_t now_us) {
+  EMAC_DMA.dmaoperation_mode.start_stop_rx = 0;
+  EMAC_MAC.gmacconfig.rx = 0;
+  esp_rom_delay_us(100);
+  EMAC_MAC.gmacconfig.rx = 1;
+  EMAC_DMA.dmaoperation_mode.start_stop_rx = 1;
+  EMAC_DMA.dmarxpolldemand = 1;
+  s_emac_toggle_count++;
+  s_emac_last_toggle_us = now_us;
+}
+
+/* After a toggle the pass count starts over, so a latch the toggle
+ * cannot clear kept the escalation from reaching the full reset
+ * (observed: 126 toggles over 43 s). A lockup seen again within 2 s of
+ * a toggle goes straight to it. */
+static bool avb_emac_rx_toggle_failed(int64_t now_us) {
+  return s_emac_last_toggle_us != 0 &&
+         now_us - s_emac_last_toggle_us < 2 * 1000 * 1000;
+}
+
+static bool avb_emac_rx_may_restart(int64_t now_us) {
+  return now_us - s_emac_last_restart_us > 10 * 1000 * 1000;
+}
+
+/* Full EMAC core reset; callers check avb_emac_rx_may_restart first.
+ * lockup and pointer_name only label the log line. */
+static void avb_emac_rx_full_reset(int64_t now_us, const char *lockup,
+                                   uint32_t status, const char *pointer_name,
+                                   uint32_t pointer) {
+  static bool warned_no_full_recover = false;
+  s_emac_last_restart_us = now_us;
+  /* Whether the RX task is stuck inside our callback, which no EMAC
+   * reset can clear. */
+  uint32_t callback_busy_ms = avb_emac_rx_cb_busy_ms();
+  if (emac_esp_rx_full_recover) {
+    s_emac_recover_count++;
+    esp_err_t err = emac_esp_rx_full_recover();
+    avbwarn("EMAC %s (dmastatus=0x%08lx %s=0x%08lx, rx callback busy "
+            "%lu ms): full EMAC reset %s",
+            lockup, (unsigned long)status, pointer_name,
+            (unsigned long)pointer, (unsigned long)callback_busy_ms,
+            err == ESP_OK ? "done" : "failed");
+    /* Pdelay responses lost to the lockup could have sprung the AVB
+     * Lite fallback latch; the restart re-arms it. */
+    if (err == ESP_OK)
+      ptpd_eth_rx_restarted();
+  } else if (!warned_no_full_recover) {
+    warned_no_full_recover = true;
+    avberr("EMAC %s (dmastatus=0x%08lx %s=0x%08lx): this ESP-IDF has no "
+           "full EMAC recovery, reception stays down until restart",
+           lockup, (unsigned long)status, pointer_name,
+           (unsigned long)pointer);
+  }
+}
+#endif
+
 void avb_emac_rx_unwedge_tick(void) {
 #if SOC_EMAC_SUPPORTED
   avb_emac_poll_drops();
   uint32_t status = EMAC_DMA.dmastatus.val;
   uint32_t recv_state = (status >> 17) & 0x7; /* RS, bits 19:17 */
+  int64_t now_us = esp_timer_get_time();
 
-  /* Case 1: Suspended (descriptor unavailable) = 100b */
+  /* Case 1: Suspended (descriptor unavailable) = 100b, escalating once
+   * the DMA's descriptor pointer has stayed put for 1 s. */
+  static uint32_t suspended_desc = 0;
+  static int64_t suspended_since_us = 0;
   if (recv_state == 4) {
     EMAC_DMA.dmarxpolldemand = 1;
     s_emac_kick_count++;
+    uint32_t cur_desc = EMAC_DMA.dmarxcurrdesc;
+    if (suspended_since_us == 0 || cur_desc != suspended_desc) {
+      suspended_desc = cur_desc;
+      suspended_since_us = now_us;
+    } else if (now_us - suspended_since_us >= 1000 * 1000) {
+      bool may_restart = avb_emac_rx_may_restart(now_us);
+      if (avb_emac_rx_toggle_failed(now_us) && may_restart) {
+        avb_emac_rx_full_reset(now_us, "RX DMA stuck suspended", status,
+                               "rxdesc", cur_desc);
+      } else if (!avb_emac_rx_toggle_failed(now_us)) {
+        avb_emac_rx_toggle(now_us);
+      }
+      suspended_since_us = now_us;
+    }
     return;
   }
+  suspended_since_us = 0;
 
   /* Case 2: Running-waiting (011b), latched overflow and a frozen RX
    * buffer pointer across consecutive passes. */
   static uint32_t last_rx_buf = 0;
   static uint32_t stagnant_passes = 0;
-  static int64_t last_restart_us = 0;
-  static int64_t last_toggle_us = 0;
-  static bool warned_no_full_recover = false;
   uint32_t cur_rx_buf = EMAC_DMA.dmarxcurraddr_buf;
   bool overflow_latched = (status & 0x10) != 0;
   if (recv_state == 3 && overflow_latched && cur_rx_buf == last_rx_buf) {
     stagnant_passes++;
-    int64_t now_us = esp_timer_get_time();
-    /* After a toggle the pass count starts over, so a latch the toggle
-     * cannot clear kept the escalation from reaching the full reset
-     * (observed: 126 toggles over 43 s). A lockup seen again within 2 s
-     * of a toggle goes straight to it. */
-    bool toggle_failed =
-        last_toggle_us != 0 && now_us - last_toggle_us < 2 * 1000 * 1000;
-    bool may_restart = now_us - last_restart_us > 10 * 1000 * 1000;
+    bool toggle_failed = avb_emac_rx_toggle_failed(now_us);
+    bool may_restart = avb_emac_rx_may_restart(now_us);
     if (stagnant_passes == 3 && !(toggle_failed && may_restart)) {
-      /* Cheap attempt: receiver toggle and poll demand. */
-      EMAC_DMA.dmaoperation_mode.start_stop_rx = 0;
-      EMAC_MAC.gmacconfig.rx = 0;
-      esp_rom_delay_us(100);
-      EMAC_MAC.gmacconfig.rx = 1;
-      EMAC_DMA.dmaoperation_mode.start_stop_rx = 1;
-      EMAC_DMA.dmarxpolldemand = 1;
-      s_emac_toggle_count++;
-      last_toggle_us = now_us;
+      avb_emac_rx_toggle(now_us);
     } else if (stagnant_passes >= 6 || stagnant_passes == 3) {
-      if (may_restart) {
-        last_restart_us = now_us;
-        if (emac_esp_rx_full_recover) {
-          s_emac_recover_count++;
-          esp_err_t err = emac_esp_rx_full_recover();
-          avbwarn("EMAC RX FIFO lockup (dmastatus=0x%08lx rxbuf=0x%08lx): "
-                  "full EMAC reset %s",
-                  (unsigned long)status, (unsigned long)cur_rx_buf,
-                  err == ESP_OK ? "done" : "failed");
-          /* Pdelay responses lost to the lockup could have sprung the
-           * AVB Lite fallback latch; the restart re-arms it. */
-          if (err == ESP_OK)
-            ptpd_eth_rx_restarted();
-        } else if (!warned_no_full_recover) {
-          warned_no_full_recover = true;
-          avberr("EMAC RX FIFO lockup (dmastatus=0x%08lx rxbuf=0x%08lx): "
-                 "this ESP-IDF has no full EMAC recovery, reception stays "
-                 "down until restart",
-                 (unsigned long)status, (unsigned long)cur_rx_buf);
-        }
-      }
+      if (may_restart)
+        avb_emac_rx_full_reset(now_us, "RX FIFO lockup", status, "rxbuf",
+                               cur_rx_buf);
       stagnant_passes = 0;
     }
   } else {
