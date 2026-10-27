@@ -264,7 +264,13 @@ static bool is_idle_task(const char *name) {
  * stack and the query walks the heap under its lock: on a bridge the tick
  * held off emac_rx for about 11 ms, longer than the RX ring lasts under a
  * Class B stream. */
+#if CONFIG_ESP_AVB_STATS_CPU_TABLE
+#define AVB_STATS_DEBUG 1
+#define cpu_table_log avbinfo
+#else
 #define AVB_STATS_DEBUG (LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG)
+#define cpu_table_log avbdebug
+#endif
 
 static void avb_cpu_stats_tick(void) {
   TaskStatus_t cur[AVB_STATS_MAX_TASKS];
@@ -282,9 +288,9 @@ static void avb_cpu_stats_tick(void) {
   }
 
   uint32_t idle0_delta = 0, idle1_delta = 0;
-  avbdebug("CPU-STATS: window=%lldms (%u tasks)", window_us / 1000,
+  cpu_table_log("CPU-STATS: window=%lldms (%u tasks)", window_us / 1000,
           (unsigned)cur_n);
-  avbdebug("  %-16s core prio  %%cpu  stackHW  state", "task");
+  cpu_table_log("  %-16s core prio  %%cpu  stackHW  state", "task");
 
   for (UBaseType_t i = 0; i < cur_n; i++) {
     /* Find matching prior entry by stable xTaskNumber. */
@@ -338,7 +344,7 @@ static void avb_cpu_stats_tick(void) {
       break;
     }
 
-    avbdebug("  %-16s %4s %4u  %3u%%  %7u  %s", cur[i].pcTaskName, core_s,
+    cpu_table_log("  %-16s %4s %4u  %3u%%  %7u  %s", cur[i].pcTaskName, core_s,
             (unsigned)cur[i].uxCurrentPriority, pct,
             (unsigned)cur[i].usStackHighWaterMark, state_s);
 
@@ -357,7 +363,7 @@ static void avb_cpu_stats_tick(void) {
       100 - (uint32_t)((uint64_t)idle0_delta * 100u / (uint64_t)window_us);
   uint32_t cpu1_busy =
       100 - (uint32_t)((uint64_t)idle1_delta * 100u / (uint64_t)window_us);
-  avbdebug("  ====> CPU0 busy=%u%% idle=%u%%  |  CPU1 busy=%u%% idle=%u%%",
+  cpu_table_log("  ====> CPU0 busy=%u%% idle=%u%%  |  CPU1 busy=%u%% idle=%u%%",
           cpu0_busy, 100 - cpu0_busy, cpu1_busy, 100 - cpu1_busy);
 
   /* Break AVB-OUT's CPU time down into "real work" vs. busy-wait spin.
@@ -368,7 +374,7 @@ static void avb_cpu_stats_tick(void) {
     uint64_t dwork = cur_work - s_prev_avbout_work_us;
     uint32_t work_pct =
         (uint32_t)((dwork * 100ull) / (uint64_t)window_us);
-    avbdebug("  ====> AVB-OUT real work=%u%% (rest of its slot is busy-wait)",
+    cpu_table_log("  ====> AVB-OUT real work=%u%% (rest of its slot is busy-wait)",
             work_pct);
   }
   s_prev_avbout_work_us = cur_work;
@@ -392,7 +398,7 @@ static void avb_cpu_stats_tick(void) {
   uint32_t rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other;
   avb_net_rx_breakdown(&rx_total, &rx_avtp, &rx_msrp, &rx_mvrp, &rx_vlan,
                        &rx_other);
-  avbdebug("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
+  cpu_table_log("  ====> RX breakdown total=%u avtp=%u msrp=%u mvrp=%u vlan=%u other=%u",
           rx_total, rx_avtp, rx_msrp, rx_mvrp, rx_vlan, rx_other);
 
   /* Hot-path cycle profile of the unified RX dispatcher (per stats
@@ -404,7 +410,13 @@ static void avb_cpu_stats_tick(void) {
                                 uint32_t *);
     uint32_t cbf, cbc, stf, stc;
     avb_net_rx_prof(&cbf, &cbc, &stf, &stc);
-    avbdebug("  ====> RX prof: cb=%u frames avg=%u cyc | stream=%u frames "
+    uint32_t drain_calls, drain_cycles, drain_write_cycles;
+    avb_stream_in_drain_prof(&drain_calls, &drain_cycles, &drain_write_cycles);
+    cpu_table_log("  ====> drain prof: %u calls avg=%u cyc, i2s write avg=%u cyc",
+                  (unsigned)drain_calls,
+                  (unsigned)(drain_calls ? drain_cycles / drain_calls : 0),
+                  (unsigned)(drain_calls ? drain_write_cycles / drain_calls : 0));
+    cpu_table_log("  ====> RX prof: cb=%u frames avg=%u cyc | stream=%u frames "
             "avg=%u cyc",
             cbf, cbf ? cbc / cbf : 0, stf, stf ? stc / stf : 0);
   }

@@ -14,6 +14,7 @@
 #include "driver/gptimer.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
+#include "esp_cpu.h"       /* drain cycle profile */
 #include "esp_heap_caps.h" /* largest free block when the jitter ring fails */
 #include "esp_log.h"
 #include "esp_task_wdt.h"
@@ -3081,7 +3082,27 @@ static void stream_in_drain_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+/* Drain cost per stats window (diagnostic, see avb_stream_in_drain_prof):
+ * calls, CPU cycles in the whole callback and in its I2S writes. */
+static uint32_t s_drain_prof_calls, s_drain_prof_cycles, s_drain_prof_write_cycles;
+
+void avb_stream_in_drain_prof(uint32_t *calls, uint32_t *cycles,
+                              uint32_t *write_cycles) {
+  *calls = s_drain_prof_calls;
+  *cycles = s_drain_prof_cycles;
+  *write_cycles = s_drain_prof_write_cycles;
+  s_drain_prof_calls = s_drain_prof_cycles = s_drain_prof_write_cycles = 0;
+}
+
+static void stream_in_drain_body(void *arg);
 static void stream_in_drain_cb(void *arg) {
+  uint32_t start = esp_cpu_get_cycle_count();
+  stream_in_drain_body(arg);
+  s_drain_prof_cycles += esp_cpu_get_cycle_count() - start;
+  s_drain_prof_calls++;
+}
+
+static void stream_in_drain_body(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
   if (!ctx)
     return;
@@ -3335,6 +3356,7 @@ static void stream_in_drain_cb(void *arg) {
 
   size_t bytes_written = 0;
   size_t w1 = 0;
+  uint32_t write_start = esp_cpu_get_cycle_count();
   i2s_channel_write(ctx->i2s_tx_handle, ctx->ring.buf + (t & mask),
                     first_chunk, &w1, 1);
   bytes_written += w1;
@@ -3352,6 +3374,7 @@ static void stream_in_drain_cb(void *arg) {
     mirror_push(ctx->ring.buf, (uint32_t)w2);
 #endif
   }
+  s_drain_prof_write_cycles += esp_cpu_get_cycle_count() - write_start;
   atomic_store_explicit(&ctx->ring.tail, t + (uint32_t)bytes_written,
                         memory_order_release);
   stream_in_slip_land(ctx);

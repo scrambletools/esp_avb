@@ -1301,6 +1301,10 @@ bool avb_crf_stream_valid(void);
 void avb_stream_in_print_diag(void);
 /* Print the listener's one-shot first-packet line if it is pending. */
 void avb_stream_in_print_first_packet(void);
+/* Listener drain cost since the last call (diagnostic): calls, CPU
+ * cycles in the drain, and in its I2S writes. Resets the counts. */
+void avb_stream_in_drain_prof(uint32_t *calls, uint32_t *cycles,
+                              uint32_t *write_cycles);
 /* Deferred drift sampler — called from AVB main's periodic loop.
  * Replaces the per-packet clock_gettime(CLOCK_PTP_SYSTEM) calls that
  * used to live in avb_stream_rx_handler / avb_crf_rx_handler and were

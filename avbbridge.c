@@ -242,6 +242,10 @@ void avb_stream_in_sample_drift(avb_state_s *state) { (void)state; }
 void avb_superfast_connect_start(avb_state_s *state) { (void)state; }
 void avb_stream_in_print_diag(void) {}
 void avb_stream_in_print_first_packet(void) {}
+void avb_stream_in_drain_prof(uint32_t *calls, uint32_t *cycles,
+                              uint32_t *write_cycles) {
+  *calls = *cycles = *write_cycles = 0;
+}
 void avb_stream_out_print_diag(void) {}
 uint64_t avb_stream_out_work_us_total(void) { return 0; }
 

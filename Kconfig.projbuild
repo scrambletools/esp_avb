@@ -618,6 +618,17 @@ menu "AVB Configuration"
             bench behind a free-running talker). Corrections beyond
             the clamp are treated as measurement error.
 
+    config ESP_AVB_STATS_CPU_TABLE
+        bool "Print the per-task CPU table every stats window"
+        default n
+        depends on ESP_AVB
+        help
+            Diagnostic builds. Every 10 s the AVB-STATS task logs each
+            task's CPU share, priority, core and stack high water mark,
+            plus per-core busy time. The task snapshot suspends the
+            scheduler for a few milliseconds, which a bridge forwarding
+            a Class B stream cannot afford.
+
     config ESP_AVB_PLL_APLL_FINE_SET
         bool "Retune the APLL by its fractional registers only"
         default y
