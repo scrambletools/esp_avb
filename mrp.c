@@ -607,9 +607,10 @@ typedef struct {
    * entirely until a LeaveAll cycles it out (minutes).
    * redeclare_after_us is the latest the quarantine can last, 0 = no
    * quarantine; holdoff_leaveall_base is the port's Talker LeaveAll
-   * count at the withdrawal. */
+   * count at the withdrawal, withdrawn_us its time. */
   int64_t redeclare_after_us;
   uint32_t holdoff_leaveall_base;
+  int64_t withdrawn_us;
   /* CVU idle-timeout stamp (avb_lite.md §6, Declaration timing):
    * refreshed on every RX of this attribute; with LeaveAll disabled
    * in AVB Lite this is the only staleness mechanism. */
@@ -2799,6 +2800,25 @@ static void mrp_tx_talker_value_leave(avb_state_s *state, int port,
 #endif
 #define MSRP_VALUE_CHANGE_LEAVEALLS 2
 
+/* A changed value that only shrinks the reservation (same stream,
+ * destination, VLAN and class, no larger frame or interval count): a
+ * bridge that keeps the old FirstValue reserves more than the stream
+ * needs and never polices it, so the two-LeaveAll wait buys nothing and
+ * the new value goes out after a LeaveTime. Measured on the MOTU: an
+ * 8-to-2-channel format change waited 21.6 s for its LeaveAlls. */
+static bool mrp_talker_value_shrinks(const talker_adv_info_s *old_info,
+                                     const talker_adv_info_s *new_info) {
+  talker_adv_info_s old_rest = *old_info, new_rest = *new_info;
+  memset(old_rest.tspec_max_frame_size, 0, 4); /* frame size and interval */
+  memset(new_rest.tspec_max_frame_size, 0, 4);
+  return memcmp(&old_rest, &new_rest, sizeof(old_rest)) == 0 &&
+         octets_to_uint(new_info->tspec_max_frame_size, 2) <=
+             octets_to_uint(old_info->tspec_max_frame_size, 2) &&
+         octets_to_uint(new_info->tspec_max_frame_interval, 2) <=
+             octets_to_uint(old_info->tspec_max_frame_interval, 2);
+}
+#define MSRP_VALUE_SHRINK_HOLDOFF_US (1500 * 1000)
+
 /* True once a changed Talker Advertise may be declared again. */
 static bool mrp_value_change_holdoff_over(int port,
                                           const msrp_talker_entry_t *e,
@@ -2889,16 +2909,20 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
        * registration down. */
       mrp_tx_talker_value_leave(state, port, e);
       mrp_tx_talker_value_leave(state, port, e);
-      e->redeclare_after_us =
-          esp_timer_get_time() + MSRP_VALUE_CHANGE_HOLDOFF_US;
+      bool shrinks = mrp_talker_value_shrinks(&e->wire.talker.info,
+                                              &fresh.talker.info);
+      int64_t holdoff_us =
+          shrinks ? MSRP_VALUE_SHRINK_HOLDOFF_US : MSRP_VALUE_CHANGE_HOLDOFF_US;
+      e->withdrawn_us = esp_timer_get_time();
+      e->redeclare_after_us = e->withdrawn_us + holdoff_us;
       e->holdoff_leaveall_base = s_talker_leaveall_count[port];
       avbinfo("MSRP: talker advertise value changed, withdrew MaxFrameSize "
-              "%u, declaring %u once the network has dropped it, at most "
-              "%d s",
+              "%u, declaring %u %s",
               (unsigned)octets_to_uint(e->wire.talker.info.tspec_max_frame_size,
                                        2),
               (unsigned)max_frame_size,
-              (int)(MSRP_VALUE_CHANGE_HOLDOFF_US / 1000000));
+              shrinks ? "after a LeaveTime, as the reservation only shrinks"
+                      : "once the network has dropped it");
     }
     mrp_sm_reset_for_new_value(&e->sm);
     e->wire = fresh;
@@ -2909,8 +2933,7 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
       return; /* periodic loop retries after the quarantine */
     avbinfo("MSRP: declaring the changed talker advertise %lld ms after "
             "the withdrawal, %lu Talker LeaveAlls heard",
-            (long long)((now_us - (e->redeclare_after_us -
-                                   MSRP_VALUE_CHANGE_HOLDOFF_US)) / 1000),
+            (long long)((now_us - e->withdrawn_us) / 1000),
             (unsigned long)(s_talker_leaveall_count[port] -
                             e->holdoff_leaveall_base));
     e->redeclare_after_us = 0;
