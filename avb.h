@@ -1289,7 +1289,8 @@ void avb_stream_in_sample_drift(avb_state_s *state);
 int avb_pll_init(uint32_t nominal_mclk_hz);
 /* Whether the APLL can produce mclk_hz the way avb_pll_init would set
  * it up; apll_hz receives the APLL frequency that would be programmed
- * (0 on targets without an APLL, where the check passes). */
+ * (0 on targets without an APLL, where the crystal must reach it with
+ * the I2S divider of 2 or more). */
 bool avb_pll_mclk_derivable(uint32_t mclk_hz, uint32_t *apll_hz);
 void avb_pll_deinit(void);
 /* Preload the persisted media-clock trim (persist v4) — call after

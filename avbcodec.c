@@ -248,13 +248,58 @@ static bool codec_caps_support_sample_rate(const avb_codec_caps_s *caps,
   return codec_plan_for_rate(caps, sample_rate, NULL) != NULL;
 }
 
+/* A limit of this chip rather than of the plan: an ESP32-C6 crystal
+ * cannot reach the 24.576 MHz the ES8311 plan lists for 96 kHz. */
+static const char s_reason_source_clock[] = "the crystal cannot produce this MCLK";
+
+/* Why a plan candidate cannot run, from arithmetic alone, or NULL when
+ * it can; apll_hz receives the APLL frequency it would program. */
+static const char *clock_candidate_reject_reason(
+    const avb_codec_caps_s *caps, const avb_codec_clock_plan_s *plan,
+    int candidate, uint32_t *apll_hz) {
+  const uint32_t bclk_per_fs = 2u * 32u; /* stereo 32-bit slots */
+  uint32_t bclk_hz = plan->sample_rate_hz * bclk_per_fs;
+  uint32_t mclk_hz = plan->mclk_hz[candidate];
+  *apll_hz = 0;
+  if (mclk_hz % bclk_hz != 0)
+    return "MCLK/BCLK is not an integer";
+  if (mclk_hz / bclk_hz < caps->min_mclk_bclk_ratio)
+    return "MCLK/BCLK below the codec floor";
+  if (mclk_hz > caps->max_mclk_hz)
+    return "MCLK above the codec ceiling";
+  if (caps->apply_clock && !plan->codec_data[candidate])
+    return "no codec clock row";
+  if (!avb_pll_mclk_derivable(mclk_hz, apll_hz)) {
+#if SOC_CLK_APLL_SUPPORTED
+    return "APLL cannot produce this MCLK";
+#else
+    return s_reason_source_clock;
+#endif
+  }
+  return NULL;
+}
+
+/* The rates the plan can run on this chip: a row whose every candidate
+ * is rejected is not offered, so no stream format promises it. */
 void avb_codec_plan_sample_rates(const avb_codec_caps_s *caps,
                                  avb_sample_rates_s *out) {
   memset(out, 0, sizeof(*out));
   size_t max_rates = sizeof(out->sample_rates) / sizeof(out->sample_rates[0]);
   for (uint8_t i = 0; i < caps->num_clock_plans && out->num_rates < max_rates;
        i++) {
-    out->sample_rates[out->num_rates++] = caps->clock_plan[i].sample_rate_hz;
+    const avb_codec_clock_plan_s *plan = &caps->clock_plan[i];
+    bool runnable = false;
+    for (int candidate = 0;
+         candidate < AVB_CODEC_MCLK_CANDIDATES && plan->mclk_hz[candidate];
+         candidate++) {
+      uint32_t apll_hz;
+      if (!clock_candidate_reject_reason(caps, plan, candidate, &apll_hz)) {
+        runnable = true;
+        break;
+      }
+    }
+    if (runnable)
+      out->sample_rates[out->num_rates++] = plan->sample_rate_hz;
   }
 }
 
@@ -307,22 +352,22 @@ esp_err_t avb_codec_validate_clock_plan(avb_state_s *state) {
       if (mclk_hz == 0)
         break;
       uint32_t apll_hz = 0;
-      const char *reason = NULL;
-      if (mclk_hz % bclk_hz != 0)
-        reason = "MCLK/BCLK is not an integer";
-      else if (mclk_hz / bclk_hz < caps->min_mclk_bclk_ratio)
-        reason = "MCLK/BCLK below the codec floor";
-      else if (mclk_hz > caps->max_mclk_hz)
-        reason = "MCLK above the codec ceiling";
-      else if (caps->apply_clock && !plan->codec_data[candidate])
-        reason = "no codec clock row";
-      else if (!avb_pll_mclk_derivable(mclk_hz, &apll_hz))
-        reason = "APLL cannot produce this MCLK";
+      const char *reason =
+          clock_candidate_reject_reason(caps, plan, candidate, &apll_hz);
       bool running = mclk_hz == state->codec_mclk_hz &&
                      plan->sample_rate_hz == state->config.default_sample_rate;
       uint32_t bit_index =
           (uint32_t)row * AVB_CODEC_MCLK_CANDIDATES + (uint32_t)candidate;
-      if (reason) {
+      if (reason == s_reason_source_clock) {
+        /* Not a plan fault: the candidate is skipped and, when it was
+         * the rate's only one, the rate is not advertised. */
+        if (bit_index < 32)
+          state->clock_plan_invalid_mask |= 1u << bit_index;
+        ESP_LOGI(TAG, "clock plan: %lu Hz from MCLK %lu Hz (%lu fs) not on this "
+                 "chip: %s",
+                 (unsigned long)plan->sample_rate_hz, (unsigned long)mclk_hz,
+                 (unsigned long)(mclk_hz / plan->sample_rate_hz), reason);
+      } else if (reason) {
         rejected++;
         if (bit_index < 32)
           state->clock_plan_invalid_mask |= 1u << bit_index;
@@ -345,7 +390,13 @@ esp_err_t avb_codec_validate_clock_plan(avb_state_s *state) {
     ESP_LOGW(TAG, "clock plan: %d candidate(s) rejected, see above", rejected);
     return ESP_FAIL;
   }
-  ESP_LOGI(TAG, "clock plan: all %u rates check out", caps->num_clock_plans);
+  avb_sample_rates_s offered;
+  avb_codec_plan_sample_rates(caps, &offered);
+  if (offered.num_rates < caps->num_clock_plans)
+    ESP_LOGI(TAG, "clock plan: %u of %u rates run on this chip",
+             (unsigned)offered.num_rates, caps->num_clock_plans);
+  else
+    ESP_LOGI(TAG, "clock plan: all %u rates check out", caps->num_clock_plans);
   return ESP_OK;
 }
 

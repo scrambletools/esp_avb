@@ -42,6 +42,7 @@
  *      SoC-independent.
  */
 #include "avb.h"
+#include "esp_clk_tree.h" /* XTAL frequency for the no-APLL MCLK check */
 #include "esp_timer.h"
 #include "hal/clk_tree_hal.h" /* clk_hal_apll_get_freq_hz readback */
 #include "hal/clk_tree_ll.h" /* CLK_LL_APLL_MIN_HZ */
@@ -165,8 +166,15 @@ bool avb_pll_mclk_derivable(uint32_t mclk_hz, uint32_t *apll_hz) {
     *apll_hz = real_hz;
   return true;
 #else
-  /* XTAL-derived MCLK: the I2S driver picks the nearest divider. */
-  return true;
+  /* XTAL-derived MCLK: the I2S driver wants a source/MCLK divider of at
+   * least 2 (i2s_std_calculate_clock), so a 40 MHz crystal tops out at
+   * 20 MHz and 24.576 MHz fails the reclock at run time. */
+  uint32_t xtal_hz = 0;
+  if (esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_XTAL,
+                                   ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED,
+                                   &xtal_hz) != ESP_OK)
+    return false;
+  return (uint64_t)mclk_hz * 2u <= xtal_hz;
 #endif
 }
 
