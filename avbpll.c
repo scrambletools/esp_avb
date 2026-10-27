@@ -326,6 +326,7 @@ static struct {
   bool stream_ref_phase; /* sensing presentation phase, see read_sample */
   /* Held-trim refinement from the talker's ADC, see avb_pll_tick. */
   int64_t adc_window_start_us; /* 0 = no averaging window */
+  int64_t adc_last_us;         /* last tick that read the ADC error */
   int64_t adc_sum_q16;
   uint32_t adc_samples;
   bool adc_refine_landing; /* persist the trim when that slew lands */
@@ -1306,15 +1307,22 @@ void avb_pll_tick(avb_state_s *state) {
     int32_t adc_q16 = state->media_clock.talker_adc_error_ppm_q8 * 256;
     bool fresh = stamp_ms != 0 &&
                  (uint32_t)(now_us / 1000) - stamp_ms < AVB_PLL_ADC_STALE_MS;
-    if (!fresh) {
+    /* Nothing reads the error while the clock follows a stream instead
+     * of holding, so a window left open then ran out unseen: the first
+     * reading after the hold came back closed it alone (observed: 1
+     * reading of -5.6 ppm, 26 s after a talker start, moved the trim
+     * 5 ppm). Such a window starts over. */
+    bool resumed = now_us - s_pll.adc_last_us > AVB_PLL_ADC_STALE_MS * 1000LL;
+    s_pll.adc_last_us = now_us;
+    if (!fresh || resumed)
       s_pll.adc_window_start_us = 0;
-    } else if (s_pll.adc_window_start_us == 0) {
+    if (fresh && s_pll.adc_window_start_us == 0) {
       /* A talker start, a gap, or a landed move (the slew above
        * returns until then): skip the settling. */
       s_pll.adc_window_start_us = now_us + AVB_PLL_ADC_REFINE_SETTLE_US;
       s_pll.adc_sum_q16 = 0;
       s_pll.adc_samples = 0;
-    } else if (now_us >= s_pll.adc_window_start_us) {
+    } else if (fresh && now_us >= s_pll.adc_window_start_us) {
       s_pll.adc_sum_q16 += adc_q16;
       s_pll.adc_samples++;
     }
