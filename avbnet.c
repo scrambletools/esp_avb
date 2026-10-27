@@ -1143,6 +1143,8 @@ void avb_wifi_bundle_rx_stats(uint32_t *bundles, uint32_t *frames,
 #endif
 #define WIFI_BUNDLE_HOLD 32
 #define WIFI_BUNDLE_HOLD_US CONFIG_ESP_AVB_WIFI_RETX_HOLD_MAX_US
+/* Held this long past their deadline, bundles belong to a stopped run. */
+#define WIFI_BUNDLE_STALE_US 200000
 /* A NACK and its answer each cross a loaded FIFO; repeating sooner only
  * duplicates the answer still on its way. */
 #define WIFI_NACK_REPEAT_US 15000
@@ -1418,8 +1420,15 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
     return;
   }
   memcpy(rx->peer, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
+  /* Bundles held past a gap when the stream stopped wait for its next
+   * bundle where no hold timer runs (the bridge): its sender keeps the
+   * bundle sequence across runs, so they went out ahead of the next
+   * run's first frame, minutes late (seen: 5 frames of the previous run
+   * before seq 0 at the listener). Too late to play: drop them. */
+  bool stale = rx->held_count && rx->deadline_us &&
+               now_us - rx->deadline_us > WIFI_BUNDLE_STALE_US;
   int16_t ahead = rx->seeded ? (int16_t)(seq - rx->expected) : 0;
-  if (!rx->seeded || ahead > 64 || ahead < -64) {
+  if (!rx->seeded || stale || ahead > 64 || ahead < -64) {
     /* First bundle, or the sender restarted: start over. */
     if (rx->seeded)
       wifi_gap_hist_add(UINT16_MAX);
