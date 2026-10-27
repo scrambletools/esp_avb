@@ -2919,7 +2919,7 @@ static void stream_in_slip_land(stream_rx_ctx_t *ctx) {
 static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
   int32_t ppm_q16 = avb_pll_software_rate_ppm_q16();
   /* A few slips a second need no finer timing than every eighth drain
-   * pass (the single-core drain runs every fourth DMA buffer). A held
+   * pass (the single-core drain runs once per DMA buffer). A held
    * clock's slips come from stream_in_held_slip instead. */
   if (ppm_q16 == 0 || ctx->state->media_clock.stream_ref_held ||
       (++ctx->slip_passes & 7) != 0)
@@ -3068,7 +3068,7 @@ static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
  * burst the drain waited past the ~2 ms of audio queued in the TX DMA
  * and the DAC played silence without consuming the ring (measured
  * ~0.1 % of playback, and the ring then overflowed). This task sits
- * above Wi-Fi and is woken by every fourth TX DMA completion; its work
+ * above Wi-Fi and is woken by each TX DMA completion; its work
  * is a few microseconds a millisecond. */
 static void stream_in_drain_task(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;

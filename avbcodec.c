@@ -407,12 +407,12 @@ static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_written,
                             (uint64_t)event->size, memory_order_relaxed);
-  /* Wake the drain every fourth buffer: once per buffer cost a
-   * single-core station 15 % of its CPU in context switches, and the
-   * DMA holds 8 ms, so half a millisecond between refills is ample. */
-  static uint32_t s_tx_buffers;
+  /* Wake the drain once per 24-frame buffer, half a millisecond at
+   * 48 kHz: with 6-frame buffers a wake per buffer cost a single-core
+   * station 15 % of its CPU in context switches, so it woke every
+   * fourth, and the DMA holds far more than that. */
   TaskHandle_t drain = (TaskHandle_t)state->media_clock.drain_task;
-  if (drain && (++s_tx_buffers & 3) == 0) {
+  if (drain) {
     BaseType_t woken = pdFALSE;
     vTaskNotifyGiveFromISR(drain, &woken);
     return woken == pdTRUE;
@@ -497,16 +497,17 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   /* DMA pool must exceed one 1 ms drain period of audio at the highest
    * rate, or i2s_channel_write can never fit a full drain batch and the
    * excess is dropped at the jitter-ring write (measured ~16% sample
-   * loss at 192 kHz with the old 16-descriptor / 1 KB pool). Keep the
-   * small 6-frame descriptors — empirically, raising dma_frame_num to
-   * 24 (192 B buffers) silenced the DAC entirely at 192 kHz (cause not
-   * yet understood; 64 B buffers are proven) — and scale the descriptor
-   * COUNT instead: 64 × 64 B = 4 KB ≈ 2.7 ms at 192 kHz stereo
+   * loss at 192 kHz with the old 16-descriptor / 1 KB pool). Each buffer
+   * costs an interrupt in both directions and a wait in the drain's
+   * write: 6-frame buffers at 192 kHz took 64,000 interrupts a second
+   * and a third of core 0 in the drain, which starved gPTP on a v1.x P4
+   * listener (its Pdelay replies went unread and it fell into AVB Lite).
+   * 24 frames: 32 x 192 B = 6 KB, about 4 ms at 192 kHz stereo
    * 24-in-32. The listener drain in avtp.c runs as an esp_timer 1 ms
    * task that calls i2s_channel_write; the I2S driver paces playout at
    * the DAC rate. */
-  chan_cfg.dma_frame_num = 6;
-  chan_cfg.dma_desc_num = 64;
+  chan_cfg.dma_frame_num = 24;
+  chan_cfg.dma_desc_num = 32;
   ESP_ERROR_CHECK(
       i2s_new_channel(&chan_cfg, &state->i2s_tx_handle, &state->i2s_rx_handle));
   i2s_std_config_t std_cfg = {
