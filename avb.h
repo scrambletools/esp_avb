@@ -228,7 +228,7 @@ static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
 #define AEM_NUM_CONTROLS 4          // IDENTIFY, Speaker Volume, Mic Gain, Test Tone
 #define AEM_CONTROL_TEST_TONE 3     // control index of the talker's test tone
 #define AEM_MAX_NUM_SAMPLE_RATES 10 // max number of sample rates
-#define AEM_MAX_NUM_FORMATS 32      // AM824 + AAF 32/24 at two cadences and 8/2 channels, 5 rates
+#define AEM_MAX_NUM_FORMATS 35      // 8 ch at 5 rates: AM824 + AAF 32/24 at two cadences and 8/2 channels
 #define AEM_MAX_NUM_MAPPINGS                                                   \
   10 // max number of mappings per map descriptor (spec max is 62)
 #define AEM_MAX_NUM_CLOCK_SOURCES                                              \

@@ -16,6 +16,8 @@
 #endif
 _Static_assert(AECP_MAX_AS_PATH_COUNT >= PTP_PATH_TRACE_MAX_CLOCKS + 1,
                "AS path response must hold the received path plus this clock");
+_Static_assert(sizeof(aem_stream_desc_s) <= AEM_MAX_DESC_LEN,
+               "stream descriptor with every format must fit descriptor_data");
 #include "esp_timer.h" /* connected-listener liveness stamps */
 #include <stddef.h>    /* offsetof */
 
