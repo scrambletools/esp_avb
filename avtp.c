@@ -2392,6 +2392,22 @@ typedef struct {
   int32_t phase_slipped; /* ring bytes: + dropped, - repeated */
   volatile uint32_t slip_drops;
   volatile uint32_t slip_repeats;
+  /* A frame slip in progress (see stream_in_slip_frame): direction
+   * (+1 drop, -1 repeat, 0 none), fade length and frames faded so far,
+   * the ring position of the next frame to fade, and for a repeat the
+   * original samples of the frame before it. */
+  int8_t slip_dir;
+  uint32_t slip_frames;
+  uint32_t slip_done;
+  uint32_t slip_pos;
+  int32_t slip_prev[2];
+  /* Held-clock drift slips (see stream_in_held_slip): the filtered
+   * continuous phase, the phase it is held to, and timing. */
+  bool held_valid;
+  int64_t held_filt_ns;
+  int64_t held_ref_ns;
+  int64_t held_settle_us;
+  int64_t held_last_slip_us;
   /* Phase statistics per stats window: playout time less presentation
    * time (plus the extra latency), and the audio buffered ahead of the
    * DAC. The printer sets phase_reset to start a new window. */
@@ -2628,6 +2644,8 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
   ctx->phase_slipped = 0;
   ctx->slip_owed = 0;
   ctx->slip_played = ctx->phase_lock_played;
+  ctx->slip_dir = 0;
+  ctx->held_valid = false;
   ctx->phase_valid = true;
   atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
                             memory_order_relaxed);
@@ -2687,13 +2705,12 @@ static inline void ring_sample_put(uint8_t *buf, uint32_t mask, uint32_t pos,
 /* Ring frames are two 32-bit big-endian slots holding 24 bits. */
 #define STREAM_FRAME_BYTES 8
 
-#if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0 || \
-    CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S > 0
 /* A trim joins the audio at the tail to the audio surplus_bytes later,
  * a step in the waveform that clicks. Crossfade the join instead: the
  * frames after the new tail fade from what would have played into what
  * now plays. Backwards, because with a trim shorter than the fade the
- * frames written are still to be read as the outgoing audio. */
+ * frames written are still to be read as the outgoing audio. A one
+ * frame slip uses it too. */
 #define STREAM_TRIM_CROSSFADE_US 2000
 static void stream_trim_crossfade(stream_rx_ctx_t *ctx, uint32_t tail,
                                   uint32_t surplus_bytes, uint32_t after_bytes) {
@@ -2718,7 +2735,6 @@ static void stream_trim_crossfade(stream_rx_ctx_t *ctx, uint32_t tail,
     }
   }
 }
-#endif
 
 /* Adaptive playout latency. Audio that arrives after its slot leaves
  * the DAC playing silence and playout that much later; the listener
@@ -2732,7 +2748,7 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
                                    int32_t ahead_us, uint32_t unit) {
 #if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0 || \
     CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S > 0
-  if (ctx->diag_gate_mode != 1)
+  if (ctx->diag_gate_mode != 1 || ctx->slip_dir != 0)
     return;
   int64_t window_s = ctx->state->port[0].medium == avb_port_medium_wifi_ftm
                          ? CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
@@ -2778,6 +2794,121 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
 #endif
 }
 
+/* One frame slip at the ring tail, faded in as the frames reach the
+ * drain: a drop runs playout one frame ahead, a repeat one frame behind.
+ * A bare slip is a step in the waveform. Over STREAM_SLIP_FADE_US each
+ * frame is blended with its neighbour by a share growing from 0 to 1, a
+ * fractional delay walked from 0 to 1 frame, and the frame skipped or
+ * repeated where the walk ends (stream_in_slip_fade, stream_in_slip_cap
+ * and stream_in_slip_land in the drain). The fade covers whatever is
+ * buffered, so it is as smooth at 2 ms of playout as at 40. Returns
+ * false while a slip is still in progress. */
+#define STREAM_SLIP_FADE_US 10000
+static bool stream_in_slip_frame(stream_rx_ctx_t *ctx, bool drop,
+                                 uint32_t unit) {
+  (void)unit;
+  if (ctx->slip_dir != 0 || ctx->ring_bytes_per_sec == 0)
+    return false;
+  uint32_t frames = (uint32_t)(((uint64_t)ctx->ring_bytes_per_sec *
+                                STREAM_SLIP_FADE_US / 1000000ULL) /
+                               STREAM_FRAME_BYTES);
+  if (frames < 1)
+    frames = 1;
+  ctx->slip_frames = frames;
+  ctx->slip_done = 0;
+  ctx->slip_pos = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  ctx->slip_prev[0] = ctx->slip_prev[1] = 0;
+  ctx->slip_dir = drop ? 1 : -1;
+  return true;
+}
+
+/* Fade the frames of the slip in progress that have arrived, in place.
+ * A drop blends frame k with frame k+1 (which must have arrived), a
+ * repeat with the original frame k-1. */
+static void stream_in_slip_fade(stream_rx_ctx_t *ctx) {
+  if (ctx->slip_dir == 0)
+    return;
+  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  if ((int32_t)(ctx->slip_pos - tail) < 0) {
+    /* Something else moved the tail past it (a relock or a trim). */
+    ctx->slip_dir = 0;
+    return;
+  }
+  uint8_t *buf = ctx->ring.buf;
+  uint32_t mask = ctx->ring.capacity - 1;
+  uint32_t head = atomic_load_explicit(&ctx->ring.head, memory_order_acquire);
+  int64_t frames = ctx->slip_frames;
+  while (ctx->slip_done < ctx->slip_frames) {
+    uint32_t pos = ctx->slip_pos;
+    uint32_t need = ctx->slip_dir > 0 ? 2 * STREAM_FRAME_BYTES : STREAM_FRAME_BYTES;
+    if ((int32_t)(head - pos) < (int32_t)need)
+      break;
+    int64_t done = ctx->slip_done;
+    for (int ch = 0; ch < 2; ch++) {
+      int64_t current = ring_sample_get(buf, mask, pos + ch * 4);
+      int32_t blended;
+      if (ctx->slip_dir > 0) {
+        int64_t next = ring_sample_get(buf, mask, pos + STREAM_FRAME_BYTES + ch * 4);
+        blended = (int32_t)((current * (frames - done) + next * (done + 1)) /
+                            (frames + 1));
+      } else {
+        blended = (int32_t)((current * (frames - done) +
+                             (int64_t)ctx->slip_prev[ch] * done) /
+                            frames);
+        ctx->slip_prev[ch] = (int32_t)current;
+      }
+      ring_sample_put(buf, mask, pos + ch * 4, blended);
+    }
+    ctx->slip_pos = pos + STREAM_FRAME_BYTES;
+    ctx->slip_done++;
+  }
+}
+
+/* The drain may write only faded frames while a slip runs, and must stop
+ * where it lands: returns the bytes it may write from the tail. */
+static uint32_t stream_in_slip_cap(const stream_rx_ctx_t *ctx, uint32_t tail,
+                                   uint32_t to_read, uint32_t unit) {
+  if (ctx->slip_dir == 0)
+    return to_read;
+  uint32_t faded = ctx->slip_pos - tail;
+  if (ctx->slip_done == ctx->slip_frames)
+    return to_read < faded ? to_read : faded; /* the landing point */
+  if (to_read > faded)
+    to_read = faded - faded % unit;
+  return to_read;
+}
+
+/* At the landing point, skip the frame a drop leaves out, or play the
+ * last faded-over original again for a repeat. */
+static void stream_in_slip_land(stream_rx_ctx_t *ctx) {
+  if (ctx->slip_dir == 0 || ctx->slip_done != ctx->slip_frames)
+    return;
+  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  if (tail != ctx->slip_pos)
+    return;
+  if (ctx->slip_dir > 0) {
+    if (ring_readable(&ctx->ring) < STREAM_FRAME_BYTES)
+      return;
+    atomic_store_explicit(&ctx->ring.tail, tail + STREAM_FRAME_BYTES,
+                          memory_order_release);
+    ctx->phase_slipped += STREAM_FRAME_BYTES;
+    ctx->slip_drops++;
+  } else {
+    /* The slot behind the tail has played; the producer is not near it
+     * while the ring has room to spare. */
+    if (ring_writable(&ctx->ring) < 1024)
+      return;
+    uint32_t mask = ctx->ring.capacity - 1;
+    uint32_t new_tail = tail - STREAM_FRAME_BYTES;
+    for (int ch = 0; ch < 2; ch++)
+      ring_sample_put(ctx->ring.buf, mask, new_tail + ch * 4, ctx->slip_prev[ch]);
+    atomic_store_explicit(&ctx->ring.tail, new_tail, memory_order_release);
+    ctx->phase_slipped -= STREAM_FRAME_BYTES;
+    ctx->slip_repeats++;
+  }
+  ctx->slip_dir = 0;
+}
+
 /* Software rate correction where the audio clock cannot be tuned
  * (avb_pll_software_rate_ppm_q16): the media-clock loop's correction is
  * paid out as single-frame slips at the ring tail, dropping a frame to
@@ -2787,8 +2918,10 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
 static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
   int32_t ppm_q16 = avb_pll_software_rate_ppm_q16();
   /* A few slips a second need no finer timing than every eighth drain
-   * pass (the single-core drain runs every fourth DMA buffer). */
-  if (ppm_q16 == 0 || (++ctx->slip_passes & 7) != 0)
+   * pass (the single-core drain runs every fourth DMA buffer). A held
+   * clock's slips come from stream_in_held_slip instead. */
+  if (ppm_q16 == 0 || ctx->state->media_clock.stream_ref_held ||
+      (++ctx->slip_passes & 7) != 0)
     return;
   uint64_t played = stream_in_played(ctx);
   uint32_t frames = (uint32_t)(played - ctx->slip_played) / STREAM_FRAME_BYTES;
@@ -2802,29 +2935,71 @@ static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
     ctx->slip_owed = 4 * one_frame;
   if (ctx->slip_owed < -4 * one_frame)
     ctx->slip_owed = -4 * one_frame;
-  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
   if (ctx->slip_owed >= one_frame) {
-    if (ring_readable(&ctx->ring) < unit + STREAM_FRAME_BYTES)
-      return;
-    atomic_store_explicit(&ctx->ring.tail, tail + STREAM_FRAME_BYTES,
-                          memory_order_release);
-    ctx->phase_slipped += STREAM_FRAME_BYTES;
-    ctx->slip_owed -= one_frame;
-    ctx->slip_drops++;
+    if (stream_in_slip_frame(ctx, true, unit))
+      ctx->slip_owed -= one_frame;
   } else if (ctx->slip_owed <= -one_frame) {
-    /* The repeated frame goes just before the tail, into space the
-     * producer is not near while the ring has room to spare. */
-    if (ring_readable(&ctx->ring) < STREAM_FRAME_BYTES ||
-        ring_writable(&ctx->ring) < 1024)
-      return;
-    uint32_t mask = ctx->ring.capacity - 1;
-    uint32_t new_tail = tail - STREAM_FRAME_BYTES;
-    for (uint32_t i = 0; i < STREAM_FRAME_BYTES; i++)
-      ctx->ring.buf[(new_tail + i) & mask] = ctx->ring.buf[(tail + i) & mask];
-    atomic_store_explicit(&ctx->ring.tail, new_tail, memory_order_release);
-    ctx->phase_slipped -= STREAM_FRAME_BYTES;
-    ctx->slip_owed += one_frame;
-    ctx->slip_repeats++;
+    if (stream_in_slip_frame(ctx, false, unit))
+      ctx->slip_owed += one_frame;
+  }
+}
+
+/* A listener whose entity streams too holds its own clock (avb_pll,
+ * stream_ref_hold), so the DAC drifts against the input stream by the
+ * two clocks' difference, a few ppm, and the playout ring drained into
+ * an underrun or filled into a trim. Hold the playout phase with frame
+ * slips instead: the continuous phase (steps taken out), filtered over
+ * a few seconds, is kept within a frame and a half of where it settled;
+ * a step beyond STREAM_HELD_REANCHOR_NS is an outage or trim, not
+ * drift, and moves the reference. */
+#define STREAM_HELD_FILTER_SHIFT 7 /* 128 phase ticks, ~2.6 s */
+#define STREAM_HELD_SETTLE_US 3000000
+#define STREAM_HELD_REANCHOR_NS 2000000
+#define STREAM_HELD_MIN_GAP_US 40000
+static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
+                                uint32_t unit) {
+  avb_state_s *state = ctx->state;
+  int64_t now_us = esp_timer_get_time();
+  if (!state->media_clock.stream_ref_held || ctx->ring_bytes_per_sec == 0) {
+    ctx->held_valid = false;
+    return;
+  }
+  if (!ctx->held_valid) {
+    ctx->held_valid = true;
+    ctx->held_filt_ns = continuous_ns;
+    ctx->held_ref_ns = continuous_ns;
+    ctx->held_settle_us = now_us + STREAM_HELD_SETTLE_US;
+    ctx->held_last_slip_us = 0;
+    return;
+  }
+  ctx->held_filt_ns += (continuous_ns - ctx->held_filt_ns) >>
+                       STREAM_HELD_FILTER_SHIFT;
+  if (now_us < ctx->held_settle_us) {
+    ctx->held_ref_ns = ctx->held_filt_ns;
+    return;
+  }
+  int64_t error_ns = ctx->held_filt_ns - ctx->held_ref_ns;
+  if (error_ns > STREAM_HELD_REANCHOR_NS ||
+      error_ns < -STREAM_HELD_REANCHOR_NS) {
+    ctx->held_ref_ns = ctx->held_filt_ns;
+    return;
+  }
+  int64_t frame_ns = (int64_t)STREAM_FRAME_BYTES * 1000000000LL /
+                     ctx->ring_bytes_per_sec;
+  int64_t threshold_ns = frame_ns * 3 / 2;
+  if (threshold_ns < 20000)
+    threshold_ns = 20000;
+  if (now_us - ctx->held_last_slip_us < STREAM_HELD_MIN_GAP_US)
+    return;
+  /* Late playout drops a frame, early playout repeats one; the filter
+   * takes the slip's known effect at once so it is not paid twice. */
+  if (error_ns > threshold_ns && stream_in_slip_frame(ctx, true, unit)) {
+    ctx->held_filt_ns -= frame_ns;
+    ctx->held_last_slip_us = now_us;
+  } else if (error_ns < -threshold_ns &&
+             stream_in_slip_frame(ctx, false, unit)) {
+    ctx->held_filt_ns += frame_ns;
+    ctx->held_last_slip_us = now_us;
   }
 }
 
@@ -2842,6 +3017,10 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
     return;
   if (ctx->diag_gate_mode == 1) {
     stream_in_phase_publish(ctx, phase_ns);
+    if (ahead_us >= 1000)
+      stream_in_held_slip(ctx, (int64_t)phase_ns - ctx->phase_steps_ns, unit);
+    else
+      ctx->held_valid = false;
     /* Only while audio is buffered: through an outage the DAC plays
      * silence and the phase climbs by the outage itself. */
     if (ahead_us >= 1000)
@@ -3092,6 +3271,8 @@ static void stream_in_drain_cb(void *arg) {
                       : 8;
   stream_in_phase_tick(ctx, unit);
   stream_in_rate_slip(ctx, unit);
+  stream_in_slip_land(ctx);
+  stream_in_slip_fade(ctx);
   uint32_t avail = ring_readable(&ctx->ring);
   if (avail < unit) {
     /* Empty ring is NORMAL at thin (presentation-time) fill: the
@@ -3143,6 +3324,9 @@ static void stream_in_drain_cb(void *arg) {
    * up to two contiguous segments (split at ring wrap). Saves the
    * intermediate ring_read copy. */
   uint32_t t = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  to_read = stream_in_slip_cap(ctx, t, to_read, unit);
+  if (to_read == 0)
+    return;
   uint32_t mask = ctx->ring.capacity - 1;
   uint32_t first_chunk = ctx->ring.capacity - (t & mask);
   if (first_chunk > to_read)
@@ -3170,6 +3354,7 @@ static void stream_in_drain_cb(void *arg) {
   }
   atomic_store_explicit(&ctx->ring.tail, t + (uint32_t)bytes_written,
                         memory_order_release);
+  stream_in_slip_land(ctx);
   ctx->drain_count++;
   /* Stream-reference pair for the media-clock PLL, see avb.h. */
   if (ctx->state && bytes_written > 0) {

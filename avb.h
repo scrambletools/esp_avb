@@ -890,6 +890,10 @@ typedef struct avb_state_s {
      * so the PLL re-seeds instead of reading the step as a rate. */
     _Atomic uint64_t stream_bytes_received;
     _Atomic uint32_t stream_ref_epoch;
+    /* The listener holds this entity's clock instead of following its
+     * input (avb_pll stream_ref_hold): the drain then holds the playout
+     * phase with frame slips. */
+    volatile bool stream_ref_held;
     /* Stream-reference sample pair, published by the 1 ms drain right
      * after its I2S write so both counters are read at the same phase
      * of the I2S queue (sampling them at the PLL tick instead read the

@@ -551,12 +551,13 @@ static bool stream_ref_active(avb_state_s *state) {
                        AVB_CLOCK_SOURCE_INTERNAL &&
                    !avb_crf_stream_valid();
   bool hold = candidate && stream_ref_hold(state);
+  state->media_clock.stream_ref_held = hold;
   static bool s_hold_logged;
   if (hold != s_hold_logged) {
     s_hold_logged = hold;
     ESP_LOGI(TAG, "%s",
              hold ? "this entity streams too, holding the internal clock "
-                    "instead of following its input stream"
+                    "and slipping frames to follow its input stream"
                   : "stream reference no longer held");
   }
   return candidate && !hold;
