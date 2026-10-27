@@ -3837,16 +3837,14 @@ bool avb_stream_in_buffered_us(const uint8_t *stream_id, int32_t *buffered_us) {
   return true;
 }
 
-/* Print stream-in diagnostics — called from AVB main loop (safe for UART).
- * One-shot: prints first-packet info once, then suppressed. */
-void avb_stream_in_print_diag(void) {
+/* One-shot "first packet received" line: the handler captured the
+ * details silently into ctx fields and AVB-STATS prints them within a
+ * few hundred ms, so the line's time stamp marks when audio arrived and
+ * UART I/O never touches the hot path. */
+void avb_stream_in_print_first_packet(void) {
   stream_rx_ctx_t *ctx = s_stream_rx_ctx;
   if (!ctx)
     return;
-
-  /* One-shot "first packet received" snapshot — handler captured the
-   * details silently into ctx fields; we print from the main loop so
-   * UART I/O never touches the hot path. */
   if (ctx->diag_captured == 1) {
     ctx->diag_captured = 2;
     avbinfo("STREAM: first packet sub=%d sdl=%d ch=%d samp=%d i2s=%d "
@@ -3858,6 +3856,15 @@ void avb_stream_in_print_diag(void) {
             ctx->diag_first_audio[5], ctx->diag_first_audio[6],
             ctx->diag_first_audio[7]);
   }
+}
+
+/* Print stream-in diagnostics — called from AVB-STATS at the window
+ * cadence (safe for UART). */
+void avb_stream_in_print_diag(void) {
+  stream_rx_ctx_t *ctx = s_stream_rx_ctx;
+  if (!ctx)
+    return;
+  avb_stream_in_print_first_packet();
 
   /* Per-window drain-health + counters snapshot. Deltas per-window.
    * Read the volatile counters directly — no atomics because SPSC with

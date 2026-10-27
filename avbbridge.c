@@ -241,6 +241,7 @@ int64_t avb_stream_in_last_rx_us(avb_state_s *state, uint16_t index) {
 void avb_stream_in_sample_drift(avb_state_s *state) { (void)state; }
 void avb_superfast_connect_start(avb_state_s *state) { (void)state; }
 void avb_stream_in_print_diag(void) {}
+void avb_stream_in_print_first_packet(void) {}
 void avb_stream_out_print_diag(void) {}
 uint64_t avb_stream_out_work_us_total(void) { return 0; }
 

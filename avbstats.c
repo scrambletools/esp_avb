@@ -528,7 +528,14 @@ static void avb_cpu_stats_task(void *arg) {
   vTaskDelay(pdMS_TO_TICKS(5000));
   avb_cpu_stats_tick(); /* seed baseline */
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(AVB_STATS_WINDOW_MS));
+    /* Between windows, poll the listener's one-shot first-packet line
+     * so it prints when audio arrives, not up to a window later. */
+    TickType_t window_start = xTaskGetTickCount();
+    while (xTaskGetTickCount() - window_start <
+           pdMS_TO_TICKS(AVB_STATS_WINDOW_MS)) {
+      vTaskDelay(pdMS_TO_TICKS(250));
+      avb_stream_in_print_first_packet();
+    }
     avb_cpu_stats_tick();
   }
 }

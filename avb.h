@@ -1295,6 +1295,8 @@ uint16_t avb_get_crf_output_index(avb_state_s *state);
 int32_t avb_pll_software_rate_ppm_q16(void);
 bool avb_crf_stream_valid(void);
 void avb_stream_in_print_diag(void);
+/* Print the listener's one-shot first-packet line if it is pending. */
+void avb_stream_in_print_first_packet(void);
 /* Deferred drift sampler — called from AVB main's periodic loop.
  * Replaces the per-packet clock_gettime(CLOCK_PTP_SYSTEM) calls that
  * used to live in avb_stream_rx_handler / avb_crf_rx_handler and were
