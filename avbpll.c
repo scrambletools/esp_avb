@@ -71,6 +71,47 @@ static struct {
 
 static int mclk_hw_tune_ppm_q16(int32_t ppm_q16);
 
+#if SOC_CLK_APLL_SUPPORTED && CONFIG_ESP_AVB_PLL_APLL_FINE_SET
+/* Fine retune: rewrite only the fractional SDM registers that changed.
+ * clk_ll_apll_set_config also pulses SDM_STOP (the modulator stops and
+ * restarts) and reloads the output divider on every call, and on the P4
+ * that glitches MCLK often enough to be heard: three of four such
+ * retunes put a phase step on the DAC output while the samples played
+ * were bit-exact, and none of four fine retunes did. Within the tuning
+ * range only DSDM0/DSDM1 move; a change of DSDM2 or the divider still
+ * takes the full sequence. */
+static struct {
+  bool valid;
+  uint32_t o_div, sdm0, sdm1, sdm2;
+} s_apll_regs;
+
+static void apll_seed_regs(void) {
+  s_apll_regs.o_div = REGI2C_READ_MASK(I2C_APLL, I2C_APLL_OR_OUTPUT_DIV);
+  s_apll_regs.sdm0 = REGI2C_READ_MASK(I2C_APLL, I2C_APLL_DSDM0);
+  s_apll_regs.sdm1 = REGI2C_READ_MASK(I2C_APLL, I2C_APLL_DSDM1);
+  s_apll_regs.sdm2 = REGI2C_READ_MASK(I2C_APLL, I2C_APLL_DSDM2);
+  s_apll_regs.valid = true;
+}
+
+static void apll_fine_set(uint32_t o_div, uint32_t sdm0, uint32_t sdm1,
+                          uint32_t sdm2) {
+  if (!s_apll_regs.valid || o_div != s_apll_regs.o_div ||
+      sdm2 != s_apll_regs.sdm2) {
+    clk_ll_apll_set_config(o_div, sdm0, sdm1, sdm2);
+  } else {
+    if (sdm1 != s_apll_regs.sdm1)
+      REGI2C_WRITE_MASK(I2C_APLL, I2C_APLL_DSDM1, sdm1);
+    if (sdm0 != s_apll_regs.sdm0)
+      REGI2C_WRITE_MASK(I2C_APLL, I2C_APLL_DSDM0, sdm0);
+  }
+  s_apll_regs.o_div = o_div;
+  s_apll_regs.sdm0 = sdm0;
+  s_apll_regs.sdm1 = sdm1;
+  s_apll_regs.sdm2 = sdm2;
+  s_apll_regs.valid = true;
+}
+#endif
+
 static int mclk_hw_init(uint32_t nominal_mclk_hz) {
 #if SOC_CLK_APLL_SUPPORTED
   if (nominal_mclk_hz == 0)
@@ -85,6 +126,9 @@ static int mclk_hw_init(uint32_t nominal_mclk_hz) {
   s_hw.nominal_apll_hz = nominal_mclk_hz * (uint32_t)mclk_div;
   s_hw.actual_apll_hz = s_hw.nominal_apll_hz;
   s_hw.initialised = true;
+#if CONFIG_ESP_AVB_PLL_APLL_FINE_SET
+  apll_seed_regs();
+#endif
   ESP_LOGI(TAG, "apll backend ready: mclk=%" PRIu32
                " Hz div=%" PRIu32 " apll_target=%" PRIu32 " Hz",
            nominal_mclk_hz, s_hw.mclk_div, s_hw.nominal_apll_hz);
@@ -180,7 +224,11 @@ static int mclk_hw_tune_ppm_q16(int32_t ppm_q16) {
    * the sigma-delta modulator absorbs ppm-scale steps smoothly. Within
    * our ±hundreds-ppm tuning range o_div/sdm2 never change from the
    * boot values, so skipping calibration is safe. */
+#if CONFIG_ESP_AVB_PLL_APLL_FINE_SET
+  apll_fine_set(o_div, sdm0, sdm1, sdm2);
+#else
   clk_ll_apll_set_config(o_div, sdm0, sdm1, sdm2);
+#endif
   s_hw.actual_apll_hz = real_hz;
   /* Hardware readback truth-check: the `hw=` figure in the stats line
    * is derived from actual_apll_hz (bookkeeping); this log line proves

@@ -565,6 +565,21 @@ menu "AVB Configuration"
             bench behind a free-running talker). Corrections beyond
             the clamp are treated as measurement error.
 
+    config ESP_AVB_PLL_APLL_FINE_SET
+        bool "Retune the APLL by its fractional registers only"
+        default y
+        depends on ESP_AVB
+        help
+            Media-clock corrections rewrite only the APLL's fractional
+            sigma-delta registers that changed, with the modulator left
+            running and the output divider untouched. The full sequence
+            (clk_ll_apll_set_config) pulses SDM_STOP and reloads the
+            divider on every correction, which on the P4 can glitch
+            MCLK and make the codec drop a sample. Measured 2026-10-26:
+            three of four full-sequence retunes put a phase step on the
+            DAC output, none of four fine retunes did, and the fine
+            retune still moved the output frequency.
+
     config ESP_AVB_PLL_CORRECTION_INTERVAL_S
         int "Listener media-clock correction interval (s, 0 = fixed clock)"
         default 30
