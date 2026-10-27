@@ -527,6 +527,19 @@ menu "AVB Configuration"
             timestamps are flagged uncertain (tu=1) or gPTP is not yet
             valid, playout falls back to a fixed byte-prefill gate.
 
+    config ESP_AVB_LISTENER_EXTRA_LATENCY_WIFI_US
+        int "Further playout latency on a Wi-Fi station (µs)"
+        default 30000
+        range 0 60000
+        depends on ESP_AVB
+        help
+            Added to the extra latency above when the listener is a
+            Wi-Fi station. The downlink stalls for 20 to 50 ms at times,
+            longer than a talker's usual presentation offset, and each
+            stall the buffer cannot cover is a dropout that also moves
+            playout later. A station then plays this much after wired
+            listeners of the same stream.
+
     config ESP_AVB_STATION_CHANNELS_PER_STREAM
         int "Channels per stream on a Wi-Fi station"
         default 2
@@ -560,16 +573,18 @@ menu "AVB Configuration"
 
     config ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
         int "Latency trim window on a Wi-Fi listener (s, 0 = never)"
-        default 600
+        default 60
         range 0 3600
         depends on ESP_AVB
         help
-            ESP_AVB_LISTENER_LATENCY_TRIM_S for a station. Wi-Fi delivery
-            stalls every minute or two, so a 60 s window trims away the
-            latency one stall added just before the next stall, which
-            then plays silence again (observed: a silence gap and a skip
-            about once a minute). A window longer than the stalls'
-            spacing keeps the latency of the worst recent stall.
+            ESP_AVB_LISTENER_LATENCY_TRIM_S for a station. A trim never
+            reaches into ESP_AVB_LISTENER_EXTRA_LATENCY_WIFI_US, which
+            covers the downlink's usual stalls, so this only bounds how
+            long an outage's added latency stays: measured 16 ms after a
+            bridge reset. Without the cushion a 60 s window trimmed away
+            the latency one stall had added just before the next stall,
+            which then played silence again; there, use a window longer
+            than the stalls' spacing (600 s).
 
     config ESP_AVB_AUTO_CRF_CLOCK_SOURCE
         bool "Auto-select CRF input as media clock source when live"

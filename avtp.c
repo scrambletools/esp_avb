@@ -2581,6 +2581,15 @@ static uint32_t stream_in_dac_pos(stream_rx_ctx_t *ctx) {
   return dac_pos;
 }
 
+/* Playout latency beyond presentation time: the configured extra
+ * latency, plus the Wi-Fi cushion on a station. */
+static inline uint32_t stream_in_extra_latency_ns(const stream_rx_ctx_t *ctx) {
+  uint32_t extra_us = CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US;
+  if (ctx->state && ctx->state->port[0].medium == avb_port_medium_wifi_ftm)
+    extra_us += CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_WIFI_US;
+  return extra_us * 1000U;
+}
+
 /* Playout phase: when the audio at the DAC plays against when it should
  * (its presentation time plus the configured extra latency), in ns, and
  * the audio buffered ahead of the DAC in µs. False when unknown. */
@@ -2595,8 +2604,7 @@ static bool stream_in_phase(stream_rx_ctx_t *ctx, int32_t *phase_ns,
     return false;
   uint32_t now32 = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
                               (uint64_t)now_ts.tv_nsec);
-  uint32_t due = pt +
-                 (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US * 1000U) -
+  uint32_t due = pt + stream_in_extra_latency_ns(ctx) -
                  STREAM_IN_OUTPUT_DELAY_NS;
   *phase_ns = (int32_t)(now32 - due);
   uint32_t head = atomic_load_explicit(&ctx->ring.head, memory_order_acquire);
@@ -2961,9 +2969,7 @@ static void stream_in_drain_cb(void *arg) {
                                     (uint64_t)now_ts.tv_nsec);
         /* The learned latency carries over a relock, so an outage does
          * not throw away what the path has shown it needs. */
-        uint32_t target = ctx->gate_avtp_ts +
-                          (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US *
-                                     1000U) -
+        uint32_t target = ctx->gate_avtp_ts + stream_in_extra_latency_ns(ctx) -
                           STREAM_IN_OUTPUT_DELAY_NS +
                           (uint32_t)ctx->learned_latency_ns;
         int32_t diff = (int32_t)(now32 - target);
@@ -3634,8 +3640,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
                             ((uint32_t)avtp_data[14] << 8) |
                             (uint32_t)avtp_data[15];
           int32_t lead = (int32_t)(
-              pkt_ts +
-              (uint32_t)(CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US * 1000U) -
+              pkt_ts + stream_in_extra_latency_ns(ctx) -
               STREAM_IN_OUTPUT_DELAY_NS + (uint32_t)ctx->learned_latency_ns -
               now32);
           if (lead > -400000000 && lead < 400000000) {
