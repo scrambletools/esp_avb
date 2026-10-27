@@ -375,6 +375,20 @@ menu "AVB Configuration"
             rate. Applies to the test tone build and to the Test Tone
             control.
 
+    config ESP_AVB_LISTENER_MIRROR
+        bool "Talker carries the listener's playout (test builds)"
+        default n
+        depends on ESP_AVB
+        help
+            For test builds. The talker sends the exact samples the
+            listener hands the codec in place of the codec input: the
+            DAC's left and right on channels 0 and 1, silence on the
+            other channels and while the listener is idle. A capture of
+            the talker stream then checks the listener's output bit for
+            bit with no analog wiring. The Test Tone control still
+            replaces it, and codec volume applies after these samples.
+            The codec input is not streamed in this build.
+
     config ESP_AVB_DEFAULT_FORMAT_AM824
         bool "Default stream format AM824 (IEC 61883-6) instead of AAF"
         default n

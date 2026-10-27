@@ -600,6 +600,125 @@ static inline void be32_to_aaf(const uint8_t *in, uint8_t *out, int n) {
   memcpy(out, in, n * 4);
 }
 
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+/* Listener mirror (test builds): the listener drain pushes every byte it
+ * hands the I2S TX DMA, and the talker pops the same count per packet in
+ * place of its capture, so its stream carries the playout bit for bit.
+ * TX and RX share one I2S clock and frame layout (stereo 24-in-32), so
+ * the fill holds steady once both run. One producer, one consumer. */
+#if CONFIG_IDF_TARGET_ESP32P4
+#define MIRROR_CAPACITY 32768 /* power of two: ~21 ms at 192 kHz */
+#else
+#define MIRROR_CAPACITY 16384 /* stations stop at 96 kHz: ~21 ms */
+#endif
+#define MIRROR_FRAME 8        /* one stereo 24-in-32 I2S frame */
+#define MIRROR_TARGET_MS 4    /* standing fill: rides out drain bursts */
+static uint8_t s_mirror_buf[MIRROR_CAPACITY];
+static _Atomic uint32_t s_mirror_head, s_mirror_tail;
+static uint32_t s_mirror_over_bytes;    /* producer found no room */
+static uint32_t s_mirror_under_bytes;   /* consumer zero-filled while primed */
+static uint32_t s_mirror_skipped_bytes; /* consumer trimmed a backlog */
+static uint32_t s_mirror_reprimes;      /* underruns that emptied it */
+static bool s_mirror_primed;
+static int64_t s_mirror_last_pop_us;
+
+static void mirror_push(const uint8_t *src, uint32_t len) {
+  uint32_t head = atomic_load_explicit(&s_mirror_head, memory_order_relaxed);
+  uint32_t tail = atomic_load_explicit(&s_mirror_tail, memory_order_acquire);
+  if (MIRROR_CAPACITY - (head - tail) < len) {
+    s_mirror_over_bytes += len;
+    return;
+  }
+  uint32_t pos = head & (MIRROR_CAPACITY - 1);
+  uint32_t first = MIRROR_CAPACITY - pos;
+  if (first > len)
+    first = len;
+  memcpy(s_mirror_buf + pos, src, first);
+  memcpy(s_mirror_buf, src + first, len - first);
+  atomic_store_explicit(&s_mirror_head, head + len, memory_order_release);
+}
+
+/* Fill dst with the next len bytes of playout, zeros where the listener
+ * wrote none (idle, or the DAC running on auto_clear silence). The drain
+ * writes whole DMA buffers each tick while the talker takes a packet's
+ * worth, so the mirror plays out of a standing fill of target bytes: it
+ * sends silence until that much is queued, and again after an underrun
+ * empties it. A talker that (re)starts finds what the listener left
+ * since it last ran; that backlog, or one near overflow, is trimmed back
+ * to the target. Steady state never drops played samples. */
+static void mirror_pop(uint8_t *dst, uint32_t len, uint32_t target) {
+  int64_t now_us = esp_timer_get_time();
+  uint32_t tail = atomic_load_explicit(&s_mirror_tail, memory_order_relaxed);
+  uint32_t head = atomic_load_explicit(&s_mirror_head, memory_order_acquire);
+  uint32_t avail = head - tail;
+  if ((now_us - s_mirror_last_pop_us > 100000 ||
+       avail > MIRROR_CAPACITY * 3 / 4) &&
+      avail > target) {
+    uint32_t skip = avail - target;
+    skip -= skip % MIRROR_FRAME;
+    s_mirror_skipped_bytes += skip;
+    tail += skip;
+    avail -= skip;
+  }
+  s_mirror_last_pop_us = now_us;
+  if (!s_mirror_primed) {
+    if (avail < target + len) {
+      memset(dst, 0, len);
+      atomic_store_explicit(&s_mirror_tail, tail, memory_order_release);
+      return;
+    }
+    s_mirror_primed = true;
+  }
+  uint32_t take = avail < len ? avail : len;
+  take -= take % MIRROR_FRAME;
+  uint32_t pos = tail & (MIRROR_CAPACITY - 1);
+  uint32_t first = MIRROR_CAPACITY - pos;
+  if (first > take)
+    first = take;
+  memcpy(dst, s_mirror_buf + pos, first);
+  memcpy(dst + first, s_mirror_buf, take - first);
+  if (take < len) {
+    memset(dst + take, 0, len - take);
+    s_mirror_under_bytes += len - take;
+    s_mirror_reprimes++;
+    s_mirror_primed = false;
+  }
+  atomic_store_explicit(&s_mirror_tail, tail + take, memory_order_release);
+}
+
+/* Mirror frames to the wire: the playout's left and right slots, bit for
+ * bit, on channels 0 and 1, silence on the rest. No mic DSP. */
+static void i2s24_to_aaf_stereo(const uint8_t *in, uint8_t *out,
+                                int num_samples, int stream_channels) {
+  for (int s = 0; s < num_samples; s++) {
+    for (int ch = 0; ch < stream_channels; ch++) {
+      if (ch < 2)
+        memcpy(out, in + ch * 4, 3);
+      else
+        memset(out, 0, 3);
+      out[3] = 0;
+      out += 4;
+    }
+    in += MIRROR_FRAME;
+  }
+}
+
+static void i2s24_to_am824_stereo(const uint8_t *in, uint8_t *out,
+                                  int num_samples, int stream_channels) {
+  for (int s = 0; s < num_samples; s++) {
+    for (int ch = 0; ch < stream_channels; ch++) {
+      out[0] = 0x40;
+      if (ch < 2)
+        memcpy(out + 1, in + ch * 4, 3);
+      else
+        memset(out + 1, 0, 3);
+      out += 4;
+    }
+    in += MIRROR_FRAME;
+  }
+}
+#endif
+
 /* A packet sent this long after its slot counts as a talker stall
  * (STREAM-OUT stalls=), whatever the pacing. */
 #define TALKER_STALL_US 4000
@@ -734,6 +853,10 @@ static void avb_stream_out_task(void *task_param) {
   int i2s_frame_bytes_pkt = i2s_channels * i2s_bytes_per_sample;
   int i2s_read_nominal = spp_base * i2s_frame_bytes_pkt; /* fill-loop scale */
   int i2s_read_size = spp_max * i2s_frame_bytes_pkt;     /* buffer size */
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+  uint32_t mirror_target =
+      params->sample_rate / 1000 * MIRROR_TARGET_MS * MIRROR_FRAME;
+#endif
 
   i2s_buf = calloc(1, i2s_read_size);
   if (!i2s_buf) {
@@ -1870,12 +1993,23 @@ static void avb_stream_out_task(void *task_param) {
         }
       }
 #endif
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+      /* The capture above still paces the talker; the playout replaces
+       * its samples. */
+      mirror_pop(i2s_buf, (uint32_t)this_i2s_read, mirror_target);
+      if (is_am824)
+        i2s24_to_am824_stereo(i2s_buf, audio_dst, this_spp,
+                              params->channels);
+      else
+        i2s24_to_aaf_stereo(i2s_buf, audio_dst, this_spp, params->channels);
+#else
       if (is_am824)
         i2s24_to_am824_mono(i2s_buf, audio_dst, this_spp,
                             params->channels, &mic_dsp);
       else
         i2s24_to_aaf_mono(i2s_buf, audio_dst, this_spp,
                           params->channels, &mic_dsp);
+#endif
       /* Test Tone control: the tone replaces the converted input, so the
        * capture ring, its pacing and the input filters run as usual and
        * the input resumes without a step when the tone stops. */
@@ -2998,6 +3132,9 @@ static void stream_in_drain_cb(void *arg) {
   i2s_channel_write(ctx->i2s_tx_handle, ctx->ring.buf + (t & mask),
                     first_chunk, &w1, 1);
   bytes_written += w1;
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+  mirror_push(ctx->ring.buf + (t & mask), (uint32_t)w1);
+#endif
   /* Only attempt the wrap-around segment if the first fully drained —
    * otherwise I2S DMA is backpressured; next tick picks it up. */
   if (w1 == first_chunk && second_chunk > 0) {
@@ -3005,6 +3142,9 @@ static void stream_in_drain_cb(void *arg) {
     i2s_channel_write(ctx->i2s_tx_handle, ctx->ring.buf, second_chunk,
                       &w2, 1);
     bytes_written += w2;
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+    mirror_push(ctx->ring.buf, (uint32_t)w2);
+#endif
   }
   atomic_store_explicit(&ctx->ring.tail, t + (uint32_t)bytes_written,
                         memory_order_release);
@@ -3927,6 +4067,17 @@ void avb_stream_out_print_diag(void) {
     avbdebug("  STREAM-OUT-rem: min=%ldns max=%ldns",
             (long)rem_min, (long)rem_max);
   }
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+  /* Running totals since boot. */
+  avbinfo("  STREAM-OUT-mirror: under=%luB reprimes=%lu over=%luB skipped=%luB "
+          "fill=%luB",
+          (unsigned long)s_mirror_under_bytes,
+          (unsigned long)s_mirror_reprimes,
+          (unsigned long)s_mirror_over_bytes,
+          (unsigned long)s_mirror_skipped_bytes,
+          (unsigned long)(atomic_load(&s_mirror_head) -
+                          atomic_load(&s_mirror_tail)));
+#endif
 
   last_pkts = pkts;
   last_fail = fail;
