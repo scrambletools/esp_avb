@@ -4153,6 +4153,20 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
      * never completed ACMP CONNECT_TX) do not hold the class. */
     uint16_t cmd_flags = octets_to_uint(msg->flags, 2);
     bool req_class_b = (cmd_flags & 0x0001) != 0;
+    /* An AAF format's frame interval is its class: the other class would
+     * reserve the wrong interval, twice the bandwidth for 250 us frames
+     * sent as Class A, too little for 125 us frames sent as Class B.
+     * Controllers mostly leave CLASS_B clear, so without this every Class
+     * B format went out as Class A. The response's flag tells the
+     * listener. */
+    bool format_class_b = false;
+    if (avb_output_format_class(&stream->stream_format, &format_class_b) &&
+        format_class_b != req_class_b) {
+      avbinfo("ACMP: stream %d stays Class %c for its frame interval, "
+              "Class %c asked",
+              talker_uid, format_class_b ? 'B' : 'A', req_class_b ? 'B' : 'A');
+      req_class_b = format_class_b;
+    }
     /* Behind a Wi-Fi hop a stream is Class B (AVB Wireless §4) whatever
      * the connect asks; the response's CLASS_B flag tells the listener. */
     if (state->port[0].medium == avb_port_medium_wifi_ftm && !req_class_b) {
