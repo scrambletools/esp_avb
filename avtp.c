@@ -1158,11 +1158,26 @@ static void avb_stream_out_task(void *task_param) {
                                  20.0f) *
                 65536.0f);
   if (!params->use_sine_wave) {
-    i2s_ring = calloc(1, i2s_ring_size);
+    /* One talker runs at a time, so its I2S ring is kept between
+     * starts and only grows. Allocated at every start, the 12 KB ring
+     * failed on a C6 station whose Wi-Fi buffers had fragmented the
+     * heap. */
+    static uint8_t *s_i2s_ring_buf;
+    static int s_i2s_ring_capacity;
+    if (s_i2s_ring_capacity < i2s_ring_size) {
+      free(s_i2s_ring_buf);
+      s_i2s_ring_buf = calloc(1, i2s_ring_size);
+      s_i2s_ring_capacity = s_i2s_ring_buf ? i2s_ring_size : 0;
+    }
+    i2s_ring = s_i2s_ring_buf;
     if (!i2s_ring) {
-      avberr("Stream out: no memory for I2S ring");
+      avberr("Stream out: no memory for I2S ring (%d B, largest free block "
+             "%u B)",
+             i2s_ring_size,
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
       goto err;
     }
+    memset(i2s_ring, 0, i2s_ring_size);
     if (capture_ring) {
       state->media_clock.capture_ring_size = (uint32_t)i2s_ring_size;
       state->media_clock.capture_write_pos = 0;
@@ -2114,7 +2129,7 @@ err:
     state->media_clock.capture_ring = NULL;
     vTaskDelay(1);
   }
-  free(i2s_ring);
+  /* i2s_ring is kept for the next start. */
   free(tx_frame);
   free(params);
   vTaskDelete(NULL);
