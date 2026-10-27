@@ -3063,6 +3063,8 @@ extern esp_err_t esp_wifi_internal_tx(int wifi_if, void *buffer, size_t len);
  * lock. */
 #define WIFI_TX_BUNDLE_SLOTS 2
 #define WIFI_TX_BUNDLE_MAX_AGE_US 2000
+/* A partial bundle this old was left when its stream stopped. */
+#define WIFI_TX_BUNDLE_STALE_US 200000
 /* Enough sent bundles, about 2 ms each, to cover the resend age below.
  * Each entry is a full-size buffer, and a single-core station is short
  * of internal RAM: 16 entries left the Wi-Fi driver without TX buffers
@@ -3173,6 +3175,11 @@ static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
   uint32_t avtp_len = len - WIFI_BUNDLE_AVTP;
   const uint8_t *avtp = frame + WIFI_BUNDLE_AVTP;
   *result = ESP_OK;
+  /* Sending it would open the next run with the last frames of the
+   * previous one (seen: a frame of an earlier run before seq 0). It was
+   * never numbered, so dropping it leaves no gap at the bridge. */
+  if (bundle->count > 0 && now_us - bundle->first_us > WIFI_TX_BUNDLE_STALE_US)
+    bundle->count = 0;
   if (bundle->count > 0 &&
       (bundle->len + WIFI_BUNDLE_ENTRY_COST(bundle->buf, bundle->count, avtp,
                                             avtp_len) >
