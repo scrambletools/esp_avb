@@ -66,6 +66,10 @@ typedef struct i2s_channel_obj_t *i2s_chan_handle_t;
 /* Maximum number of listeners connected to a talker stream */
 #define AVB_MAX_NUM_CONNECTED_LISTENERS 10
 
+/* Stream IDs an output stream moves through, one per grown reservation
+ * (see avb_talker_stream_s.stream_id_gen). */
+#define AVB_STREAM_ID_GENERATIONS 4
+
 /* Unicast fan-out limit is Kconfig-gated on AVB Lite compliance;
  * builds without it still need the tx_da[] mailbox to compile. */
 #ifndef CONFIG_ESP_AVB_LITE_MEDIA_VLAN_ID
@@ -612,6 +616,13 @@ typedef struct {
 /* Talker stream */
 typedef struct {
   unique_id_t stream_id;                     // stream ID
+  /* A format change that grows the stream's reservation moves it to a
+   * new stream ID, so no bridge applies the old reservation to it: the
+   * generation is kept in the top two bits of the ID's last octet, and
+   * stream_id_retired_us[] says when each generation's ID last left the
+   * wire. */
+  uint8_t stream_id_gen;
+  int64_t stream_id_retired_us[AVB_STREAM_ID_GENERATIONS];
   eth_addr_t stream_dest_addr;               // stream destination address
   aem_stream_info_flags_s stream_info_flags; // stream info flags
   uint8_t vlan_id[2];                        // vlan ID
@@ -1486,6 +1497,13 @@ bool avb_output_format_class(const avtp_stream_format_s *fmt, bool *class_b);
 /* Set an output stream's class and VLAN to the class its format implies;
  * false, changing nothing, when the format implies none. */
 bool avb_output_stream_class_from_format(avb_state_s *state, uint16_t index);
+/* Declare an output stream's Talker Advertise at once, after a change of
+ * its format or class, instead of at the next periodic declaration.
+ * except_listener is a connected_listeners[] row whose ACMP connection
+ * does not hold the stream ID (the listener the change is made for), or
+ * -1. */
+void avb_output_stream_declare_now(avb_state_s *state, uint16_t index,
+                                   int except_listener);
 /* FreeRTOS task entry point for the deferred NVS writer. */
 void avb_persist_task(void *arg);
 void i2s_task(void *arg);

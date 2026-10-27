@@ -540,6 +540,23 @@ menu "AVB Configuration"
             playout later. A station then plays this much after wired
             listeners of the same stream.
 
+    config ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW
+        bool "Give a grown Stream Output a new stream ID"
+        default y
+        depends on ESP_AVB
+        help
+            A format change that grows a Stream Output's reservation
+            (more channels, a higher rate or another class) moves the
+            stream to the next of four stream IDs, which differ in the
+            top two bits of the last octet, and declares it at once. A
+            bridge has no reservation for the new ID, so the stream
+            starts with its connect. Under the same ID the talker must
+            first leave the stream undeclared for two LeaveAll periods
+            (802.1Q 35.2.2.8), 13 to 23 s on a MOTU switch. The ID
+            changes only while the stream is stopped and no other
+            listener is connected to it; controllers see the new ID in
+            GET_STREAM_INFO. Shrinks keep the ID.
+
     config ESP_AVB_TALKER_MIN_OFFSET_WIFI_US
         int "Least presentation offset of a Wi-Fi station's talker (µs)"
         default 30000

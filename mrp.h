@@ -434,6 +434,20 @@ void mrp_lite_sync_refusals(avb_state_s *state, const unique_id_t *stream_id,
                             const eth_addr_t *declared_da,
                             const uint8_t *vlan_id, uint16_t max_frame_size,
                             uint16_t max_interval_frames, bool class_b);
+/* True when declaring this value would change a Talker Advertise of ours
+ * already on the wire other than by shrinking its reservation: the change
+ * mrp_declare_talker_advertise withdraws for two LeaveAll periods. */
+bool mrp_talker_advertise_change_waits(avb_state_s *state, int port,
+                                       const unique_id_t *stream_id,
+                                       const eth_addr_t *stream_dest_addr,
+                                       const uint8_t *vlan_id,
+                                       uint16_t max_frame_size,
+                                       uint16_t max_interval_frames,
+                                       bool class_b);
+/* Drop the idle talker entries of a stream ID, so a later declaration of
+ * it starts fresh with New; false, changing nothing, while either entry
+ * is still declared or registered. */
+bool mrp_talker_forget(int port, const unique_id_t *stream_id);
 /* TSpec of the registered Talker Advertise for a stream, false when
  * none is registered. */
 bool mrp_talker_advertise_tspec(int port, const unique_id_t *stream_id,

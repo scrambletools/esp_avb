@@ -2843,6 +2843,69 @@ static void mrp_sm_reset_for_new_value(mrp_sm_state_t *sm) {
   sm->pending_tx = mrp_tx_none;
 }
 
+/* The Talker Advertise value a declaration would put on the wire for
+ * entry e, built first so a mid-life change can be detected against the
+ * currently declared one. */
+static void mrp_talker_candidate(avb_state_s *state,
+                                 const msrp_talker_entry_t *e,
+                                 const unique_id_t *stream_id,
+                                 const eth_addr_t *stream_dest_addr,
+                                 const uint8_t *vlan_id,
+                                 uint16_t max_frame_size,
+                                 uint16_t max_interval_frames, bool class_b,
+                                 msrp_talker_message_u *fresh) {
+  memset(fresh, 0, sizeof(*fresh));
+  mrp_build_talker_info(state, &fresh->talker.info, stream_id,
+                        stream_dest_addr, vlan_id, max_frame_size,
+                        max_interval_frames, class_b);
+  /* accumulated_latency is owned by mrp_patch_egress_accumulated_latency,
+   * which edits the stored entry after every MAP declare. Carrying the
+   * stored value into the candidate keeps a latency-only difference from
+   * reading as a mid-life value change, without it, every re-registration
+   * of a bridged stream withdrew and re-quarantined its own declaration
+   * forever, so Wi-Fi-ingress talker advertises never reached the wire. */
+  memcpy(fresh->talker.info.accumulated_latency,
+         e->wire.talker.info.accumulated_latency,
+         sizeof(fresh->talker.info.accumulated_latency));
+}
+
+bool mrp_talker_advertise_change_waits(avb_state_s *state, int port,
+                                       const unique_id_t *stream_id,
+                                       const eth_addr_t *stream_dest_addr,
+                                       const uint8_t *vlan_id,
+                                       uint16_t max_frame_size,
+                                       uint16_t max_interval_frames,
+                                       bool class_b) {
+  static const eth_addr_t zero_da = {0};
+  msrp_talker_entry_t *e =
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
+  /* A fresh slot carries a zero DA (see mrp_declare_talker_advertise),
+   * and a held-off entry already holds its new value. */
+  if (e == NULL || e->redeclare_after_us != 0 ||
+      memcmp(&e->wire.talker.info.stream_dest_addr, zero_da, ETH_ADDR_LEN) ==
+          0)
+    return false;
+  msrp_talker_message_u fresh;
+  mrp_talker_candidate(state, e, stream_id, stream_dest_addr, vlan_id,
+                       max_frame_size, max_interval_frames, class_b, &fresh);
+  return memcmp(&e->wire.talker.info, &fresh.talker.info,
+                sizeof(fresh.talker.info)) != 0 &&
+         !mrp_talker_value_shrinks(&e->wire.talker.info, &fresh.talker.info);
+}
+
+bool mrp_talker_forget(int port, const unique_id_t *stream_id) {
+  msrp_talker_entry_t *entries[2] = {
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise),
+      msrp_talker_find(port, stream_id, msrp_attr_type_talker_failed)};
+  for (int i = 0; i < 2; i++)
+    if (entries[i] != NULL && !mrp_sm_idle(&entries[i]->sm))
+      return false;
+  for (int i = 0; i < 2; i++)
+    if (entries[i] != NULL)
+      memset(entries[i], 0, sizeof(*entries[i]));
+  return true;
+}
+
 void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
@@ -2862,22 +2925,9 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
   if (e == NULL)
     return;
   e->locally_originated = true;
-  /* Build the candidate value first so a mid-life change can be
-   * detected against the currently declared one. */
   msrp_talker_message_u fresh;
-  memset(&fresh, 0, sizeof(fresh));
-  mrp_build_talker_info(state, &fresh.talker.info, stream_id,
-                        stream_dest_addr, vlan_id, max_frame_size,
-                        max_interval_frames, class_b);
-  /* accumulated_latency is owned by mrp_patch_egress_accumulated_latency,
-   * which edits the stored entry after every MAP declare. Carrying the
-   * stored value into the candidate keeps a latency-only difference from
-   * reading as a mid-life value change, without it, every re-registration
-   * of a bridged stream withdrew and re-quarantined its own declaration
-   * forever, so Wi-Fi-ingress talker advertises never reached the wire. */
-  memcpy(fresh.talker.info.accumulated_latency,
-         e->wire.talker.info.accumulated_latency,
-         sizeof(fresh.talker.info.accumulated_latency));
+  mrp_talker_candidate(state, e, stream_id, stream_dest_addr, vlan_id,
+                       max_frame_size, max_interval_frames, class_b, &fresh);
   mrp_applicant_state_e applicant_before = e->sm.applicant;
   if (state->avb_lite && memcmp(&e->wire.talker.info, &fresh.talker.info,
                                 sizeof(fresh.talker.info)) != 0) {

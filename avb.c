@@ -185,7 +185,8 @@ static void avb_apply_media_vlan(avb_state_s *state) {
   }
 }
 
-static void avb_declare_output_stream(avb_state_s *state, uint16_t index);
+static void avb_declare_output_stream(avb_state_s *state, uint16_t index,
+                                      int except_listener);
 
 static void avb_update_avb_lite_from_ptp(avb_state_s *state) {
   bool avb_lite = state->config.avb_lite_compliant &&
@@ -217,7 +218,7 @@ static void avb_update_avb_lite_from_ptp(avb_state_s *state) {
           static const uint8_t zero_sid[UNIQUE_ID_LEN] = {0};
           if (memcmp(state->output_streams[i].stream_id, zero_sid,
                      UNIQUE_ID_LEN) != 0)
-            avb_declare_output_stream(state, i);
+            avb_declare_output_stream(state, i, -1);
         }
       }
       mrp_lite_enter(state, 0);
@@ -417,15 +418,116 @@ static void avb_output_streams_class_from_format(avb_state_s *state) {
 }
 #endif
 
-/* Declare (or keep declaring) an output stream's Talker Advertise. */
-static void avb_declare_output_stream(avb_state_s *state, uint16_t index) {
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) &&                                    \
+    defined(CONFIG_ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW)
+/* A stream ID left the wire this long ago is gone from every bridge: two
+ * of the longest Milan LeaveAll periods and a LeaveTime, as for a value
+ * change (MSRP_VALUE_CHANGE_HOLDOFF_US in mrp.c). */
+#define AVB_STREAM_ID_REUSE_US (32 * 1000 * 1000)
+
+static void stream_id_set_generation(uint8_t *stream_id, uint8_t gen) {
+  stream_id[UNIQUE_ID_LEN - 1] =
+      (uint8_t)((stream_id[UNIQUE_ID_LEN - 1] & 0x3f) | (gen << 6));
+}
+
+/* IEEE 802.1Q-2022 35.2.2.8 lets no FirstValue change for a registered
+ * stream ID: a stream that grows its reservation under the same ID waits
+ * two LeaveAll periods with no Talker Advertise (13 to 23 s on a MOTU
+ * switch), or a bridge that kept the old, smaller TSpec polices it (seen:
+ * 36 % of the frames dropped). Under a stream ID no bridge has seen for
+ * AVB_STREAM_ID_REUSE_US the grown stream is declared at once, with the
+ * old ID's Leave, and a PC endpoint doing so had audio 1 to 3 s after the
+ * connect. Only while nothing would lose the stream: it is not running,
+ * so its frame template is rebuilt at the next start, and no listener
+ * other than except_listener holds an ACMP connection to the old ID. */
+static bool avb_output_stream_renew_id(avb_state_s *state, uint16_t index,
+                                       int except_listener) {
   avb_talker_stream_s *stream = &state->output_streams[index];
-  mrp_declare_talker_advertise(
-      state, 0, &stream->stream_id, avb_declared_dest_addr(state, stream),
-      stream->vlan_id, avb_compute_tspec_max_frame_size(state, index),
-      avb_compute_tspec_max_interval_frames(state, index),
-      stream->stream_info_flags.class_b);
+  if (stream->streaming)
+    return false;
+  uint16_t count = octets_to_uint(stream->connection_count, 2);
+  for (int i = 0; i < count && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++)
+    if (stream->connected_listeners[i].acmp_connected && i != except_listener)
+      return false;
+  int64_t now_us = esp_timer_get_time();
+  for (int step = 1; step < AVB_STREAM_ID_GENERATIONS; step++) {
+    uint8_t gen = (uint8_t)((stream->stream_id_gen + step) %
+                            AVB_STREAM_ID_GENERATIONS);
+    if (now_us - stream->stream_id_retired_us[gen] < AVB_STREAM_ID_REUSE_US)
+      continue;
+    unique_id_t next;
+    memcpy(next, stream->stream_id, UNIQUE_ID_LEN);
+    stream_id_set_generation(next, gen);
+    if (!mrp_talker_forget(0, &next))
+      continue; /* a bridge still reflects it */
+    mrp_withdraw_talker(state, 0, &stream->stream_id);
+    stream->stream_id_retired_us[stream->stream_id_gen] = now_us;
+    stream->stream_id_gen = gen;
+    memcpy(stream->stream_id, next, UNIQUE_ID_LEN);
+    /* Readiness was declared for the old ID. Listeners known only from
+     * MSRP go with it, ACMP ones declare again for the new ID. */
+    for (int i = count - 1; i >= 0; i--) {
+      if (i >= AVB_MAX_NUM_CONNECTED_LISTENERS)
+        continue;
+      if (!stream->connected_listeners[i].acmp_connected) {
+        avb_remove_talker_listener_by_index(stream, i);
+        continue;
+      }
+      stream->connected_listeners[i].msrp_ready = false;
+      stream->connected_listeners[i].msrp_ready_live = false;
+      stream->connected_listeners[i].asking_failed = false;
+      stream->connected_listeners[i].asking_failed_since_us = 0;
+    }
+    avbinfo("Stream out %u: reservation grows, moved to stream "
+            "%02x%02x%02x%02x%02x%02x%02x%02x",
+            index, next[0], next[1], next[2], next[3], next[4], next[5],
+            next[6], next[7]);
+    return true;
+  }
+  avbinfo("Stream out %u: reservation grows, no stream ID free yet; "
+          "keeping this one",
+          index);
+  return false;
+}
+#endif
+
+/* Declare (or keep declaring) an output stream's Talker Advertise. */
+static void avb_declare_output_stream(avb_state_s *state, uint16_t index,
+                                      int except_listener) {
+  avb_talker_stream_s *stream = &state->output_streams[index];
+  const eth_addr_t *dest_addr = avb_declared_dest_addr(state, stream);
+  uint16_t max_frame_size = avb_compute_tspec_max_frame_size(state, index);
+  uint16_t max_interval_frames =
+      avb_compute_tspec_max_interval_frames(state, index);
+#if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) &&                                    \
+    defined(CONFIG_ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW)
+  if (!state->avb_lite &&
+      mrp_talker_advertise_change_waits(
+          state, 0, &stream->stream_id, dest_addr, stream->vlan_id,
+          max_frame_size, max_interval_frames,
+          stream->stream_info_flags.class_b))
+    avb_output_stream_renew_id(state, index, except_listener);
+#else
+  (void)except_listener;
+#endif
+  mrp_declare_talker_advertise(state, 0, &stream->stream_id, dest_addr,
+                               stream->vlan_id, max_frame_size,
+                               max_interval_frames,
+                               stream->stream_info_flags.class_b);
   mrp_set_talker_latency(state, 0, &stream->stream_id);
+}
+
+void avb_output_stream_declare_now(avb_state_s *state, uint16_t index,
+                                   int except_listener) {
+  static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
+  if (!state->config.talker || index >= state->num_output_streams)
+    return;
+  /* As in the periodic loop: no declaration before MAAP has an address. */
+  if (!state->avb_lite &&
+      memcmp(state->output_streams[index].stream_dest_addr, zero_mac,
+             ETH_ADDR_LEN) == 0)
+    return;
+  avb_declare_output_stream(state, index, except_listener);
 }
 
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
@@ -836,7 +938,7 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
       avbinfo("Stream out %d declares %s", i,
               s->lite_declared_multicast ? "its multicast address (escalating)"
                                          : "unicast (zero address)");
-      avb_declare_output_stream(state, i);
+      avb_declare_output_stream(state, i, -1);
     }
   }
 }
@@ -1645,7 +1747,7 @@ static int avb_periodic_send(avb_state_s *state) {
                          : MSRP_TALKER_IDLE_INTERVAL_MSEC;
       if (timespec_to_ms(&delta) > interval) {
         state->port[0].last_transmitted_msrp_talker_adv = time_now;
-        avb_declare_output_stream(state, i);
+        avb_declare_output_stream(state, i, -1);
       }
     }
     avb_maap_tick(state);

@@ -2917,6 +2917,10 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
         if (avb_output_format_class(requested, &new_class_b) &&
             (!old_class_known || old_class_b != new_class_b))
           avb_output_stream_class_from_format(state, index);
+        /* A grown reservation goes out under a new stream ID, which
+         * GET_STREAM_INFO and the next connect then report. */
+        if (changed)
+          avb_output_stream_declare_now(state, index, -1);
       } else {
         memcpy(&state->input_streams[index].stream_format, requested,
                sizeof(avtp_stream_format_s));
@@ -4234,6 +4238,9 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
       /* Boot in this class next time: the listener asks for it again when
        * it reconnects, and a change of class costs two LeaveAll periods. */
       avb_persist_append_output_stream(state, talker_uid);
+      /* Unless it moves to a new stream ID, which the response below
+       * gives the listener. */
+      avb_output_stream_declare_now(state, talker_uid, listener_idx);
     }
 
     avbinfo(
