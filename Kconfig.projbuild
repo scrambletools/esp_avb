@@ -540,6 +540,21 @@ menu "AVB Configuration"
             playout later. A station then plays this much after wired
             listeners of the same stream.
 
+    config ESP_AVB_TALKER_MIN_OFFSET_WIFI_US
+        int "Least presentation offset of a Wi-Fi station's talker (µs)"
+        default 30000
+        range 0 50000
+        depends on ESP_AVB
+        help
+            A Wi-Fi station's Stream Output presents its samples at
+            least this long after capture, whatever max transit time a
+            controller set (a larger one still applies), and reports
+            the offset it uses. The uplink stalls for 20 to 50 ms at
+            times, and the station's gPTP time runs milliseconds off
+            the bridge's: with the 12 ms default, frames reached a
+            wired listener a median 5.7 ms before their presentation
+            time and some arrived late. Class B allows 50 ms.
+
     config ESP_AVB_STATION_CHANNELS_PER_STREAM
         int "Channels per stream on a Wi-Fi station"
         default 2

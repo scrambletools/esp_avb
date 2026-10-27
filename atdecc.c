@@ -3134,7 +3134,7 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
 
   uint64_t current_ns = 0;
   if (index < state->num_output_streams)
-    current_ns = state->output_streams[index].presentation_time_offset_ns;
+    current_ns = avb_output_presentation_offset_ns(state, index);
   int_to_octets(&current_ns, rsp->max_transit_time, 8);
 
   rsp->common.header.msg_type = aecp_msg_type_aem_response;

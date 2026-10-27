@@ -5052,7 +5052,7 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
          ETH_ADDR_LEN);
   memcpy(params->vlan_id, state->output_streams[index].vlan_id, 2);
   params->presentation_time_offset_ns =
-      state->output_streams[index].presentation_time_offset_ns;
+      avb_output_presentation_offset_ns(state, index);
 
   // Get format parameters from the stream format in state
   avtp_stream_format_s *fmt = &state->output_streams[index].stream_format;

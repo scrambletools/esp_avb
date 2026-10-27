@@ -1399,6 +1399,18 @@ static inline int avb_stream_tx_addrs_snapshot(const avb_talker_stream_s *stream
   return n;
 }
 
+/* The presentation offset a Stream Output uses: its max transit time,
+ * raised to CONFIG_ESP_AVB_TALKER_MIN_OFFSET_WIFI_US on a Wi-Fi
+ * station. */
+static inline uint32_t avb_output_presentation_offset_ns(const avb_state_s *state,
+                                                         int index) {
+  uint32_t offset_ns = state->output_streams[index].presentation_time_offset_ns;
+  uint32_t floor_ns = (uint32_t)CONFIG_ESP_AVB_TALKER_MIN_OFFSET_WIFI_US * 1000U;
+  if (state->port[0].medium == avb_port_medium_wifi_ftm && offset_ns < floor_ns)
+    offset_ns = floor_ns;
+  return offset_ns;
+}
+
 /* Codec functions */
 const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type);
 /* Sample rates the codec's clock plan offers, in plan order. */
