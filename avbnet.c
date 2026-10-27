@@ -1167,6 +1167,7 @@ typedef struct {
   bool seeded;
   uint8_t stream_id[UNIQUE_ID_LEN];
   uint8_t peer[ETH_ADDR_LEN]; /* sender of the bundles */
+  int64_t last_rx_us;
   uint16_t expected;
   uint16_t nack_next; /* first bundle seq not NACKed yet */
   int64_t deadline_us; /* 0 while nothing is held */
@@ -1406,7 +1407,11 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
       rx = &s_bundle_rx[i];
       break;
     }
-    if (!spare && !s_bundle_rx[i].valid)
+    /* A talker moves to a new stream ID when its reservation grows, so
+     * a stream gone quiet with nothing held gives its entry up. */
+    if (!spare && (!s_bundle_rx[i].valid ||
+                   (s_bundle_rx[i].held_count == 0 &&
+                    now_us - s_bundle_rx[i].last_rx_us > 1000000)))
       spare = &s_bundle_rx[i];
   }
   if (!rx && spare) {
@@ -1420,6 +1425,7 @@ static void wifi_bundle_receive(uint8_t *buf, uint32_t len, void *priv,
     return;
   }
   memcpy(rx->peer, buf + ETH_ADDR_LEN, ETH_ADDR_LEN);
+  rx->last_rx_us = now_us;
   /* Bundles held past a gap when the stream stopped wait for its next
    * bundle where no hold timer runs (the bridge): its sender keeps the
    * bundle sequence across runs, so they went out ahead of the next
@@ -3078,6 +3084,9 @@ typedef struct {
   int64_t sent_us;
   int64_t retx_us;
 } wifi_tx_hist_t;
+/* A slot idle this long can take another stream ID: a talker moves to a
+ * new one when its reservation grows. */
+#define WIFI_TX_BUNDLE_IDLE_US 1000000
 typedef struct {
   bool valid;
   uint8_t stream_id[UNIQUE_ID_LEN];
@@ -3085,6 +3094,7 @@ typedef struct {
   uint8_t count;
   uint32_t len;
   int64_t first_us;
+  int64_t last_us; /* last frame added */
   uint8_t buf[WIFI_BUNDLE_MAX_BYTES];
   /* Sent bundles kept for the bridge's NACKs. */
   uint8_t *hist_buf;
@@ -3157,21 +3167,28 @@ static bool wifi_tx_bundle_add(const uint8_t *frame, size_t len,
     free(slots);
   }
   wifi_tx_bundle_t *bundle = NULL;
+  int64_t now_us = esp_timer_get_time();
   portENTER_CRITICAL(&s_tx_bundle_lock);
   for (int i = 0; i < WIFI_TX_BUNDLE_SLOTS && !bundle; i++)
     if (s_tx_bundles[i].valid &&
         memcmp(s_tx_bundles[i].stream_id, frame + 22, UNIQUE_ID_LEN) == 0)
       bundle = &s_tx_bundles[i];
   for (int i = 0; i < WIFI_TX_BUNDLE_SLOTS && !bundle; i++)
-    if (!s_tx_bundles[i].valid) {
+    if (!s_tx_bundles[i].valid ||
+        now_us - s_tx_bundles[i].last_us > WIFI_TX_BUNDLE_IDLE_US) {
+      /* Its sent bundles belong to the old stream ID: NACKs for the new
+       * one must not find them. */
       bundle = &s_tx_bundles[i];
       bundle->valid = true;
       memcpy(bundle->stream_id, frame + 22, UNIQUE_ID_LEN);
+      bundle->count = 0;
+      memset(bundle->hist, 0, sizeof(bundle->hist));
+      bundle->hist_next = 0;
     }
   portEXIT_CRITICAL(&s_tx_bundle_lock);
   if (!bundle)
     return false;
-  int64_t now_us = esp_timer_get_time();
+  bundle->last_us = now_us;
   uint32_t avtp_len = len - WIFI_BUNDLE_AVTP;
   const uint8_t *avtp = frame + WIFI_BUNDLE_AVTP;
   *result = ESP_OK;
