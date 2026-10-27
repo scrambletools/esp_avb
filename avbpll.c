@@ -307,9 +307,14 @@ static struct {
    * preload 25 → persisted 50 after one reboot). Only a first-ever
    * boot (no stored trim) runs the calibration staircase. */
   bool trim_preloaded;
-  /* Hold breaker: consecutive ticks the held INTERNAL trim has
-   * measured beyond AVB_PLL_HOLD_BREAK_PPM_Q16 (see avb_pll_tick). */
-  uint32_t hold_break_ticks;
+  /* Hold breaker (see avb_pll_tick): the held INTERNAL trim's current
+   * window, its ticks so far (0 = none), and how many windows in a row
+   * measured beyond AVB_PLL_HOLD_BREAK_PPM_Q16, on which side. */
+  uint64_t hold_win_bytes;
+  uint64_t hold_win_gptp_ns;
+  uint32_t hold_win_ticks;
+  uint32_t hold_beyond_windows;
+  int32_t hold_beyond_sign;
   /* BTC the current hold/acquisition is referenced to. A change while
    * running releases the hold, the old trim is meaningless against a
    * new reference. */
@@ -416,11 +421,18 @@ static struct {
  * against the reference is quasi-static, but a BTC change that slips
  * past the identity check, or thermal drift over a long uptime, leave
  * a wrong trim with no feedback path (observed: listener ring
- * draining and re-anchoring every minute). Sustained cumulative error
- * far beyond the gPTP reference's documented ~25 ppm measurement
- * bias releases the hold for a fresh acquisition. 36 ticks = 3 min. */
+ * draining and re-anchoring every minute). Error far beyond the gPTP
+ * reference's documented ~25 ppm measurement bias in three 1 min
+ * windows in a row, on the same side, releases the hold for a fresh
+ * acquisition. It used the cumulative error since the hold began,
+ * which never forgets a fault in the count: a talker whose stream ran
+ * within 1 ppm of gPTP read -97 ppm three minutes after it started,
+ * the hold was released, and the re-acquisition applied that reading
+ * and walked the APLL to +110 ppm. Every P4 board had released this
+ * way, always on a negative reading. A fault now spoils one window. */
 #define AVB_PLL_HOLD_BREAK_PPM_Q16 ((int32_t)(30 * 65536))
-#define AVB_PLL_HOLD_BREAK_TICKS 36
+#define AVB_PLL_HOLD_BREAK_WINDOW_TICKS 12
+#define AVB_PLL_HOLD_BREAK_WINDOWS 3
 
 /* Held-trim refinement from the talker's ADC (see avb_pll_tick): the
  * reading averaged over 2 min of streaming, once it is at least 1 ppm,
@@ -1007,7 +1019,8 @@ void avb_pll_tick(avb_state_s *state) {
       }
       memcpy(s_pll.hold_btc_id, btc_now, 8);
       s_pll.hold_btc_known = true;
-      s_pll.hold_break_ticks = 0;
+      s_pll.hold_win_ticks = 0;
+      s_pll.hold_beyond_windows = 0;
       s_pll.valid = false;    /* re-seed baselines below on this tick */
     } else if (s_pll.hold_btc_known && memcmp(s_pll.hold_btc_id, btc_now, 8) != 0) {
       /* Runtime BTC change: the trim was relative to the old reference. */
@@ -1016,7 +1029,8 @@ void avb_pll_tick(avb_state_s *state) {
       s_pll.internal_hold = false;
       s_pll.internal_correcting_since_us = now_us;
       s_pll.integrator_ppm_q16 = 0;
-      s_pll.hold_break_ticks = 0;
+      s_pll.hold_win_ticks = 0;
+      s_pll.hold_beyond_windows = 0;
       s_pll.valid = false;
       return;
     }
@@ -1065,6 +1079,7 @@ void avb_pll_tick(avb_state_s *state) {
 
   /* First valid sample — seed the baselines, nothing to compare yet */
   if (!s_pll.valid) {
+    s_pll.hold_win_ticks = 0;
     s_pll.base_i2s_bytes = bytes_now;
     s_pll.base_gptp_ns = gptp_now_ns;
     s_pll.prev_i2s_bytes = bytes_now;
@@ -1129,22 +1144,49 @@ void avb_pll_tick(avb_state_s *state) {
 
   /* Hold breaker, see AVB_PLL_HOLD_BREAK_PPM_Q16. */
   if (internal_mode && s_pll.internal_hold) {
-    bool beyond = cumul_ppm_q16 > AVB_PLL_HOLD_BREAK_PPM_Q16 ||
-                  cumul_ppm_q16 < -AVB_PLL_HOLD_BREAK_PPM_Q16;
-    if (!beyond) {
-      s_pll.hold_break_ticks = 0;
-    } else if (++s_pll.hold_break_ticks >= AVB_PLL_HOLD_BREAK_TICKS) {
-      s_pll.hold_break_ticks = 0;
-      s_pll.internal_hold = false;
-      s_pll.internal_correcting_since_us = now_us;
-      s_pll.integrator_ppm_q16 = 0;
-      s_pll.next_correction_us = now_us; /* correct on this tick */
-      ESP_LOGW(TAG,
-               "held trim measures %ld ppm off for %d s, releasing hold and "
-               "re-acquiring",
-               (long)(cumul_ppm_q16 / 65536),
-               AVB_PLL_HOLD_BREAK_TICKS * 5);
+    if (s_pll.hold_win_ticks == 0) {
+      s_pll.hold_win_bytes = bytes_now;
+      s_pll.hold_win_gptp_ns = gptp_now_ns;
+    } else if (s_pll.hold_win_ticks >= AVB_PLL_HOLD_BREAK_WINDOW_TICKS) {
+      int32_t win_q16 =
+          compute_ppm_q16(state, bytes_now - s_pll.hold_win_bytes,
+                          gptp_now_ns - s_pll.hold_win_gptp_ns);
+      int32_t sign = win_q16 > AVB_PLL_HOLD_BREAK_PPM_Q16    ? 1
+                     : win_q16 < -AVB_PLL_HOLD_BREAK_PPM_Q16 ? -1
+                                                             : 0;
+      if (sign == 0)
+        s_pll.hold_beyond_windows = 0;
+      else if (sign == s_pll.hold_beyond_sign)
+        s_pll.hold_beyond_windows++;
+      else
+        s_pll.hold_beyond_windows = 1;
+      s_pll.hold_beyond_sign = sign;
+      if (sign != 0)
+        ESP_LOGI(TAG, "held trim window %lu of %d: %ld ppm off",
+                 (unsigned long)s_pll.hold_beyond_windows,
+                 AVB_PLL_HOLD_BREAK_WINDOWS, (long)(win_q16 / 65536));
+      s_pll.hold_win_bytes = bytes_now;
+      s_pll.hold_win_gptp_ns = gptp_now_ns;
+      s_pll.hold_win_ticks = 0;
+      if (s_pll.hold_beyond_windows >= AVB_PLL_HOLD_BREAK_WINDOWS) {
+        s_pll.hold_beyond_windows = 0;
+        s_pll.internal_hold = false;
+        s_pll.internal_correcting_since_us = now_us;
+        s_pll.integrator_ppm_q16 = 0;
+        /* Acquire from a fresh baseline: the cumulative error since the
+         * hold began carries whatever the windows were spared. */
+        s_pll.base_i2s_bytes = bytes_now;
+        s_pll.base_gptp_ns = gptp_now_ns;
+        s_pll.next_correction_us = now_us + correction_interval_us;
+        ESP_LOGW(TAG,
+                 "held trim measures %ld ppm off in %d windows of %d s, "
+                 "releasing hold and re-acquiring",
+                 (long)(win_q16 / 65536), AVB_PLL_HOLD_BREAK_WINDOWS,
+                 AVB_PLL_HOLD_BREAK_WINDOW_TICKS * 5);
+        return;
+      }
     }
+    s_pll.hold_win_ticks++;
   }
 
 
