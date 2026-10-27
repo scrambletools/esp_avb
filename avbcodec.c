@@ -627,42 +627,28 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   return ESP_OK;
 }
 
-/* Switch the audio hardware to a new sample rate. Codecs cannot
- * retune live — they need a stop/start (or reset) around a rate
- * change — so this must only run while NO stream is active in either
- * direction (the AECP layer enforces that with STREAM_IS_RUNNING).
- * Sequence: codec off → I2S channels disabled → I2S clock tree
- * reconfigured (rate + per-rate MCLK multiple) → codec re-programmed
- * at the new fs → everything back on → media-clock/PLL re-seeded. */
-esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
-  if (rate == state->config.default_sample_rate)
-    return ESP_OK;
-  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
-  const void *codec_clock_data = NULL;
-  uint32_t mclk_hz =
-      caps ? avb_codec_select_mclk(state, rate, state->codec_mclk_hz,
-                                   &codec_clock_data)
-           : 0;
-  if (mclk_hz == 0) {
-    ESP_LOGE(TAG, "Rate change to %lu Hz: no usable clock plan on this codec",
-             (unsigned long)rate);
-    return ESP_ERR_NOT_SUPPORTED;
-  }
-  if (!state->codec_enabled || !state->codec_if || !state->i2s_tx_handle ||
-      !state->i2s_rx_handle) {
-    return ESP_ERR_INVALID_STATE;
-  }
+/* Disable one I2S channel for a reclock. A channel that is already
+ * disabled is fine: an earlier failed step may have left it so. */
+static esp_err_t audio_channel_disable(i2s_chan_handle_t handle) {
+  esp_err_t err = i2s_channel_disable(handle);
+  return err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+}
 
+/* The hardware half of a rate change: codec off, I2S clock tree moved
+ * to (rate, mclk_hz), codec re-programmed, everything back on. */
+static esp_err_t audio_hw_reclock(avb_state_s *state, uint32_t rate,
+                                  uint32_t mclk_hz,
+                                  const void *codec_clock_data, bool park) {
+  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
   const audio_codec_if_t *cif = (const audio_codec_if_t *)state->codec_if;
   if (cif->enable)
     cif->enable(cif, false);
-  ESP_RETURN_ON_ERROR(i2s_channel_disable(state->i2s_tx_handle), TAG,
+  ESP_RETURN_ON_ERROR(audio_channel_disable(state->i2s_tx_handle), TAG,
                       "i2s tx disable");
-  ESP_RETURN_ON_ERROR(i2s_channel_disable(state->i2s_rx_handle), TAG,
+  ESP_RETURN_ON_ERROR(audio_channel_disable(state->i2s_rx_handle), TAG,
                       "i2s rx disable");
 
   uint32_t mclk_multiple = mclk_hz / rate;
-  bool same_mclk = mclk_hz == state->codec_mclk_hz;
   i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate);
   clk_cfg.mclk_multiple = mclk_multiple;
 #if SOC_CLK_APLL_SUPPORTED
@@ -676,7 +662,7 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
    * asked for the APLL frequency it already records, so it leaves the
    * coefficients (and the servo's trim) alone; only the BCLK divider
    * and the codec row move, and the park is skipped. */
-  if (!same_mclk) {
+  if (park) {
     i2s_std_clk_config_t park_cfg = I2S_STD_CLK_DEFAULT_CONFIG(48000);
     park_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     park_cfg.clk_src = I2S_CLK_SRC_XTAL;
@@ -689,6 +675,7 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
   }
   clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 #else
+  (void)park;
   clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
 #endif
   ESP_RETURN_ON_ERROR(
@@ -722,6 +709,56 @@ esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
                       "i2s tx enable");
   ESP_RETURN_ON_ERROR(i2s_channel_enable(state->i2s_rx_handle), TAG,
                       "i2s rx enable");
+  return ESP_OK;
+}
+
+/* Switch the audio hardware to a new sample rate. Codecs cannot
+ * retune live — they need a stop/start (or reset) around a rate
+ * change — so this must only run while NO stream is active in either
+ * direction (the AECP layer enforces that with STREAM_IS_RUNNING).
+ * Sequence: codec off → I2S channels disabled → I2S clock tree
+ * reconfigured (rate + per-rate MCLK multiple) → codec re-programmed
+ * at the new fs → everything back on → media-clock/PLL re-seeded. */
+esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
+  if (rate == state->config.default_sample_rate)
+    return ESP_OK;
+  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
+  const void *codec_clock_data = NULL;
+  uint32_t mclk_hz =
+      caps ? avb_codec_select_mclk(state, rate, state->codec_mclk_hz,
+                                   &codec_clock_data)
+           : 0;
+  if (mclk_hz == 0) {
+    ESP_LOGE(TAG, "Rate change to %lu Hz: no usable clock plan on this codec",
+             (unsigned long)rate);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+  if (!state->codec_enabled || !state->codec_if || !state->i2s_tx_handle ||
+      !state->i2s_rx_handle) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  bool same_mclk = mclk_hz == state->codec_mclk_hz;
+  esp_err_t err =
+      audio_hw_reclock(state, rate, mclk_hz, codec_clock_data, !same_mclk);
+  if (err != ESP_OK) {
+    /* Put the hardware back on the running rate. Without this a failed
+     * step left both channels disabled, every later rate change failed
+     * at the disable step, and the board stayed silent until reboot. */
+    uint32_t old_rate = state->config.default_sample_rate;
+    const void *old_clock_data = NULL;
+    avb_codec_select_mclk(state, old_rate, state->codec_mclk_hz,
+                          &old_clock_data);
+    esp_err_t restored = audio_hw_reclock(state, old_rate, state->codec_mclk_hz,
+                                          old_clock_data, true);
+    if (restored == ESP_OK && avb_pll_init(state->codec_mclk_hz) == 0)
+      avb_pll_restore_trim(state);
+    ESP_LOGE(TAG, "Rate change to %lu Hz failed (%s); %s %lu Hz",
+             (unsigned long)rate, esp_err_to_name(err),
+             restored == ESP_OK ? "back on" : "could not restore",
+             (unsigned long)old_rate);
+    return err;
+  }
 
   /* Commit the new rate only now that every hardware step has succeeded.
    * A failure above leaves default_sample_rate untouched, so a retry
