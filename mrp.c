@@ -436,6 +436,9 @@ static void mrp_port_dispatch_periodic(int port);
 /* AVB Lite declaration timing, defined after the TX flush helpers. */
 static bool mrp_lite_flush(avb_state_s *state, int port, int64_t now);
 static void mrp_lite_redeclare_all(int port, int64_t now);
+/* A station's own LeaveAll applied to its Registrars, defined after the
+ * attribute tables. */
+static void mrp_station_self_leaveall(int port);
 
 /* Called from avb_periodic / avb main loop on every tick. Fires
  * expired port-scoped timers. Returns true if anything fired. */
@@ -468,11 +471,15 @@ bool mrp_port_tick(avb_state_s *state, int port) {
       mrp_lite_redeclare_all(port, now);
     } else if (!suppress) {
       p->mrp_leaveall_tx_pending = true;
+      if (p->medium == avb_port_medium_wifi_ftm &&
+          p->wifi_mode == avb_port_wifi_mode_sta)
+        mrp_station_self_leaveall(port);
     }
     p->mrp_leaveall_timer_us = mrp_leaveall_next_expiry_us(p, state->avb_lite);
     fired = true;
-    /* TODO: iterate this port's attribute table and step
-     * applicant + registrar with mrp_event_r_la on each entry. */
+    /* TODO: on wired and access point ports, also step this port's own
+     * Registrars with mrp_event_r_la (only stations do, see
+     * mrp_station_self_leaveall). */
   }
 
   /* PeriodicTimer: every 1 s, drive periodic! into active Applicants
@@ -1751,6 +1758,41 @@ static void mrp_on_domain_registrar_change(avb_state_s *state, int port,
   (void)port;
   (void)tr;
 #endif
+}
+
+/* A station applies its own LeaveAll to its Registrars too (802.1Q
+ * §10.7.6, sLA), with a LeaveTime long enough that the access point's
+ * 1 s periodic re-declarations keep every live registration IN. The
+ * access point sends a LeaveAll of an attribute type only while it
+ * declares some attribute of that type, and its single Lv for an
+ * attribute can be lost on the air; then nothing else ages the
+ * registration out, and a talker kept streaming its uplink for a
+ * listener that had left minutes before. Only IN entries start the
+ * timer: one already in LV keeps the peer's shorter LeaveTime. */
+#define MRP_STATION_SELF_LEAVE_US (10 * 1000 * 1000)
+static void mrp_station_self_leaveall(int port) {
+  int64_t expiry = esp_timer_get_time() + MRP_STATION_SELF_LEAVE_US;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    mrp_sm_state_t *sm = &s_msrp_talkers[port][i].sm;
+    if (s_msrp_talkers[port][i].valid && sm->registrar == mrp_registrar_in) {
+      mrp_registrar_step(sm, mrp_event_r_la);
+      sm->leave_timer_us = expiry;
+    }
+  }
+  for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
+    mrp_sm_state_t *sm = &s_msrp_listeners[port][i].sm;
+    if (s_msrp_listeners[port][i].valid && sm->registrar == mrp_registrar_in) {
+      mrp_registrar_step(sm, mrp_event_r_la);
+      sm->leave_timer_us = expiry;
+    }
+  }
+  for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
+    mrp_sm_state_t *sm = &s_msrp_domains[port][i].sm;
+    if (s_msrp_domains[port][i].valid && sm->registrar == mrp_registrar_in) {
+      mrp_registrar_step(sm, mrp_event_r_la);
+      sm->leave_timer_us = expiry;
+    }
+  }
 }
 
 /* Dispatch rLA to the SMs of ONE attribute type on this port.
