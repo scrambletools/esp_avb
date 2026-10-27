@@ -2425,7 +2425,9 @@ static bool avb_persist_stream_format_supported(avb_state_s *state,
   size_t num_supported = is_output ? state->num_supported_formats_out
                                    : state->num_supported_formats_in;
   for (size_t i = 0; i < num_supported; i++) {
-    if (memcmp(format, &supported[i], 8) == 0)
+    if (memcmp(format, &supported[i], 8) == 0 ||
+        avb_am824_same_but_upto((const avtp_stream_format_s *)format,
+                                &supported[i]))
       return true;
   }
   return false;

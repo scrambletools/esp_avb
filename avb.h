@@ -467,6 +467,26 @@ typedef struct {
 /* AVTP / MAAP types and protocol message declarations */
 #include "avtp.h"
 
+/* An IEC 61883-6 AM824 word that differs from a listed one only in the
+ * UT ("up to" this many channels) flag. MOTU endpoints and others
+ * declare their AM824 formats with UT set; a stream of exactly the
+ * listed channel count fits both, so either word is accepted and the
+ * requested one is kept. */
+static inline bool avb_am824_same_but_upto(const avtp_stream_format_s *requested,
+                                           const avtp_stream_format_s *listed) {
+  const uint8_t *req = (const uint8_t *)requested;
+  const uint8_t *lst = (const uint8_t *)listed;
+  const uint8_t upto_bit = 0x20; /* byte 4: b, nb, ut, sc */
+  if ((req[0] & 0x7f) != avtp_subtype_61883 || req[0] != lst[0])
+    return false;
+  for (int i = 1; i < 8; i++) {
+    uint8_t mask = i == 4 ? (uint8_t)~upto_bit : 0xff;
+    if ((req[i] & mask) != (lst[i] & mask))
+      return false;
+  }
+  return true;
+}
+
 /* ATDECC (IEEE 1722.1) types and protocol message declarations.
  * Also provides avtp_msgbuf_u — the AVTP envelope union spanning
  * every subtype, including the ATDECC ones (ADP/AECP/ACMP). */

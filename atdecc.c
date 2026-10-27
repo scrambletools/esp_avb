@@ -2857,7 +2857,8 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
                                        : state->num_supported_formats_in;
       for (size_t i = 0; i < num_supported; i++) {
         if (memcmp(requested, &supported[i], sizeof(avtp_stream_format_s)) ==
-            0) {
+                0 ||
+            avb_am824_same_but_upto(requested, &supported[i])) {
           format_supported = true;
           break;
         }
