@@ -320,9 +320,9 @@ static struct {
   uint32_t stream_ref_epoch_seen;
   bool stream_ref_phase; /* sensing presentation phase, see read_sample */
   /* Held-trim refinement from the talker's ADC, see avb_pll_tick. */
-  int64_t adc_steady_since_us; /* 0 = no steady reading */
-  int32_t adc_steady_ppm_q16;
-  int64_t adc_refined_us;  /* last refinement move */
+  int64_t adc_window_start_us; /* 0 = no averaging window */
+  int64_t adc_sum_q16;
+  uint32_t adc_samples;
   bool adc_refine_landing; /* persist the trim when that slew lands */
 } s_pll;
 
@@ -422,14 +422,19 @@ static struct {
 #define AVB_PLL_HOLD_BREAK_PPM_Q16 ((int32_t)(30 * 65536))
 #define AVB_PLL_HOLD_BREAK_TICKS 36
 
-/* Held-trim refinement from the talker's ADC (see avb_pll_tick): a
- * reading of at least 1 ppm, steady within 0.5 ppm for 5 min, moves
- * the trim by at most 5 ppm, and at most once per 10 min while the
- * ADC-following cadence settles on the new rate. */
+/* Held-trim refinement from the talker's ADC (see avb_pll_tick): the
+ * reading averaged over 2 min of streaming, once it is at least 1 ppm,
+ * moves the trim by at most 5 ppm. The first 3 min after a talker
+ * start, or after a move has landed, are left out: the stream's rate
+ * follows a new ADC rate only as the ADC-following cadence catches up,
+ * which took about 2 min after a 5 ppm move (a 30 s settle averaged
+ * the old rate in and overshot by 3 ppm). The old rule wanted the
+ * reading steady within 0.5 ppm for 5 min, which its +/-2 ppm wander
+ * between 10 s windows rarely allowed: three moves in 10 h, and
+ * talkers stayed 5-9 ppm off. */
 #define AVB_PLL_ADC_REFINE_MIN_PPM_Q16 (1 * 65536)
-#define AVB_PLL_ADC_REFINE_BAND_PPM_Q16 (65536 / 2)
-#define AVB_PLL_ADC_REFINE_SETTLE_US (5LL * 60 * 1000000LL)
-#define AVB_PLL_ADC_REFINE_INTERVAL_US (10LL * 60 * 1000000LL)
+#define AVB_PLL_ADC_REFINE_WINDOW_US (2LL * 60 * 1000000LL)
+#define AVB_PLL_ADC_REFINE_SETTLE_US (3LL * 60 * 1000000LL)
 #define AVB_PLL_ADC_REFINE_MAX_PPM_Q16 (5 * 65536)
 #define AVB_PLL_ADC_STALE_MS 15000u
 
@@ -1259,18 +1264,38 @@ void avb_pll_tick(avb_state_s *state) {
     int32_t adc_q16 = state->media_clock.talker_adc_error_ppm_q8 * 256;
     bool fresh = stamp_ms != 0 &&
                  (uint32_t)(now_us / 1000) - stamp_ms < AVB_PLL_ADC_STALE_MS;
-    int32_t abs_adc_q16 = adc_q16 < 0 ? -adc_q16 : adc_q16;
-    int32_t drift_q16 = adc_q16 - s_pll.adc_steady_ppm_q16;
-    if (!fresh || abs_adc_q16 < AVB_PLL_ADC_REFINE_MIN_PPM_Q16) {
-      s_pll.adc_steady_since_us = 0;
-    } else if (s_pll.adc_steady_since_us == 0 ||
-               drift_q16 > AVB_PLL_ADC_REFINE_BAND_PPM_Q16 ||
-               drift_q16 < -AVB_PLL_ADC_REFINE_BAND_PPM_Q16) {
-      s_pll.adc_steady_since_us = now_us;
-      s_pll.adc_steady_ppm_q16 = adc_q16;
-    } else if (now_us - s_pll.adc_steady_since_us >=
-                   AVB_PLL_ADC_REFINE_SETTLE_US &&
-               now_us - s_pll.adc_refined_us >= AVB_PLL_ADC_REFINE_INTERVAL_US) {
+    if (!fresh) {
+      s_pll.adc_window_start_us = 0;
+    } else if (s_pll.adc_window_start_us == 0) {
+      /* A talker start, a gap, or a landed move (the slew above
+       * returns until then): skip the settling. */
+      s_pll.adc_window_start_us = now_us + AVB_PLL_ADC_REFINE_SETTLE_US;
+      s_pll.adc_sum_q16 = 0;
+      s_pll.adc_samples = 0;
+    } else if (now_us >= s_pll.adc_window_start_us) {
+      s_pll.adc_sum_q16 += adc_q16;
+      s_pll.adc_samples++;
+    }
+    int32_t mean_q16 = s_pll.adc_samples
+                           ? (int32_t)(s_pll.adc_sum_q16 / s_pll.adc_samples)
+                           : 0;
+    int32_t abs_mean_q16 = mean_q16 < 0 ? -mean_q16 : mean_q16;
+    if (fresh && s_pll.adc_window_start_us != 0 &&
+        now_us - s_pll.adc_window_start_us >= AVB_PLL_ADC_REFINE_WINDOW_US) {
+      /* Window over: start the next one either way. */
+      int32_t mean_cppm = (int32_t)(((int64_t)mean_q16 * 100) / 65536);
+      int32_t abs_mean_cppm = mean_cppm < 0 ? -mean_cppm : mean_cppm;
+      ESP_LOGI(TAG, "held trim check: ADC %s%ld.%02d ppm over %lu readings",
+               mean_cppm < 0 ? "-" : "+", (long)(abs_mean_cppm / 100),
+               (int)(abs_mean_cppm % 100), (unsigned long)s_pll.adc_samples);
+      s_pll.adc_window_start_us = now_us;
+      s_pll.adc_sum_q16 = 0;
+      s_pll.adc_samples = 0;
+    } else {
+      abs_mean_q16 = 0;
+    }
+    if (abs_mean_q16 >= AVB_PLL_ADC_REFINE_MIN_PPM_Q16) {
+      adc_q16 = mean_q16;
       int32_t move_q16 = adc_q16;
       if (move_q16 > AVB_PLL_ADC_REFINE_MAX_PPM_Q16)
         move_q16 = AVB_PLL_ADC_REFINE_MAX_PPM_Q16;
@@ -1288,8 +1313,7 @@ void avb_pll_tick(avb_state_s *state) {
       if (new_target < -AVB_PLL_MAX_APPLIED_PPM_Q16)
         new_target = -AVB_PLL_MAX_APPLIED_PPM_Q16;
       state->media_clock.pll_target_ppm_q16 = new_target;
-      s_pll.adc_refined_us = now_us;
-      s_pll.adc_steady_since_us = 0;
+      s_pll.adc_window_start_us = 0;
       s_pll.adc_refine_landing = true;
       int32_t adc_cppm = (int32_t)(((int64_t)adc_q16 * 100) / 65536);
       int32_t abs_adc_cppm = adc_cppm < 0 ? -adc_cppm : adc_cppm;
