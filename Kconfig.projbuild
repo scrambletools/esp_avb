@@ -527,6 +527,19 @@ menu "AVB Configuration"
             timestamps are flagged uncertain (tu=1) or gPTP is not yet
             valid, playout falls back to a fixed byte-prefill gate.
 
+    config ESP_AVB_STATION_CHANNELS_PER_STREAM
+        int "Channels per stream on a Wi-Fi station"
+        default 2
+        range 1 8
+        depends on ESP_AVB
+        help
+            A Wi-Fi station's stream formats carry at most this many
+            channels, in both directions. Its codec is stereo, and an
+            8-channel Class B stream costs four times the airtime: a C6
+            station measured 12 % of its 8-channel uplink sends failing
+            for buffers and nearly half of its frames lost, with
+            2-channel streams clean. Wired endpoints are unaffected.
+
     config ESP_AVB_LISTENER_LATENCY_TRIM_S
         int "Trim surplus playout latency every this many seconds (0 = never)"
         default 60

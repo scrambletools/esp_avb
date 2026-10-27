@@ -879,6 +879,9 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   state->port[0].wifi_mode = avb_port_wifi_mode_ap;
 #elif defined(CONFIG_ESP_AVB_PORT0_WIFI_MODE_STA)
   state->port[0].wifi_mode = avb_port_wifi_mode_sta;
+  /* A station's formats stop at its channel limit, see the Kconfig. */
+  if (state->config.channels_per_stream > CONFIG_ESP_AVB_STATION_CHANNELS_PER_STREAM)
+    state->config.channels_per_stream = CONFIG_ESP_AVB_STATION_CHANNELS_PER_STREAM;
 #else
   state->port[0].wifi_mode = avb_port_wifi_mode_none;
 #endif
