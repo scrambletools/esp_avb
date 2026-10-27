@@ -622,6 +622,7 @@ static uint32_t s_mirror_skipped_bytes; /* consumer trimmed a backlog */
 static uint32_t s_mirror_reprimes;      /* underruns that emptied it */
 static bool s_mirror_primed;
 static int64_t s_mirror_last_pop_us;
+static volatile uint32_t s_mirror_last_push_ms;
 
 static void mirror_push(const uint8_t *src, uint32_t len) {
   uint32_t head = atomic_load_explicit(&s_mirror_head, memory_order_relaxed);
@@ -637,6 +638,7 @@ static void mirror_push(const uint8_t *src, uint32_t len) {
   memcpy(s_mirror_buf + pos, src, first);
   memcpy(s_mirror_buf, src + first, len - first);
   atomic_store_explicit(&s_mirror_head, head + len, memory_order_release);
+  s_mirror_last_push_ms = (uint32_t)(esp_timer_get_time() / 1000);
 }
 
 /* Fill dst with the next len bytes of playout, zeros where the listener
@@ -646,7 +648,9 @@ static void mirror_push(const uint8_t *src, uint32_t len) {
  * sends silence until that much is queued, and again after an underrun
  * empties it. A talker that (re)starts finds what the listener left
  * since it last ran; that backlog, or one near overflow, is trimmed back
- * to the target. Steady state never drops played samples. */
+ * to the target, or dropped whole when the listener has stopped (its
+ * last 4 ms opened the next stream: plaa saw an earlier cell's tone).
+ * Steady state never drops played samples. */
 static void mirror_pop(uint8_t *dst, uint32_t len, uint32_t target) {
   int64_t now_us = esp_timer_get_time();
   uint32_t tail = atomic_load_explicit(&s_mirror_tail, memory_order_relaxed);
@@ -655,11 +659,15 @@ static void mirror_pop(uint8_t *dst, uint32_t len, uint32_t target) {
   if ((now_us - s_mirror_last_pop_us > 100000 ||
        avail > MIRROR_CAPACITY * 3 / 4) &&
       avail > target) {
-    uint32_t skip = avail - target;
+    bool listening =
+        (uint32_t)(now_us / 1000) - s_mirror_last_push_ms <= 100;
+    uint32_t skip = avail - (listening ? target : 0);
     skip -= skip % MIRROR_FRAME;
     s_mirror_skipped_bytes += skip;
     tail += skip;
     avail -= skip;
+    if (!listening)
+      s_mirror_primed = false;
   }
   s_mirror_last_pop_us = now_us;
   if (!s_mirror_primed) {
