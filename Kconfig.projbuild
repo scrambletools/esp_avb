@@ -364,6 +364,17 @@ menu "AVB Configuration"
         help
             Frequency of the generated test tone.
 
+    config ESP_AVB_TEST_TONE_PER_CHANNEL
+        bool "Test tone at a different frequency on each channel"
+        default n
+        depends on ESP_AVB
+        help
+            Channel n plays the test tone frequency plus 250 Hz x n
+            (1000, 1250, 1500 Hz and so on for a 1 kHz tone), so a
+            capture shows channel order as well as clicks, gaps and
+            rate. Applies to the test tone build and to the Test Tone
+            control.
+
     config ESP_AVB_DEFAULT_FORMAT_AM824
         bool "Default stream format AM824 (IEC 61883-6) instead of AAF"
         default n

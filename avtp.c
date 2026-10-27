@@ -109,9 +109,14 @@ static uint32_t gcd(uint32_t a, uint32_t b) {
   return a;
 }
 
+/* Per-channel test tone spacing: channel n plays freq + n x this. */
+#define TONE_CHANNEL_STEP_HZ 250
+
 /* Build a precomputed sine wave lookup table (one exact cycle)
  *
- * Each entry is a big-endian PCM sample (all channels identical).
+ * Each entry is a big-endian PCM sample, the same on every channel, or
+ * with CONFIG_ESP_AVB_TEST_TONE_PER_CHANNEL at freq + 250 Hz x channel
+ * so a capture shows channel order.
  * Returns the number of samples in one cycle, or 0 on allocation failure.
  * Caller must free *lut_out when done.
  */
@@ -119,7 +124,14 @@ static uint32_t build_sine_lut(uint8_t **lut_out, int channels, int bit_depth,
                                uint32_t sample_rate, float freq) {
   // One exact cycle length = sample_rate / gcd(sample_rate, freq)
   uint32_t freq_int = (uint32_t)freq;
+#if CONFIG_ESP_AVB_TEST_TONE_PER_CHANNEL
+  /* Every channel's frequency is a multiple of this, so one table
+   * period holds a whole number of cycles of each. */
+  uint32_t cycle_samples =
+      sample_rate / gcd(sample_rate, gcd(freq_int, TONE_CHANNEL_STEP_HZ));
+#else
   uint32_t cycle_samples = sample_rate / gcd(sample_rate, freq_int);
+#endif
 
   int stride = (bit_depth == 24) ? 4 : (bit_depth / 8);
   int frame_size = stride * channels;
@@ -139,6 +151,14 @@ static uint32_t build_sine_lut(uint8_t **lut_out, int channels, int bit_depth,
     int32_t sample = (int32_t)(sinf(phase) * amplitude * 0.7f); // 70% amplitude
 
     for (int ch = 0; ch < channels; ch++) {
+#if CONFIG_ESP_AVB_TEST_TONE_PER_CHANNEL
+      /* Phase from the index, (f x i) mod rate, so it stays exact. */
+      uint32_t ch_freq = freq_int + TONE_CHANNEL_STEP_HZ * (uint32_t)ch;
+      float ch_phase = 2.0f * (float)M_PI *
+                       (float)(((uint64_t)ch_freq * i) % sample_rate) /
+                       (float)sample_rate;
+      sample = (int32_t)(sinf(ch_phase) * amplitude * 0.7f);
+#endif
       int offset = (i * channels + ch) * stride;
       if (bit_depth == 24) {
         // IEEE 1722 AAF §7.3.5: 24-bit sample left-justified in 32-bit
