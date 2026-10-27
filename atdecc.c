@@ -2942,22 +2942,30 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
   }
 }
 
+static int avb_reflect_aem_command(avb_state_s *state, aecp_message_u *msg,
+                                   eth_addr_t *src_addr, aecp_status_t status);
+
 int avb_process_aecp_cmd_get_stream_format(avb_state_s *state,
                                            aecp_message_u *msg,
                                            eth_addr_t *src_addr) {
 
+  /* A descriptor this entity does not have gets NO_SUCH_DESCRIPTOR, here
+   * and in the other read commands: without a response the controller
+   * waits out its timeout. */
   uint16_t descriptor_type =
       octets_to_uint(msg->stream_format.descriptor_type, 2);
   if (descriptor_type != aem_desc_type_stream_input &&
       descriptor_type != aem_desc_type_stream_output) {
-    return ERROR;
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   uint16_t index = octets_to_uint(msg->stream_format.descriptor_index, 2);
   bool is_output = descriptor_type == aem_desc_type_stream_output;
   if ((is_output && index >= state->num_output_streams) ||
       (!is_output && index >= state->num_input_streams)) {
-    return ERROR;
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   // fill in the current stream format
@@ -3155,9 +3163,10 @@ int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
       octets_to_uint(msg->get_stream_info.descriptor_type, 2);
   if (descriptor_type != aem_desc_type_stream_input &&
       descriptor_type != aem_desc_type_stream_output) {
-    avberr("AECP Get Stream Info: unsupported descriptor type: %d",
-           descriptor_type);
-    return ERROR;
+    avbdebug("AECP Get Stream Info: unsupported descriptor type: %d",
+             descriptor_type);
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   // validate descriptor index is in range
@@ -3165,8 +3174,9 @@ int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
   bool is_output = descriptor_type == aem_desc_type_stream_output;
   if ((is_output && index >= state->num_output_streams) ||
       (!is_output && index >= state->num_input_streams)) {
-    avberr("AECP Get Stream Info: descriptor index out of range: %d", index);
-    return ERROR;
+    avbdebug("AECP Get Stream Info: descriptor index out of range: %d", index);
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   // send the response
@@ -3237,16 +3247,18 @@ int avb_process_aecp_cmd_get_avb_info(avb_state_s *state, aecp_message_u *msg,
   uint16_t descriptor_type =
       octets_to_uint(msg->get_avb_info.descriptor_type, 2);
   if (descriptor_type != aem_desc_type_avb_interface) {
-    avberr("AECP Get AVB Info: unsupported descriptor type: %d",
-           descriptor_type);
-    return ERROR;
+    avbdebug("AECP Get AVB Info: unsupported descriptor type: %d",
+             descriptor_type);
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   // validate descriptor index (only one interface supported)
   uint16_t index = octets_to_uint(msg->get_avb_info.descriptor_index, 2);
   if (index != 0) {
-    avberr("AECP Get AVB Info: descriptor index out of range: %d", index);
-    return ERROR;
+    avbdebug("AECP Get AVB Info: descriptor index out of range: %d", index);
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   // send the response
@@ -3292,8 +3304,9 @@ int avb_process_aecp_cmd_get_as_path(avb_state_s *state, aecp_message_u *msg,
   // validate descriptor index (only one interface supported)
   uint16_t index = octets_to_uint(msg->get_as_path.descriptor_index, 2);
   if (index != 0) {
-    avberr("AECP Get AS Path: descriptor index out of range: %d", index);
-    return ERROR;
+    avbdebug("AECP Get AS Path: descriptor index out of range: %d", index);
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
 
   // send the response
@@ -3372,9 +3385,10 @@ int avb_process_aecp_cmd_get_counters(avb_state_s *state, aecp_message_u *msg,
     char desc_type_str[7];
     octets_to_hex_string(msg->get_counters.descriptor_type, 2, desc_type_str,
                          '-');
-    avberr("Ignoring AECP Get Counters for unsupported descriptor type %s",
-           desc_type_str);
-    return ERROR;
+    avbdebug("AECP Get Counters for unsupported descriptor type %s",
+             desc_type_str);
+    return avb_reflect_aem_command(state, msg, src_addr,
+                                   aecp_status_no_such_descriptor);
   }
   int ret =
       avb_net_send_to(state, ethertype_avtp, &response, msg_len, &ts, src_addr);
