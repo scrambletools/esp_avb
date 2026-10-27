@@ -2410,6 +2410,7 @@ typedef struct {
   uint16_t diag_i2s_bytes;
   uint8_t diag_first_audio[8];
   uint8_t diag_captured; /* 0=waiting, 1=pending print, 2=printed */
+  uint32_t start_serial; /* increments per stream-in start (stats re-baseline) */
   /* Milan late/early ts counters (updated by the drift sampler in
    * main loop from drift_latest_*). Not in the hot path. */
   uint32_t late_ts_count;
@@ -3872,6 +3873,13 @@ void avb_stream_in_print_diag(void) {
    * caller (AVB-STATS). */
   static uint32_t last_pkt = 0, last_ok = 0, last_fail = 0;
   static uint32_t last_drain = 0, last_under = 0;
+  /* A new stream's counters start at zero: re-baseline, as stream-out
+   * does, or the first window prints wrapped deltas. */
+  static uint32_t prev_serial = 0;
+  if (ctx->start_serial != prev_serial) {
+    prev_serial = ctx->start_serial;
+    last_pkt = last_ok = last_fail = last_drain = last_under = 0;
+  }
 
   uint32_t packets = ctx->pkt_count;
   uint32_t ok = ctx->ring_write_ok;
@@ -4353,6 +4361,8 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   }
   ctx->state = state;
   ctx->i2s_tx_handle = state->i2s_tx_handle;
+  static uint32_t s_rx_start_serial = 0;
+  ctx->start_serial = ++s_rx_start_serial;
   /* Ring carries stereo 24-in-32 slots: 8 B per sample frame. Used by
    * loss concealment to convert arrival gaps and presentation leads
    * into ring bytes. */
