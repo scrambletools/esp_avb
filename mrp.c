@@ -3926,8 +3926,13 @@ uint16_t avb_compute_tspec_max_frame_size(avb_state_s *state, uint16_t index) {
   }
   if (channels <= 0 || sample_rate <= 0)
     return 0;
-  /* AAF frames carry the format's samples; AM824 one class interval's. */
-  int samples_per_packet = sample_rate / (1000000 / interval_us);
+  /* AAF frames carry the format's samples; AM824 one class interval's,
+   * rounded up: at 44.1 kHz a Class A frame alternates 5 and 6 data
+   * blocks, and a reservation sized for 5 had the switch police away
+   * 6 % of the stream. */
+  int intervals_per_second = 1000000 / interval_us;
+  int samples_per_packet =
+      (sample_rate + intervals_per_second - 1) / intervals_per_second;
   if (subtype != avtp_subtype_61883) {
     int format_spf = (fmt->aaf_pcm.samples_per_frame_h << 4) |
                      fmt->aaf_pcm.samples_per_frame;
