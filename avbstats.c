@@ -484,6 +484,17 @@ static void avb_cpu_stats_tick(void) {
             (unsigned)missed_frames, (unsigned)overflow_frames,
             (unsigned)missed_wrapped, (unsigned)overflow_wrapped);
   }
+  /* Frames of unrelated ethertypes dropped on arrival: zero in normal
+   * operation, a flood when not. */
+  {
+    extern uint32_t avb_net_rx_dropped_other(void);
+    static uint32_t s_prev_dropped_other;
+    uint32_t dropped_other = avb_net_rx_dropped_other();
+    if (dropped_other != s_prev_dropped_other)
+      avbinfo("  ====> RX dropped %u frames of unrelated ethertypes",
+              (unsigned)(dropped_other - s_prev_dropped_other));
+    s_prev_dropped_other = dropped_other;
+  }
   /* Un-wedge guard activity (avb_emac_rx_unwedge_tick): all zero in
    * normal operation. */
   if (s_emac_kick_count || s_emac_toggle_count || s_emac_recover_count) {

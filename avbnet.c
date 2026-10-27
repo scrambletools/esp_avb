@@ -717,6 +717,10 @@ static volatile uint32_t s_rx_msrp = 0;
 static volatile uint32_t s_rx_mvrp = 0;
 static volatile uint32_t s_rx_vlan = 0;
 static volatile uint32_t s_rx_other = 0;
+/* EMAC frames of an ethertype nobody here takes, dropped on arrival. */
+static volatile uint32_t s_rx_dropped_other = 0;
+
+uint32_t avb_net_rx_dropped_other(void) { return s_rx_dropped_other; }
 /* L2 instrument: every entry into the Wi-Fi RX callback, counted before
  * the malloc that could drop the frame. Compared against s_rx_total
  * (which the dispatcher bumps after a successful malloc): a gap = OOM
@@ -2237,6 +2241,18 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
      * lwIP's pbuf chain indefinitely and slowly drain the default
      * heap. Drop them. */
     if (eth_handle == NULL || s_eth_netif == NULL) {
+      free(buf);
+      return ESP_OK;
+    }
+    /* The IP stack takes only IPv4, ARP and IPv6, and no L2TAP socket
+     * listens for anything else, so drop other ethertypes here instead
+     * of paying an L2TAP walk, an lwIP buffer and a queue hop for each.
+     * This task runs above the AVB task: a flood of 30,000 unrelated
+     * frames/s kept it busy enough that the AVB task stopped
+     * re-declaring MSRP and answering ACMP, and the switch dropped the
+     * talker's reservation. */
+    if (ethertype != 0x0800 && ethertype != 0x0806 && ethertype != 0x86dd) {
+      s_rx_dropped_other++;
       free(buf);
       return ESP_OK;
     }
