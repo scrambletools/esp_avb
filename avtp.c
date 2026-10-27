@@ -14,6 +14,7 @@
 #include "driver/gptimer.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
+#include "esp_heap_caps.h" /* largest free block when the jitter ring fails */
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
@@ -4178,12 +4179,23 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     ctx->rate_check_pending = true;
   }
 
-  ctx->ring.buf = calloc(1, JITTER_RING_SIZE);
-  if (!ctx->ring.buf) {
-    avberr("Stream in: no memory for jitter ring (%d B)", JITTER_RING_SIZE);
+  /* One stream-in runs at a time, so its jitter ring is allocated at
+   * the first start and kept. Allocated at every start, it failed on a
+   * C6 nine minutes after boot: Wi-Fi buffers had fragmented the heap
+   * and no 64 KB block was left. */
+  static uint8_t *s_jitter_ring_buf;
+  if (!s_jitter_ring_buf)
+    s_jitter_ring_buf = calloc(1, JITTER_RING_SIZE);
+  if (!s_jitter_ring_buf) {
+    avberr("Stream in: no memory for jitter ring (%d B, largest free block "
+           "%u B)",
+           JITTER_RING_SIZE,
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
     free(ctx);
     return ERROR;
   }
+  memset(s_jitter_ring_buf, 0, JITTER_RING_SIZE);
+  ctx->ring.buf = s_jitter_ring_buf;
   ctx->ring.capacity = JITTER_RING_SIZE;
   atomic_store(&ctx->ring.head, 0);
   atomic_store(&ctx->ring.tail, 0);
@@ -4192,7 +4204,6 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   if (xTaskCreate(stream_in_drain_task, "avb_drain", 3072, ctx,
                   configMAX_PRIORITIES - 1, &ctx->drain_task) != pdPASS) {
     avberr("Stream in: failed to start drain task");
-    free(ctx->ring.buf);
     free(ctx);
     return ERROR;
   }
@@ -4210,14 +4221,12 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   };
   if (esp_timer_create(&drain_args, &ctx->drain_timer) != ESP_OK) {
     avberr("Stream in: failed to create drain timer");
-    free(ctx->ring.buf);
     free(ctx);
     return ERROR;
   }
   if (esp_timer_start_periodic(ctx->drain_timer, 1000) != ESP_OK) {
     avberr("Stream in: failed to start drain timer");
     esp_timer_delete(ctx->drain_timer);
-    free(ctx->ring.buf);
     free(ctx);
     return ERROR;
   }
@@ -4351,7 +4360,6 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
             (unsigned long)ctx_to_free->media_locked_count,
             (unsigned long)ctx_to_free->media_unlocked_count);
 
-    free(ctx_to_free->ring.buf);
     free(ctx_to_free);
   }
 
