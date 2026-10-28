@@ -439,6 +439,10 @@ static void mrp_lite_redeclare_all(int port, int64_t now);
 /* A station's own LeaveAll applied to its Registrars, defined after the
  * attribute tables. */
 static void mrp_station_self_leaveall(int port);
+/* Held-off Talker Advertise declarations, made once their hold-off ends,
+ * defined after the declare helpers. */
+static bool mrp_talker_release_held(avb_state_s *state, int port,
+                                    int64_t now);
 
 /* Called from avb_periodic / avb main loop on every tick. Fires
  * expired port-scoped timers. Returns true if anything fired. */
@@ -509,6 +513,9 @@ bool mrp_port_tick(avb_state_s *state, int port) {
       p->mrp_join_timer_us = mrp_join_next_expiry_us();
     }
   }
+
+  if (mrp_talker_release_held(state, port, now))
+    fired = true;
 
   /* JoinTimer: armed when a state-change leaves an Applicant with a
    * non-none pending_tx. When fires, build + transmit a single MRPDU
@@ -611,6 +618,9 @@ typedef struct {
   int64_t redeclare_after_us;
   uint32_t holdoff_leaveall_base;
   int64_t withdrawn_us;
+  /* A declaration came during the quarantine and is made at its end
+   * (mrp_talker_release_held); a withdrawal cancels it. */
+  bool declare_held;
   /* CVU idle-timeout stamp (avb_lite.md §6, Declaration timing):
    * refreshed on every RX of this attribute; with LeaveAll disabled
    * in AVB Lite this is the only staleness mechanism. */
@@ -2906,6 +2916,18 @@ bool mrp_talker_forget(int port, const unique_id_t *stream_id) {
   return true;
 }
 
+/* Ends entry e's quarantine: its value may go out now. */
+static void mrp_talker_end_holdoff(int port, msrp_talker_entry_t *e,
+                                   int64_t now_us) {
+  avbinfo("MSRP: declaring the changed talker advertise %lld ms after "
+          "the withdrawal, %lu Talker LeaveAlls heard",
+          (long long)((now_us - e->withdrawn_us) / 1000),
+          (unsigned long)(s_talker_leaveall_count[port] -
+                          e->holdoff_leaveall_base));
+  e->redeclare_after_us = 0;
+  e->declare_held = false;
+}
+
 void mrp_declare_talker_advertise(avb_state_s *state, int port,
                                   const unique_id_t *stream_id,
                                   const eth_addr_t *stream_dest_addr,
@@ -2938,6 +2960,7 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
      * Declaration content). No withdrawal or quarantine. */
     mrp_sm_reset_for_new_value(&e->sm);
     e->redeclare_after_us = 0;
+    e->declare_held = false;
     e->wire = fresh;
     e->lite_next_tx_us = esp_timer_get_time();
   } else if (memcmp(&e->wire.talker.info, &fresh.talker.info,
@@ -2979,19 +3002,41 @@ void mrp_declare_talker_advertise(avb_state_s *state, int port,
   }
   if (e->redeclare_after_us != 0) {
     int64_t now_us = esp_timer_get_time();
-    if (!mrp_value_change_holdoff_over(port, e, now_us))
-      return; /* periodic loop retries after the quarantine */
-    avbinfo("MSRP: declaring the changed talker advertise %lld ms after "
-            "the withdrawal, %lu Talker LeaveAlls heard",
-            (long long)((now_us - e->withdrawn_us) / 1000),
-            (unsigned long)(s_talker_leaveall_count[port] -
-                            e->holdoff_leaveall_base));
-    e->redeclare_after_us = 0;
+    if (!mrp_value_change_holdoff_over(port, e, now_us)) {
+      e->declare_held = true;
+      return;
+    }
+    mrp_talker_end_holdoff(port, e, now_us);
   }
   e->wire = fresh;
   mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
   mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
   mrp_port_arm_join_timer(state, port);
+}
+
+/* Makes each held declaration on this port whose quarantine is over.
+ * Before, only the next declare call ended a quarantine, and a bridge
+ * calls again only when the upstream registration changes: its
+ * re-declaration toward a station came 2 to 9 s after the withdrawal,
+ * the station's Listener stayed Asking Failed until then, and the
+ * switch passed the Ready that followed on at its next LeaveAll. */
+static bool mrp_talker_release_held(avb_state_s *state, int port,
+                                    int64_t now) {
+  bool released = false;
+  for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
+    msrp_talker_entry_t *e = &s_msrp_talkers[port][i];
+    if (!e->valid || !e->declare_held || e->redeclare_after_us == 0 ||
+        !mrp_value_change_holdoff_over(port, e, now))
+      continue;
+    mrp_talker_end_holdoff(port, e, now);
+    mrp_applicant_state_e applicant_before = e->sm.applicant;
+    mrp_applicant_step(&e->sm, mrp_declare_event(&e->sm));
+    mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
+    released = true;
+  }
+  if (released)
+    mrp_port_arm_join_timer(state, port);
+  return released;
 }
 
 void mrp_declare_talker_failed(avb_state_s *state, int port,
@@ -3090,6 +3135,7 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
   msrp_talker_entry_t *e =
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise);
   if (e != NULL) {
+    e->declare_held = false;
     mrp_applicant_state_e applicant_before = e->sm.applicant;
     mrp_withdraw_step(&e->sm);
     mrp_lite_note_local(&e->sm, applicant_before, &e->lite_next_tx_us);
