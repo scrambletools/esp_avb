@@ -11,6 +11,7 @@
  */
 
 #include "avb.h"
+#include "avbsrc.h"
 #include "driver/gptimer.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
@@ -88,6 +89,8 @@ typedef struct {
   volatile int32_t ts_err_ns;          /* stamp error vs gPTP schedule */
   volatile uint32_t wakes;             /* batched pacing: sleeps ended */
   volatile uint32_t stalls;            /* packets sent TALKER_STALL_US late */
+  volatile uint32_t src_cycles;        /* CPU cycles per resampled frame */
+  volatile uint32_t src_walks;         /* converter walks started */
 } stream_tx_ctx_t;
 
 static stream_tx_ctx_t *s_stream_tx_ctx = NULL;
@@ -831,6 +834,7 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t lut_pos = 0;
   uint8_t *pcm_buf = NULL;
   uint8_t *i2s_buf = NULL;
+  uint8_t *src_in_buf = NULL;
   uint8_t *i2s_ring = NULL;
   uint8_t *tx_frame = NULL;
   esp_task_wdt_user_handle_t wdt_handle = NULL;
@@ -1128,6 +1132,34 @@ static void avb_stream_out_task(void *task_param) {
     i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 32 / 1000);
     i2s_ring_size -= i2s_ring_size % i2s_frame_bytes;
   }
+  /* Without an APLL the codec clock cannot be trimmed to gPTP. Its audio
+   * is converted to the stream rate instead: the stamps advance by
+   * exactly the samples sent, the cadence follows the stamps, and the
+   * backlog loop below sets the conversion ratio (a cadence that
+   * followed the codec ran the station's stream 11 to 49 ppm off its
+   * stamps, and every listener that holds its clock trimmed it). */
+  static avb_src_s s_talker_src;
+#if CONFIG_ESP_AVB_TALKER_RESAMPLE
+  bool resample = false;
+  if (!params->use_sine_wave) {
+    src_in_buf = calloc(spp_max + 2, i2s_frame_bytes_pkt);
+    resample = src_in_buf && avb_src_init(&s_talker_src);
+    if (resample)
+      avbinfo("Stream out: codec input resampled to the stream rate");
+    else
+      avbwarn("Stream out: no memory to resample, pacing by the codec");
+  }
+#else
+  const bool resample = false;
+#endif
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+  const int src_slots = 2; /* the mirror carries both slots */
+#else
+  const int src_slots = 1; /* the converters carry only the left slot */
+#endif
+  int32_t src_rate_q32 = 0;
+  int64_t cadence_integ_ppm_q8 = 0; /* cadence PI on the stamp error */
+  uint32_t src_cycles = 0, src_frames = 0;
   uint64_t capture_dropped = 0;
   /* Monotonic byte counters — MUST be 64-bit. As 32-bit ints they
    * cross 2^31 after ~31 min of 192 kHz stereo 24-bit capture
@@ -1520,6 +1552,13 @@ static void avb_stream_out_task(void *task_param) {
     int this_sdl = is_am824 ? (TX_CIP_HDR_LEN + this_audio_len) : this_audio_len;
     int this_frame_len = audio_offset + this_audio_len;
     int this_i2s_read = this_spp * i2s_frame_bytes_pkt;
+    /* Codec frames this packet takes: one per sample, or what the
+     * conversion to the stream rate consumes. */
+    int this_in_read =
+        resample ? avb_src_inputs(&s_talker_src, this_spp, src_rate_q32) *
+                       i2s_frame_bytes_pkt
+                 : this_i2s_read;
+    uint8_t *in_buf = resample ? src_in_buf : i2s_buf;
 
     /* Advance AVTP media clock by the nominal increment plus the
      * rate-lock correction (Q16 sub-ns carry). The nominal-only
@@ -1611,6 +1650,29 @@ static void avb_stream_out_task(void *task_param) {
             ts_rate_frac_q16 = 0;
             tu_active = true;
             tu_hold_remaining = MCR_HOLD_PACKETS;
+          } else if (resample) {
+            /* The stamps advance by exactly the samples sent, so the
+             * cadence follows them instead: a PI on the stamp error,
+             * 0.05 ppm per us and 0.00128 ppm per us second, settles in
+             * about 20 s with damping 0.7 and absorbs what the
+             * cadence lock above leaves (30 ppm while a station warms
+             * up). A stamp ahead of its gPTP slot slows the cadence. */
+            int64_t window_ms = 8192LL * params->interval / 1000;
+            cadence_integ_ppm_q8 += (int64_t)ts_err * window_ms * 328 /
+                                    1000000000LL;
+            if (cadence_integ_ppm_q8 > 150 * 256)
+              cadence_integ_ppm_q8 = 150 * 256;
+            else if (cadence_integ_ppm_q8 < -150 * 256)
+              cadence_integ_ppm_q8 = -150 * 256;
+            int64_t cadence_ppm_q8 =
+                (int64_t)ts_err * 128 / 10000 + cadence_integ_ppm_q8;
+            if (cadence_ppm_q8 > 200 * 256)
+              cadence_ppm_q8 = 200 * 256;
+            else if (cadence_ppm_q8 < -200 * 256)
+              cadence_ppm_q8 = -200 * 256;
+            fill_adj_q16 = (((int64_t)params->interval * 1000LL *
+                             cadence_ppm_q8) << 16) /
+                           (256LL * 1000000LL);
           } else {
             /* Target extra ns/pkt (Q16) from the measured rate error:
              * interval_ns × drift_ppm_q8 / (256 × 1e6). On windows
@@ -1763,8 +1825,11 @@ static void avb_stream_out_task(void *task_param) {
           rate_window_samples0 = rate_samples;
         }
         /* ns per packet, Q16: interval_ns x ppm / 1e6. */
-        fill_adj_q16 = (((int64_t)params->interval * 1000LL * ppm_q8) << 16) /
-                       (256LL * 1000000LL);
+        if (resample)
+          src_rate_q32 = avb_src_rate_from_ppm_q8((int32_t)ppm_q8);
+        else
+          fill_adj_q16 = (((int64_t)params->interval * 1000LL * ppm_q8) << 16) /
+                         (256LL * 1000000LL);
       }
 
       /* Publish diagnostic counters for AVB-STATS (~1 Hz). Piggybacks
@@ -1790,6 +1855,11 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->remaining_ns_max = remaining_ns_max;
         tx_ctx->gptp_resync_count = gptp_resync_count;
         tx_ctx->ts_reanchors = ts_reanchors;
+        if (src_frames) {
+          tx_ctx->src_cycles = src_cycles / src_frames;
+          src_cycles = src_frames = 0;
+        }
+        tx_ctx->src_walks = s_talker_src.walks;
         tx_ctx->ts_err_ns = ts_err_last;
         tx_ctx->wakes = wake_count;
         tx_ctx->stalls = stall_count;
@@ -1946,20 +2016,33 @@ static void avb_stream_out_task(void *task_param) {
         ring_avail = (int)(i2s_ring_head - i2s_ring_tail);
       }
       skip_refill:
-      /* Consume this_i2s_read bytes from ring */
-      if (ring_avail >= this_i2s_read) {
+      /* Consume this_in_read bytes from ring */
+      if (ring_avail >= this_in_read) {
         int read_pos = (int)(i2s_ring_tail % (uint64_t)i2s_ring_size);
         int first = i2s_ring_size - read_pos;
-        if (first >= this_i2s_read) {
-          memcpy(i2s_buf, i2s_ring + read_pos, this_i2s_read);
+        if (first >= this_in_read) {
+          memcpy(in_buf, i2s_ring + read_pos, this_in_read);
         } else {
-          memcpy(i2s_buf, i2s_ring + read_pos, first);
-          memcpy(i2s_buf + first, i2s_ring, this_i2s_read - first);
+          memcpy(in_buf, i2s_ring + read_pos, first);
+          memcpy(in_buf + first, i2s_ring, this_in_read - first);
         }
-        i2s_ring_tail += this_i2s_read;
+        i2s_ring_tail += this_in_read;
       } else {
-        memset(i2s_buf, 0, this_i2s_read); /* underrun — silence */
+        memset(in_buf, 0, this_in_read); /* underrun — silence */
         ring_underruns++;
+      }
+      if (resample) {
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+        /* The playout runs on the codec clock too: it replaces the
+         * capture before the conversion. */
+        mirror_pop(src_in_buf, (uint32_t)this_in_read, mirror_target);
+#endif
+        uint32_t src_start = esp_cpu_get_cycle_count();
+        avb_src_run(&s_talker_src, src_in_buf,
+                    this_in_read / i2s_frame_bytes_pkt, i2s_buf, this_spp,
+                    src_rate_q32, src_slots, i2s_frame_bytes_pkt);
+        src_cycles += esp_cpu_get_cycle_count() - src_start;
+        src_frames += (uint32_t)this_spp;
       }
 #if CONFIG_ESP_AVB_TALKER_SLIP_MUTE
       /* Slot-slip guard. After a rate change (and less often after a
@@ -2045,7 +2128,8 @@ static void avb_stream_out_task(void *task_param) {
 #if CONFIG_ESP_AVB_LISTENER_MIRROR
       /* The capture above still paces the talker; the playout replaces
        * its samples. */
-      mirror_pop(i2s_buf, (uint32_t)this_i2s_read, mirror_target);
+      if (!resample)
+        mirror_pop(i2s_buf, (uint32_t)this_i2s_read, mirror_target);
       if (is_am824)
         i2s24_to_am824_stereo(i2s_buf, audio_dst, this_spp,
                               params->channels);
@@ -2158,6 +2242,7 @@ err:
   free(sine_lut);
   free(pcm_buf);
   free(i2s_buf);
+  free(src_in_buf);
   if (i2s_ring && state->media_clock.capture_ring == i2s_ring) {
     /* Detach, then give a copy already in the interrupt time to end. */
     state->media_clock.capture_ring = NULL;
@@ -4307,7 +4392,7 @@ void avb_stream_out_print_diag(void) {
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
           "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus "
-          "wbundles=%lu wnack=%lu wretx=%lu/%lu/%lu",
+          "wbundles=%lu wnack=%lu wretx=%lu/%lu/%lu src=%lucyc/%lu",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -4331,7 +4416,8 @@ void avb_stream_out_print_diag(void) {
           (unsigned long)(dropped - last_dropped),
           (long)(ctx->ts_err_ns / 1000), (unsigned long)wbundles,
           (unsigned long)wnacks, (unsigned long)wretx,
-          (unsigned long)wretx_late, (unsigned long)wretx_evicted);
+          (unsigned long)wretx_late, (unsigned long)wretx_evicted,
+          (unsigned long)ctx->src_cycles, (unsigned long)ctx->src_walks);
 
   /* Secondary detail lines only emitted when samples were actually
    * collected, to keep noise-free output when the stream is idle. */

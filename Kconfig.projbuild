@@ -441,6 +441,19 @@ menu "AVB Configuration"
             cadence modulation, or when an external media-clock chain
             cannot tolerate any talker-side rate steering.
 
+    config ESP_AVB_TALKER_RESAMPLE
+        bool "Resample the codec input to the stream rate"
+        default y
+        depends on ESP_AVB && !SOC_CLK_APLL_SUPPORTED
+        help
+            Without an APLL the codec clock cannot be trimmed to gPTP,
+            so its frames arrive at the crystal's rate. With this on,
+            the talker converts them to the stream's nominal rate
+            (16-tap polyphase, flat within 0.1 dB to 15 kHz) and the
+            stream's samples match its timestamps exactly. Off, the
+            packet cadence follows the codec instead, and listeners
+            that hold their own clock trim or slip to keep up.
+
     config ESP_AVB_STATION_TALKER_BATCHED
         bool "Single-core talker sends in timed batches"
         default y
