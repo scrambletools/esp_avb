@@ -2527,6 +2527,13 @@ typedef struct {
   /* Held-clock drift slips (see stream_in_held_slip): the filtered
    * continuous phase, the phase it is held to, and timing. */
   bool held_valid;
+  /* With the drain converting, the held clock follows its input by the
+   * converter's rate (see stream_in_held_rate): the rate, its integral,
+   * and the APLL correction when the hold began, ppm x 65536. */
+  int32_t held_rate_q32;
+  int64_t held_integ_ppm_q16;
+  int32_t held_base_ppm_q16;
+  bool held_base_valid;
   int64_t held_filt_ns;
   int64_t held_ref_ns;
   int64_t held_settle_us;
@@ -3092,6 +3099,32 @@ static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
   }
 }
 
+/* Held clock, converting drain: a PI from the held phase error to the
+ * converter's rate, 0.03 ppm per us and 0.00046 ppm per us second, a
+ * 33 s loop with damping 0.7. The clocks' difference is then paid in
+ * walks at its own rate: slips on a 1.5 frame band held against the
+ * drain's +/-0.25 ms phase jitter went both ways about once a second.
+ * Late playout raises the rate, which takes more input per frame. The
+ * APLL's moves since the hold began (its slew from following the input
+ * to the held trim, 0.8 ms of phase in 20 s, and later refinements)
+ * go into the rate at once. */
+static void stream_in_held_rate(stream_rx_ctx_t *ctx, int64_t error_ns) {
+  int32_t applied_ppm_q16 = ctx->state->media_clock.pll_applied_ppm_q16;
+  /* Per phase tick: Ki x STREAM_PHASE_INTERVAL_US, ppm x 65536 per ns. */
+  ctx->held_integ_ppm_q16 += error_ns * 603 / 1000000;
+  if (ctx->held_integ_ppm_q16 > 150LL * 65536)
+    ctx->held_integ_ppm_q16 = 150LL * 65536;
+  else if (ctx->held_integ_ppm_q16 < -150LL * 65536)
+    ctx->held_integ_ppm_q16 = -150LL * 65536;
+  int64_t ppm_q16 = error_ns * 1966 / 1000 + ctx->held_integ_ppm_q16 +
+                    (ctx->held_base_ppm_q16 - applied_ppm_q16);
+  if (ppm_q16 > 200LL * 65536)
+    ppm_q16 = 200LL * 65536;
+  else if (ppm_q16 < -200LL * 65536)
+    ppm_q16 = -200LL * 65536;
+  ctx->held_rate_q32 = (int32_t)(ppm_q16 * 65536 / 1000000);
+}
+
 /* A listener whose entity streams too holds its own clock (avb_pll,
  * stream_ref_hold), so the DAC drifts against the input stream by the
  * two clocks' difference, a few ppm, and the playout ring drained into
@@ -3110,28 +3143,47 @@ static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
   int64_t now_us = esp_timer_get_time();
   if (!state->media_clock.stream_ref_held || ctx->ring_bytes_per_sec == 0) {
     ctx->held_valid = false;
+    ctx->held_rate_q32 = 0;
+    ctx->held_integ_ppm_q16 = 0;
+    ctx->held_base_valid = false;
     return;
   }
+  if (!ctx->held_base_valid) {
+    ctx->held_base_ppm_q16 = state->media_clock.pll_applied_ppm_q16;
+    ctx->held_base_valid = true;
+  }
+  /* The error against the settled phase: zero while it settles and
+   * across a step. */
+  int64_t error_ns = 0;
+  bool settled = false;
   if (!ctx->held_valid) {
     ctx->held_valid = true;
     ctx->held_filt_ns = continuous_ns;
     ctx->held_ref_ns = continuous_ns;
     ctx->held_settle_us = now_us + STREAM_HELD_SETTLE_US;
     ctx->held_last_slip_us = 0;
+  } else {
+    ctx->held_filt_ns += (continuous_ns - ctx->held_filt_ns) >>
+                         STREAM_HELD_FILTER_SHIFT;
+    if (now_us < ctx->held_settle_us) {
+      ctx->held_ref_ns = ctx->held_filt_ns;
+    } else {
+      error_ns = ctx->held_filt_ns - ctx->held_ref_ns;
+      settled = error_ns <= STREAM_HELD_REANCHOR_NS &&
+                error_ns >= -STREAM_HELD_REANCHOR_NS;
+      if (!settled) {
+        ctx->held_ref_ns = ctx->held_filt_ns;
+        error_ns = 0;
+      }
+    }
+  }
+  if (ctx->src_out) {
+    /* Every tick: the APLL may move before the phase has settled. */
+    stream_in_held_rate(ctx, error_ns);
     return;
   }
-  ctx->held_filt_ns += (continuous_ns - ctx->held_filt_ns) >>
-                       STREAM_HELD_FILTER_SHIFT;
-  if (now_us < ctx->held_settle_us) {
-    ctx->held_ref_ns = ctx->held_filt_ns;
+  if (!settled)
     return;
-  }
-  int64_t error_ns = ctx->held_filt_ns - ctx->held_ref_ns;
-  if (error_ns > STREAM_HELD_REANCHOR_NS ||
-      error_ns < -STREAM_HELD_REANCHOR_NS) {
-    ctx->held_ref_ns = ctx->held_filt_ns;
-    return;
-  }
   int64_t frame_ns = (int64_t)STREAM_FRAME_BYTES * 1000000000LL /
                      ctx->ring_bytes_per_sec;
   int64_t threshold_ns = frame_ns * 3 / 2;
@@ -3212,11 +3264,11 @@ static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
 
 /* With CONFIG_ESP_AVB_LISTENER_RESAMPLE the drain plays the ring through
  * the converter: it pays the media-clock loop's correction where the DAC
- * cannot be tuned as walks instead of slipped frames. Ring frames are
- * consumed as they are converted, and the difference from the frames
- * produced counts in the playout phase as slips do; output the DMA did
- * not take waits for the next pass. Returns the bytes written to the
- * DAC. */
+ * cannot be tuned, and a held clock's slips, as walks instead of slipped
+ * frames. Ring frames are consumed as they are converted, and the
+ * difference from the frames produced counts in the playout phase as
+ * slips do; output the DMA did not take waits for the next pass. Returns
+ * the bytes written to the DAC. */
 static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
                                           uint32_t avail, uint32_t unit) {
   uint32_t mask = ctx->ring.capacity - 1;
@@ -3247,7 +3299,8 @@ static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
     /* ppm x 65536 to the ratio's 2^-32 frames: x 2^16 / 1e6. A faster
      * DAC consumes more of the stream per frame. */
     int32_t rate_q32 = (int32_t)(
-        ((int64_t)avb_pll_software_rate_ppm_q16() * 65536LL) / 1000000LL);
+        ((int64_t)avb_pll_software_rate_ppm_q16() * 65536LL) / 1000000LL) +
+        ctx->held_rate_q32;
     int out_frames = (int)(out_bytes / STREAM_FRAME_BYTES);
     int in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
     while (in_frames * STREAM_FRAME_BYTES > (int)avail && out_frames > 0) {

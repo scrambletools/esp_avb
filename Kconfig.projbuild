@@ -601,14 +601,16 @@ menu "AVB Configuration"
     config ESP_AVB_LISTENER_RESAMPLE
         bool "Play the stream through the sample-rate converter"
         default y
-        depends on ESP_AVB && !SOC_CLK_APLL_SUPPORTED
+        depends on ESP_AVB
         help
-            Without an APLL the DAC runs at the crystal's rate, and the
-            media-clock loop's correction was paid as single-frame
-            slips, each a 10 ms crossfade. With this on, the drain plays
-            the stream through the converter instead: unchanged while
-            nothing is owed, and each owed frame paid as an 85 ms
-            polyphase walk (flat within 0.1 dB to 15 kHz).
+            A DAC that cannot follow the stream's clock pays the
+            difference in frames: without an APLL the DAC runs at the
+            crystal's rate, and a wired board that streams too holds its
+            clock. Those frames were single-frame slips, each a 10 ms
+            crossfade. With this on, the drain plays the stream through
+            the converter instead: unchanged while nothing is owed, and
+            each owed frame paid as an 85 ms polyphase walk (flat within
+            0.1 dB to 15 kHz).
 
     config ESP_AVB_LISTENER_LATENCY_TRIM_S
         int "Trim surplus playout latency every this many seconds (0 = never)"
