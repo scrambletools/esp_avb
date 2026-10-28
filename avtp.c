@@ -1818,9 +1818,13 @@ static void avb_stream_out_task(void *task_param) {
                         1000000000ULL / params->sample_rate);
           if (span_ns > 0) {
             /* Positive: more samples than the timestamps span, the ADC
-             * runs fast against gPTP. ppm x 256. */
+             * runs fast against gPTP. ppm x 256. Converted, the stream
+             * matches its stamps exactly, and the conversion ratio is
+             * the ADC's error. */
             state->media_clock.talker_adc_error_ppm_q8 =
-                (int32_t)(((samples_ns - span_ns) * 256000000LL) / span_ns);
+                resample ? (int32_t)-ppm_q8
+                         : (int32_t)(((samples_ns - span_ns) * 256000000LL) /
+                                     span_ns);
             /* Never 0, which means no reading. */
             state->media_clock.talker_adc_error_stamp_ms =
                 (uint32_t)(rate_now_us / 1000) | 1;
