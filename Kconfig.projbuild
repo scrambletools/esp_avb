@@ -375,6 +375,19 @@ menu "AVB Configuration"
             rate. Applies to the test tone build and to the Test Tone
             control.
 
+    config ESP_AVB_TALKER_TEST_PULSE
+        bool "Talker sends a pulse at the top of each gPTP second"
+        default n
+        depends on ESP_AVB
+        help
+            For test builds. The talker sends silence and a 1 ms pulse
+            at -6 dBFS on every channel, starting with the first sample
+            presented at or after each whole gPTP second. A scope on a
+            listener's analog output, triggered by a pulse at the same
+            second (CLOCK_SCOPE_PROBE on another board), then shows the
+            listener's output timing: a listener that presents on time
+            puts the pulse's rising edge on the trigger.
+
     config ESP_AVB_LISTENER_MIRROR
         bool "Talker carries the listener's playout (test builds)"
         default n

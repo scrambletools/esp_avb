@@ -208,6 +208,30 @@ static void copy_sine_from_lut(uint8_t *buf, int num_samples, int channels,
   }
 }
 
+#if CONFIG_ESP_AVB_TALKER_TEST_PULSE
+#define TEST_PULSE_WIDTH_NS 1000000
+
+/* Fill a packet with the test pulse: -6 dBFS for 1 ms from each whole
+ * gPTP second of presentation time, silence otherwise, in the sine
+ * table's 32-bit BE layout. first_pt_ns is the full presentation time
+ * of the packet's first sample. */
+static void fill_test_pulse(uint8_t *buf, int num_samples, int channels,
+                            int64_t first_pt_ns, uint32_t ns_per_sample) {
+  for (int i = 0; i < num_samples; i++) {
+    int64_t into_second =
+        (first_pt_ns + (int64_t)i * ns_per_sample) % 1000000000LL;
+    uint8_t level = into_second < TEST_PULSE_WIDTH_NS ? 0x40 : 0x00;
+    for (int ch = 0; ch < channels; ch++) {
+      uint8_t *sample = buf + (i * channels + ch) * 4;
+      sample[0] = level;
+      sample[1] = 0;
+      sample[2] = 0;
+      sample[3] = 0;
+    }
+  }
+}
+#endif
+
 /* Read PCM samples from an embedded file into a buffer
  *
  * Reads one packet's worth of samples from flash-mapped PCM data,
@@ -2164,6 +2188,23 @@ static void avb_stream_out_task(void *task_param) {
           be32_to_aaf(pcm_buf, audio_dst, total_samples);
       }
     } /* end else (mic path) */
+#if CONFIG_ESP_AVB_TALKER_TEST_PULSE
+    /* The pulse replaces the source. The last gPTP read, at most about
+     * 2 s old, supplies the upper bits of the 32-bit stamp. */
+    if (drift_ref_valid && params->bit_depth >= 24) {
+      uint32_t first_pt = avtp_media_ts + params->presentation_time_offset_ns;
+      int64_t first_pt_ns = drift_gptp_ref_ns +
+                            (int32_t)(first_pt - (uint32_t)drift_gptp_ref_ns);
+      fill_test_pulse(pcm_buf, this_spp, params->channels, first_pt_ns,
+                      ns_per_sample);
+    } else {
+      memset(pcm_buf, 0, (size_t)total_samples * 4);
+    }
+    if (is_am824)
+      be32_to_am824(pcm_buf, audio_dst, total_samples);
+    else
+      be32_to_aaf(pcm_buf, audio_dst, total_samples);
+#endif
 
     /* Transmit via avbnet's medium-abstracted raw send. AVB Lite
      * unicast transport: the control plane publishes per-listener
