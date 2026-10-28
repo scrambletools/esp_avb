@@ -808,6 +808,10 @@ static void talker_batch_timer_arm(int64_t delay_us) {
 #define TX_HDR_LEN_AAF (TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN + TX_AVTP_HDR_LEN)
 #define TX_HDR_LEN_61883 (TX_HDR_LEN_AAF + TX_CIP_HDR_LEN)
 
+/* Samples per packet the talker's converter takes: 48 at 192 kHz in
+ * Class B. */
+#define TALKER_SRC_MAX_SPP 64
+
 static void avb_stream_out_task(void *task_param) {
   /* Reset productive-work accumulator on every stream_out_task
    * start so each streaming session stands alone in the CPU stats. */
@@ -834,7 +838,6 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t lut_pos = 0;
   uint8_t *pcm_buf = NULL;
   uint8_t *i2s_buf = NULL;
-  uint8_t *src_in_buf = NULL;
   uint8_t *i2s_ring = NULL;
   uint8_t *tx_frame = NULL;
   esp_task_wdt_user_handle_t wdt_handle = NULL;
@@ -1139,11 +1142,13 @@ static void avb_stream_out_task(void *task_param) {
    * followed the codec ran the station's stream 11 to 49 ppm off its
    * stamps, and every listener that holds its clock trimmed it). */
   static avb_src_s s_talker_src;
+  /* Codec frames for one packet: one or two more than it carries. */
+  static uint8_t src_in_buf[(TALKER_SRC_MAX_SPP + 2) * 8];
 #if CONFIG_ESP_AVB_TALKER_RESAMPLE
   bool resample = false;
-  if (!params->use_sine_wave) {
-    src_in_buf = calloc(spp_max + 2, i2s_frame_bytes_pkt);
-    resample = src_in_buf && avb_src_init(&s_talker_src);
+  if (!params->use_sine_wave && spp_max <= TALKER_SRC_MAX_SPP &&
+      i2s_frame_bytes_pkt == 8) {
+    resample = avb_src_init(&s_talker_src);
     if (resample)
       avbinfo("Stream out: codec input resampled to the stream rate");
     else
@@ -2242,7 +2247,6 @@ err:
   free(sine_lut);
   free(pcm_buf);
   free(i2s_buf);
-  free(src_in_buf);
   if (i2s_ring && state->media_clock.capture_ring == i2s_ring) {
     /* Detach, then give a copy already in the interrupt time to end. */
     state->media_clock.capture_ring = NULL;
@@ -4683,6 +4687,17 @@ static int avb_start_stream_in_crf(avb_state_s *state, uint16_t index) {
   return OK;
 }
 
+/* One stream-in runs at a time, so its jitter ring is allocated once and
+ * kept, as early as the boot reserves it. Allocated at a start, it failed
+ * on a C6 nine minutes after boot, and at a station's first listener
+ * start after talker runs: no 64 KB block was left. */
+static uint8_t *s_jitter_ring_buf;
+
+void avb_stream_in_reserve(void) {
+  if (!s_jitter_ring_buf)
+    s_jitter_ring_buf = calloc(1, JITTER_RING_SIZE);
+}
+
 /* Start AVB stream input — opens codec, creates jitter buffer,
  * starts drain timer, registers stream RX handler. */
 int avb_start_stream_in(avb_state_s *state, uint16_t index) {
@@ -4728,13 +4743,7 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     ctx->rate_check_pending = true;
   }
 
-  /* One stream-in runs at a time, so its jitter ring is allocated at
-   * the first start and kept. Allocated at every start, it failed on a
-   * C6 nine minutes after boot: Wi-Fi buffers had fragmented the heap
-   * and no 64 KB block was left. */
-  static uint8_t *s_jitter_ring_buf;
-  if (!s_jitter_ring_buf)
-    s_jitter_ring_buf = calloc(1, JITTER_RING_SIZE);
+  avb_stream_in_reserve();
   if (!s_jitter_ring_buf) {
     avberr("Stream in: no memory for jitter ring (%d B, largest free block "
            "%u B)",

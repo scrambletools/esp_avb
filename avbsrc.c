@@ -27,8 +27,11 @@
 /* (AVB_SRC_PHASES + 1) rows of AVB_SRC_TAPS Q30 coefficients. Row p
  * weights the history oldest first for an output p / AVB_SRC_PHASES of a
  * frame past the window's centre; the last row is the first shifted by
- * one input, so the phase interpolation is continuous across inputs. */
-static int32_t *s_src_table;
+ * one input, so the phase interpolation is continuous across inputs.
+ * Static: a station's first listener start needs a 64 KB block of heap,
+ * and what its talker starts keep fragments it. */
+static int32_t s_src_table[(AVB_SRC_PHASES + 1) * AVB_SRC_TAPS];
+static bool s_src_table_ready;
 
 static float bessel_i0(float value) {
   float sum = 1.0f, term = 1.0f;
@@ -44,12 +47,8 @@ static bool src_table_build(void) {
   const int taps = AVB_SRC_TAPS, phases = AVB_SRC_PHASES;
   const int len = taps * phases + 1;
   float *proto = malloc(len * sizeof(float));
-  int32_t *table = malloc((phases + 1) * taps * sizeof(int32_t));
-  if (!proto || !table) {
-    free(proto);
-    free(table);
+  if (!proto)
     return false;
-  }
   float beta_norm = bessel_i0(SRC_BETA);
   for (int n = 0; n < len; n++) {
     float t = ((float)n - (float)(len - 1) / 2.0f) / (float)phases;
@@ -73,16 +72,16 @@ static bool src_table_build(void) {
   }
   for (int row = 0; row <= phases; row++)
     for (int oldest = 0; oldest < taps; oldest++)
-      table[row * taps + oldest] = (int32_t)lroundf(
+      s_src_table[row * taps + oldest] = (int32_t)lroundf(
           proto[(taps - 1 - oldest) * phases + row] * (float)(1 << 30));
   free(proto);
-  s_src_table = table;
+  s_src_table_ready = true;
   return true;
 }
 
 bool avb_src_init(avb_src_s *src) {
   memset(src, 0, sizeof(*src));
-  return s_src_table || src_table_build();
+  return s_src_table_ready || src_table_build();
 }
 
 #define SRC_ONE (1LL << 32)

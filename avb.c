@@ -2005,6 +2005,8 @@ static void avb_task(void *task_param) {
     } else {
       state->codec_enabled = true;
     }
+    if (state->config.listener)
+      avb_stream_in_reserve();
   } else if (state->config.codec_disabled) {
     avbinfo("Codec disabled by config — skipping I2S + codec init");
   }

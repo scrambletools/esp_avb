@@ -1440,6 +1440,8 @@ uint32_t avb_codec_select_mclk(const avb_state_s *state, uint32_t rate,
  * and flags rejects in clock_plan_invalid_mask. No hardware access. */
 esp_err_t avb_codec_validate_clock_plan(avb_state_s *state);
 esp_err_t avb_config_i2s(avb_state_s *state);
+/* Allocates what a stream-in keeps, while the heap is still whole. */
+void avb_stream_in_reserve(void);
 esp_err_t avb_config_codec(avb_state_s *state);
 /* Reconfigure I2S + codec to a new sample rate. Only valid while no
  * stream is running in either direction (codecs need a stop/start
