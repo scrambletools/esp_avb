@@ -3271,6 +3271,64 @@ static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
  * talker's 8-packet tu hold around a BTC change at most 8. */
 #define PT_AWAIT_UNARMED_MIN 16
 
+/* Converts the next block of the ring for the DAC into src_out: up to
+ * STREAM_SRC_MAX_FRAMES, whole DMA buffers. False when too little has
+ * arrived. */
+static bool stream_in_convert_block(stream_rx_ctx_t *ctx, uint32_t avail,
+                                    uint32_t unit) {
+  uint32_t mask = ctx->ring.capacity - 1;
+  /* A frame spare: the block may take one input more than it plays. */
+  uint32_t out_bytes =
+      avail > STREAM_FRAME_BYTES ? avail - STREAM_FRAME_BYTES : 0;
+  if (out_bytes > STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES)
+    out_bytes = STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES;
+  out_bytes -= out_bytes % unit;
+  if (out_bytes == 0)
+    return false;
+  /* ppm x 65536 to the ratio's 2^-32 frames: x 2^16 / 1e6. A faster
+   * DAC consumes more of the stream per frame. */
+  int32_t rate_q32 = (int32_t)(
+      ((int64_t)avb_pll_software_rate_ppm_q16() * 65536LL) / 1000000LL) +
+      ctx->held_rate_q32;
+  int out_frames = (int)(out_bytes / STREAM_FRAME_BYTES);
+  int in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
+  while (in_frames * STREAM_FRAME_BYTES > (int)avail && out_frames > 0) {
+    out_frames -= (int)(unit / STREAM_FRAME_BYTES);
+    in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
+  }
+  if (out_frames <= 0)
+    return false;
+  uint32_t in_bytes = (uint32_t)in_frames * STREAM_FRAME_BYTES;
+  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  uint32_t first = ctx->ring.capacity - (tail & mask);
+  if (first > in_bytes)
+    first = in_bytes;
+  memcpy(ctx->src_in, ctx->ring.buf + (tail & mask), first);
+  memcpy(ctx->src_in + first, ctx->ring.buf, in_bytes - first);
+  uint32_t start = esp_cpu_get_cycle_count();
+  avb_src_run(&ctx->src, ctx->src_in, in_frames, ctx->src_out, out_frames,
+              rate_q32, 2, STREAM_FRAME_BYTES);
+  ctx->src_cycles += esp_cpu_get_cycle_count() - start;
+  ctx->src_frames += (uint32_t)out_frames;
+  atomic_store_explicit(&ctx->ring.tail, tail + in_bytes,
+                        memory_order_release);
+  /* Frames a trim's walks take count as trimmed, which the phase
+   * sensors leave out like the crossfaded trim they replace. */
+  int32_t taken = (in_frames - out_frames) * STREAM_FRAME_BYTES;
+  if (taken > 0 && ctx->src_trim_bytes) {
+    uint32_t trimmed = (uint32_t)taken < ctx->src_trim_bytes
+                           ? (uint32_t)taken
+                           : ctx->src_trim_bytes;
+    ctx->src_trim_bytes -= trimmed;
+    ctx->phase_trimmed += trimmed;
+    taken -= (int32_t)trimmed;
+  }
+  ctx->phase_slipped += taken;
+  ctx->src_out_pos = 0;
+  ctx->src_pending = (uint32_t)out_frames * STREAM_FRAME_BYTES;
+  return true;
+}
+
 /* With CONFIG_ESP_AVB_LISTENER_RESAMPLE the drain plays the ring through
  * the converter: it pays the media-clock loop's correction where the DAC
  * cannot be tuned, and a held clock's slips, as walks instead of slipped
@@ -3280,12 +3338,12 @@ static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
  * the bytes written to the DAC. */
 static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
                                           uint32_t avail, uint32_t unit) {
-  uint32_t mask = ctx->ring.capacity - 1;
   if (!ctx->src_primed) {
     /* Centre the converter's window on the next frame to play: it reads
      * half a window ahead of what plays, which plays one for one, so the
      * playout phase does not move. */
     const uint32_t half = AVB_SRC_TAPS / 2 * STREAM_FRAME_BYTES;
+    uint32_t mask = ctx->ring.capacity - 1;
     if (avail < half + unit)
       return 0;
     uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
@@ -3294,68 +3352,29 @@ static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
     avb_src_prime(&ctx->src, ctx->src_in, 2, STREAM_FRAME_BYTES);
     atomic_store_explicit(&ctx->ring.tail, tail + half, memory_order_release);
     ctx->src_primed = true;
-    avail -= half;
   }
-  if (ctx->src_pending == 0) {
-    uint32_t out_bytes = avail > 2 * STREAM_FRAME_BYTES
-                             ? avail - 2 * STREAM_FRAME_BYTES
-                             : 0;
-    if (out_bytes > STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES)
-      out_bytes = STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES;
-    out_bytes -= out_bytes % unit;
-    if (out_bytes == 0)
-      return 0;
-    /* ppm x 65536 to the ratio's 2^-32 frames: x 2^16 / 1e6. A faster
-     * DAC consumes more of the stream per frame. */
-    int32_t rate_q32 = (int32_t)(
-        ((int64_t)avb_pll_software_rate_ppm_q16() * 65536LL) / 1000000LL) +
-        ctx->held_rate_q32;
-    int out_frames = (int)(out_bytes / STREAM_FRAME_BYTES);
-    int in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
-    while (in_frames * STREAM_FRAME_BYTES > (int)avail && out_frames > 0) {
-      out_frames -= (int)(unit / STREAM_FRAME_BYTES);
-      in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
-    }
-    if (out_frames <= 0)
-      return 0;
-    uint32_t in_bytes = (uint32_t)in_frames * STREAM_FRAME_BYTES;
-    uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
-    uint32_t first = ctx->ring.capacity - (tail & mask);
-    if (first > in_bytes)
-      first = in_bytes;
-    memcpy(ctx->src_in, ctx->ring.buf + (tail & mask), first);
-    memcpy(ctx->src_in + first, ctx->ring.buf, in_bytes - first);
-    uint32_t start = esp_cpu_get_cycle_count();
-    avb_src_run(&ctx->src, ctx->src_in, in_frames, ctx->src_out, out_frames,
-                rate_q32, 2, STREAM_FRAME_BYTES);
-    ctx->src_cycles += esp_cpu_get_cycle_count() - start;
-    ctx->src_frames += (uint32_t)out_frames;
-    atomic_store_explicit(&ctx->ring.tail, tail + in_bytes,
-                          memory_order_release);
-    /* Frames a trim's walks take count as trimmed, which the phase
-     * sensors leave out like the crossfaded trim they replace. */
-    int32_t taken = (in_frames - out_frames) * STREAM_FRAME_BYTES;
-    if (taken > 0 && ctx->src_trim_bytes) {
-      uint32_t trimmed = (uint32_t)taken < ctx->src_trim_bytes
-                             ? (uint32_t)taken
-                             : ctx->src_trim_bytes;
-      ctx->src_trim_bytes -= trimmed;
-      ctx->phase_trimmed += trimmed;
-      taken -= (int32_t)trimmed;
-    }
-    ctx->phase_slipped += taken;
-    ctx->src_out_pos = 0;
-    ctx->src_pending = (uint32_t)out_frames * STREAM_FRAME_BYTES;
-  }
-  size_t written = 0;
-  i2s_channel_write(ctx->i2s_tx_handle, ctx->src_out + ctx->src_out_pos,
-                    ctx->src_pending, &written, 1);
+  /* Fill the DMA as the ring-to-DMA path does: convert and write until
+   * the DMA takes no more or too little has arrived. A pass that only
+   * finished the last block's remainder left what had arrived since for
+   * the next pass, up to a pass less audio queued. */
+  uint32_t written_total = 0;
+  for (;;) {
+    if (ctx->src_pending == 0 &&
+        !stream_in_convert_block(ctx, ring_readable(&ctx->ring), unit))
+      break;
+    size_t written = 0;
+    i2s_channel_write(ctx->i2s_tx_handle, ctx->src_out + ctx->src_out_pos,
+                      ctx->src_pending, &written, 1);
 #if CONFIG_ESP_AVB_LISTENER_MIRROR
-  mirror_push(ctx->src_out + ctx->src_out_pos, (uint32_t)written);
+    mirror_push(ctx->src_out + ctx->src_out_pos, (uint32_t)written);
 #endif
-  ctx->src_out_pos += (uint32_t)written;
-  ctx->src_pending -= (uint32_t)written;
-  return (uint32_t)written;
+    ctx->src_out_pos += (uint32_t)written;
+    ctx->src_pending -= (uint32_t)written;
+    written_total += (uint32_t)written;
+    if (ctx->src_pending)
+      break; /* the DMA is full */
+  }
+  return written_total;
 }
 
 /* Single-core stations: the 1 ms esp_timer drain runs below the Wi-Fi
