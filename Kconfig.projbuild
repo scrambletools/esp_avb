@@ -943,15 +943,21 @@ menu "AVB Configuration"
         default y if ESP_PTP_PORT0_TYPE_BRIDGED || ESP_PTP_PORT1_TYPE_BRIDGED
         depends on ESP_AVB
 
+    # The media-clock byte counters run in the I2S interrupt. Masked
+    # through a flash write, it missed the DMA buffers completed
+    # meanwhile: a settings save cost ~32 ms of count, a journal record
+    # ~2.6 ms, and the hold breaker read them as clock error.
     config ESP_AVB_ROLE_ENDPOINT_WIRELESS
         bool
         default y if ESP_PTP_PORT0_TYPE_PRIMARY && ESP_PTP_PORT0_MEDIUM_WIFI_FTM && ESP_PTP_PORT0_WIFI_MODE_STA
         depends on ESP_AVB && !ESP_AVB_ROLE_BRIDGE
+        select I2S_ISR_IRAM_SAFE
 
     config ESP_AVB_ROLE_ENDPOINT_WIRED
         bool
         default y if ESP_PTP_PORT0_TYPE_PRIMARY && ESP_PTP_PORT0_MEDIUM_ETH_HWTS
         depends on ESP_AVB && !ESP_AVB_ROLE_BRIDGE && !ESP_AVB_ROLE_ENDPOINT_WIRELESS
+        select I2S_ISR_IRAM_SAFE
 
     config ESP_AVB_FTM_IE_HOOK
         bool "Use FTM-frame Vendor IE for FollowUpInformation transport"
