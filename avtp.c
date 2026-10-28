@@ -3348,6 +3348,20 @@ static void stream_in_drain_body(void *arg) {
       ctx->ever_locked = true;
     }
     ctx->media_locked_count++;
+    /* A presentation lock fires up to a drain tick late (measured
+     * 0.76 ms): skip that much audio before any of it plays. Played
+     * late, it stayed late until the first latency trim spliced it out a
+     * minute in, a click on any tone it cut mid-cycle. */
+    if (pt_mode && pt_err_ns > 0 && ctx->ring_bytes_per_sec) {
+      uint32_t late_bytes = (uint32_t)((uint64_t)pt_err_ns *
+                                       ctx->ring_bytes_per_sec / 1000000000ULL);
+      if (late_bytes > fill)
+        late_bytes = fill;
+      late_bytes -= late_bytes % STREAM_FRAME_BYTES;
+      uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+      atomic_store_explicit(&ctx->ring.tail, tail + late_bytes,
+                            memory_order_release);
+    }
     stream_in_phase_lock(ctx);
     /* The gate wait moved consumption relative to arrival: tell the
      * stream-referenced PLL to re-seed rather than read it as rate. */
