@@ -547,16 +547,19 @@ menu "AVB Configuration"
 
     config ESP_AVB_LISTENER_EXTRA_LATENCY_WIFI_US
         int "Further playout latency on a Wi-Fi station (µs)"
-        default 30000
+        default 60000
         range 0 60000
         depends on ESP_AVB
         help
             Added to the extra latency above when the listener is a
-            Wi-Fi station. The downlink stalls for 20 to 50 ms at times,
-            longer than a talker's usual presentation offset, and each
-            stall the buffer cannot cover is a dropout that also moves
-            playout later. A station then plays this much after wired
-            listeners of the same stream.
+            Wi-Fi station. The downlink reaches a station in clumps,
+            with gaps of up to 57 ms between them, longer than a
+            talker's usual presentation offset, and each gap the buffer
+            cannot cover is a dropout that also moves playout later.
+            With 30 ms a listening station ran dry about every 4
+            minutes; with 60 ms not once in 24, its buffer never below
+            16 ms. A station then plays this much after wired listeners
+            of the same stream.
 
     config ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW
         bool "Give a grown Stream Output a new stream ID"
