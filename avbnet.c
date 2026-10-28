@@ -2355,14 +2355,34 @@ typedef struct {
   uint16_t len;
 } wifi_rx_item_t;
 #define WIFI_RX_WORKER_DEPTH 64
+/* Each queued frame is a heap copy. Below a talker that takes a third
+ * of the CPU the queue reached 34 frames and left the heap 1 KB free, so
+ * the uplink failed sends; above it always, the talker ran up to 23 ms
+ * late. The worker rises above the talker only while it is behind. */
+#define WIFI_RX_WORKER_BOOST_DEPTH 8
+#define WIFI_RX_WORKER_CALM_DEPTH 2
+#ifdef CONFIG_ESP_AVB_STATION_TALKER_PRIORITY
+#define WIFI_RX_WORKER_BOOST_PRIORITY (CONFIG_ESP_AVB_STATION_TALKER_PRIORITY + 1)
+#else
+#define WIFI_RX_WORKER_BOOST_PRIORITY (CONFIG_ESP_AVB_STATION_RX_WORKER_PRIORITY + 2)
+#endif
 static QueueHandle_t s_wifi_rx_queue;
 
 static void wifi_rx_worker(void *arg) {
   (void)arg;
   wifi_rx_item_t item;
+  bool boosted = false;
   for (;;) {
     if (xQueueReceive(s_wifi_rx_queue, &item, portMAX_DELAY) != pdTRUE)
       continue;
+    UBaseType_t waiting = uxQueueMessagesWaiting(s_wifi_rx_queue);
+    if (!boosted && waiting >= WIFI_RX_WORKER_BOOST_DEPTH) {
+      boosted = true;
+      vTaskPrioritySet(NULL, WIFI_RX_WORKER_BOOST_PRIORITY);
+    } else if (boosted && waiting <= WIFI_RX_WORKER_CALM_DEPTH) {
+      boosted = false;
+      vTaskPrioritySet(NULL, CONFIG_ESP_AVB_STATION_RX_WORKER_PRIORITY);
+    }
     xSemaphoreTake(s_wifi_rx_lock, portMAX_DELAY);
     avb_unified_rx_cb(NULL /* no eth_handle */, item.buf, (uint32_t)item.len,
                       NULL, NULL);
@@ -2409,8 +2429,9 @@ static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
 #if defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
   /* A NACK for the uplink is answered here: behind the worker's queue of
    * downlink bundles it waited 20 to 60 ms, and the bundles it asked
-   * for had left the history. */
-  if (wifi_nack_is(buf, len)) {
+   * for had left the history. Not when bundles are wrapped: the wrap
+   * lock's holder can be waiting on this task. */
+  if (!s_wifi_vi_wrap && wifi_nack_is(buf, len)) {
     wifi_tx_nack_handle(buf);
     free(buf);
     return ESP_OK;

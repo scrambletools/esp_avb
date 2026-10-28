@@ -500,6 +500,8 @@ menu "AVB Configuration"
         depends on ESP_AVB_STATION_RX_WORKER
         help
             Below the batched talker (ESP_AVB_STATION_TALKER_PRIORITY).
+            The worker rises above the talker while 8 or more received
+            frames wait, and drops back once 2 or fewer do.
 
     config ESP_AVB_LISTENER_CONCEAL_REPEAT
         bool "Conceal lost audio by repeating the waveform"
