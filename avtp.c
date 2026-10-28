@@ -2467,6 +2467,7 @@ typedef struct {
   uint32_t standing_depth_samples;
   uint32_t standing_depth_hold;
   uint32_t ring_bytes_per_sec;        /* ring byte rate at nominal DAC rate */
+  uint32_t output_delay_ns; /* DAC position to analog output at its rate */
   volatile uint32_t ts_uncertain_count; /* AVTPDU with tu=1 received */
   uint8_t last_seq_num;               /* last received sequence number */
   bool seq_num_valid;                 /* false until first packet received */
@@ -2719,7 +2720,23 @@ static bool stream_in_timeline_valid(stream_rx_ctx_t *ctx) {
 
 static void stream_in_drain_cb(void *arg);
 
-#define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
+/* Playout delay assumed for a codec with none measured. */
+#define STREAM_IN_OUTPUT_DELAY_DEFAULT_NS (2 * 1000 * 1000)
+
+/* Playout delay from the DAC position to the analog output at the
+ * listener's rate, from the codec's measured frames. */
+static uint32_t stream_in_output_delay_ns(const avb_state_s *state) {
+  const avb_codec_caps_s *caps = avb_codec_get_caps(state->config.codec_type);
+  uint32_t rate = state->media_clock.listener_sample_rate;
+  if (!caps || rate == 0)
+    return STREAM_IN_OUTPUT_DELAY_DEFAULT_NS;
+  uint32_t frames = rate > 48000 ? caps->output_delay_frames_fast
+                                 : caps->output_delay_frames;
+  if (frames == 0)
+    return STREAM_IN_OUTPUT_DELAY_DEFAULT_NS;
+  return (uint32_t)(((uint64_t)frames * 1000000000ULL + rate / 2) / rate);
+}
+
 /* Frames the drain converts per pass: past a 1 ms pass at 192 kHz on a
  * wired board. */
 #if portNUM_PROCESSORS == 1
@@ -2815,7 +2832,7 @@ static bool stream_in_phase(stream_rx_ctx_t *ctx, int32_t *phase_ns,
   uint32_t now32 = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
                               (uint64_t)now_ts.tv_nsec);
   uint32_t due = pt + stream_in_extra_latency_ns(ctx) -
-                 STREAM_IN_OUTPUT_DELAY_NS;
+                 ctx->output_delay_ns;
   *phase_ns = (int32_t)(now32 - due);
   uint32_t head = atomic_load_explicit(&ctx->ring.head, memory_order_acquire);
   *ahead_us = (int32_t)(((uint64_t)(head - dac_pos) * 1000000ULL) /
@@ -3579,7 +3596,7 @@ static void stream_in_drain_body(void *arg) {
         /* The learned latency carries over a relock, so an outage does
          * not throw away what the path has shown it needs. */
         uint32_t target = ctx->gate_avtp_ts + stream_in_extra_latency_ns(ctx) -
-                          STREAM_IN_OUTPUT_DELAY_NS +
+                          ctx->output_delay_ns +
                           (uint32_t)ctx->learned_latency_ns;
         int32_t diff = (int32_t)(now32 - target);
         int64_t now_us = esp_timer_get_time();
@@ -4279,7 +4296,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
                             (uint32_t)avtp_data[15];
           int32_t lead = (int32_t)(
               pkt_ts + stream_in_extra_latency_ns(ctx) -
-              STREAM_IN_OUTPUT_DELAY_NS + (uint32_t)ctx->learned_latency_ns -
+              ctx->output_delay_ns + (uint32_t)ctx->learned_latency_ns -
               now32);
           if (lead > -400000000 && lead < 400000000) {
             /* A sane clock read owns the decision either way. lead ≤ 0
@@ -5040,6 +5057,7 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
    * loss concealment to convert arrival gaps and presentation leads
    * into ring bytes. */
   ctx->ring_bytes_per_sec = state->media_clock.listener_sample_rate * 8;
+  ctx->output_delay_ns = stream_in_output_delay_ns(state);
   memcpy(ctx->expected_stream_id, state->input_streams[index].stream_id,
          UNIQUE_ID_LEN);
   {

@@ -401,6 +401,12 @@ typedef struct {
    * with the codec disabled. NULL when set_fs already covers it. */
   esp_err_t (*apply_clock)(struct avb_state_s *state, uint32_t rate_hz,
                            uint32_t mclk_hz, const void *codec_data);
+  /* Listener playout delay in frames, up to 48 kHz and above it: from
+   * the audio's DAC position (counted played as each I2S DMA buffer
+   * completes) to the analog output. 0 when not measured; the
+   * listener then assumes 2 ms. */
+  uint16_t output_delay_frames;
+  uint16_t output_delay_frames_fast;
 } avb_codec_caps_s;
 
 /* Default format */
