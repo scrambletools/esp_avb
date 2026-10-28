@@ -2560,6 +2560,17 @@ typedef struct {
   volatile uint32_t drift_latest_avtp_ts;
   volatile int64_t drift_latest_rx_ts_us;
   volatile bool drift_latest_valid;
+  /* Conversion to the DAC's rate (see stream_in_write_converted): the
+   * converter, ring frames copied out for it, its output and the part
+   * of that output the DMA has not taken yet. src_out is NULL when the
+   * drain writes the ring as it is. */
+  avb_src_s src;
+  uint8_t *src_in;
+  uint8_t *src_out;
+  bool src_primed;
+  uint32_t src_out_pos;
+  uint32_t src_pending;
+  uint32_t src_cycles, src_frames; /* CPU cycles, frames converted */
 } stream_rx_ctx_t;
 
 static stream_rx_ctx_t *s_stream_rx_ctx = NULL;
@@ -2656,6 +2667,13 @@ static bool stream_in_timeline_valid(stream_rx_ctx_t *ctx) {
 static void stream_in_drain_cb(void *arg);
 
 #define STREAM_IN_OUTPUT_DELAY_NS (2 * 1000 * 1000) /* I2S DMA+codec ~2 ms */
+/* Frames the drain converts per pass: past a 1 ms pass at 192 kHz on a
+ * wired board. */
+#if portNUM_PROCESSORS == 1
+#define STREAM_SRC_MAX_FRAMES 256
+#else
+#define STREAM_SRC_MAX_FRAMES 512
+#endif
 #define GATE_ANCHOR_STALE_US (2 * 1000 * 1000) /* 32-bit ns wrap guard */
 /* A presentation lock fires within a drain tick of its target; an
  * anchor later than this is passed over (see the gate). */
@@ -2769,6 +2787,13 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
   ctx->slip_played = ctx->phase_lock_played;
   ctx->slip_dir = 0;
   ctx->held_valid = false;
+  /* Converted audio still queued belongs to the playout before the
+   * lock. */
+  if (ctx->src_out) {
+    avb_src_init(&ctx->src);
+    ctx->src_primed = false;
+    ctx->src_pending = 0;
+  }
   ctx->phase_valid = true;
   atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
                             memory_order_relaxed);
@@ -3044,7 +3069,7 @@ static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
    * pass (the single-core drain runs once per DMA buffer). A held
    * clock's slips come from stream_in_held_slip instead. */
   if (ppm_q16 == 0 || ctx->state->media_clock.stream_ref_held ||
-      (++ctx->slip_passes & 7) != 0)
+      ctx->src_out || (++ctx->slip_passes & 7) != 0)
     return;
   uint64_t played = stream_in_played(ctx);
   uint32_t frames = (uint32_t)(played - ctx->slip_played) / STREAM_FRAME_BYTES;
@@ -3184,6 +3209,81 @@ static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
  * the stream cannot arm: a tu=1 stream supplies one per drain pass, a
  * talker's 8-packet tu hold around a BTC change at most 8. */
 #define PT_AWAIT_UNARMED_MIN 16
+
+/* With CONFIG_ESP_AVB_LISTENER_RESAMPLE the drain plays the ring through
+ * the converter: it pays the media-clock loop's correction where the DAC
+ * cannot be tuned as walks instead of slipped frames. Ring frames are
+ * consumed as they are converted, and the difference from the frames
+ * produced counts in the playout phase as slips do; output the DMA did
+ * not take waits for the next pass. Returns the bytes written to the
+ * DAC. */
+static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
+                                          uint32_t avail, uint32_t unit) {
+  uint32_t mask = ctx->ring.capacity - 1;
+  if (!ctx->src_primed) {
+    /* Centre the converter's window on the next frame to play: it reads
+     * half a window ahead of what plays, which plays one for one, so the
+     * playout phase does not move. */
+    const uint32_t half = AVB_SRC_TAPS / 2 * STREAM_FRAME_BYTES;
+    if (avail < half + unit)
+      return 0;
+    uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+    for (uint32_t byte = 0; byte < 2 * half; byte++)
+      ctx->src_in[byte] = ctx->ring.buf[(tail - half + byte) & mask];
+    avb_src_prime(&ctx->src, ctx->src_in, 2, STREAM_FRAME_BYTES);
+    atomic_store_explicit(&ctx->ring.tail, tail + half, memory_order_release);
+    ctx->src_primed = true;
+    avail -= half;
+  }
+  if (ctx->src_pending == 0) {
+    uint32_t out_bytes = avail > 2 * STREAM_FRAME_BYTES
+                             ? avail - 2 * STREAM_FRAME_BYTES
+                             : 0;
+    if (out_bytes > STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES)
+      out_bytes = STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES;
+    out_bytes -= out_bytes % unit;
+    if (out_bytes == 0)
+      return 0;
+    /* ppm x 65536 to the ratio's 2^-32 frames: x 2^16 / 1e6. A faster
+     * DAC consumes more of the stream per frame. */
+    int32_t rate_q32 = (int32_t)(
+        ((int64_t)avb_pll_software_rate_ppm_q16() * 65536LL) / 1000000LL);
+    int out_frames = (int)(out_bytes / STREAM_FRAME_BYTES);
+    int in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
+    while (in_frames * STREAM_FRAME_BYTES > (int)avail && out_frames > 0) {
+      out_frames -= (int)(unit / STREAM_FRAME_BYTES);
+      in_frames = avb_src_inputs(&ctx->src, out_frames, rate_q32);
+    }
+    if (out_frames <= 0)
+      return 0;
+    uint32_t in_bytes = (uint32_t)in_frames * STREAM_FRAME_BYTES;
+    uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+    uint32_t first = ctx->ring.capacity - (tail & mask);
+    if (first > in_bytes)
+      first = in_bytes;
+    memcpy(ctx->src_in, ctx->ring.buf + (tail & mask), first);
+    memcpy(ctx->src_in + first, ctx->ring.buf, in_bytes - first);
+    uint32_t start = esp_cpu_get_cycle_count();
+    avb_src_run(&ctx->src, ctx->src_in, in_frames, ctx->src_out, out_frames,
+                rate_q32, 2, STREAM_FRAME_BYTES);
+    ctx->src_cycles += esp_cpu_get_cycle_count() - start;
+    ctx->src_frames += (uint32_t)out_frames;
+    atomic_store_explicit(&ctx->ring.tail, tail + in_bytes,
+                          memory_order_release);
+    ctx->phase_slipped += (int32_t)(in_frames - out_frames) * STREAM_FRAME_BYTES;
+    ctx->src_out_pos = 0;
+    ctx->src_pending = (uint32_t)out_frames * STREAM_FRAME_BYTES;
+  }
+  size_t written = 0;
+  i2s_channel_write(ctx->i2s_tx_handle, ctx->src_out + ctx->src_out_pos,
+                    ctx->src_pending, &written, 1);
+#if CONFIG_ESP_AVB_LISTENER_MIRROR
+  mirror_push(ctx->src_out + ctx->src_out_pos, (uint32_t)written);
+#endif
+  ctx->src_out_pos += (uint32_t)written;
+  ctx->src_pending -= (uint32_t)written;
+  return (uint32_t)written;
+}
 
 /* Single-core stations: the 1 ms esp_timer drain runs below the Wi-Fi
  * task, which also runs this station's own receive path, so during a
@@ -3477,6 +3577,13 @@ static void stream_in_drain_body(void *arg) {
   if (to_read == 0)
     return;
 
+  size_t bytes_written = 0;
+  if (ctx->src_out) {
+    uint32_t write_start = esp_cpu_get_cycle_count();
+    bytes_written = stream_in_write_converted(ctx, avail, unit);
+    s_drain_prof_write_cycles += esp_cpu_get_cycle_count() - write_start;
+    goto written;
+  }
   /* Zero-copy drain: i2s_channel_write straight from the ring buffer in
    * up to two contiguous segments (split at ring wrap). Saves the
    * intermediate ring_read copy. */
@@ -3490,7 +3597,6 @@ static void stream_in_drain_body(void *arg) {
     first_chunk = to_read;
   uint32_t second_chunk = to_read - first_chunk;
 
-  size_t bytes_written = 0;
   size_t w1 = 0;
   uint32_t write_start = esp_cpu_get_cycle_count();
   i2s_channel_write(ctx->i2s_tx_handle, ctx->ring.buf + (t & mask),
@@ -3514,6 +3620,7 @@ static void stream_in_drain_body(void *arg) {
   atomic_store_explicit(&ctx->ring.tail, t + (uint32_t)bytes_written,
                         memory_order_release);
   stream_in_slip_land(ctx);
+written:
   ctx->drain_count++;
   /* Stream-reference pair for the media-clock PLL, see avb.h. */
   if (ctx->state && bytes_written > 0) {
@@ -4275,6 +4382,8 @@ void avb_stream_in_print_diag(void) {
   int32_t ahead_min = phase_n ? ctx->ahead_min_us : 0;
   int32_t ahead_max = phase_n ? ctx->ahead_max_us : 0;
   ctx->phase_reset = true;
+  uint32_t src_cycles = ctx->src_frames ? ctx->src_cycles / ctx->src_frames : 0;
+  ctx->src_cycles = ctx->src_frames = 0;
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
           "qfill=%lu id_skip=%lu rate_mm=%lu seq_gap=%lu conceal=%lu/%lu "
@@ -4282,7 +4391,7 @@ void avb_stream_in_print_diag(void) {
           "bundles=%lu/%lu nack=%lu nack_skip=%lu rec=%lu gaveup=%lu dup=%lu "
           "starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
-          "phase_n=%lu trims=%lu/%luB slips=%lu/%lu",
+          "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -4314,7 +4423,8 @@ void avb_stream_in_print_diag(void) {
           (long)phase_min, (long)phase_avg, (long)phase_max, (long)ahead_min,
           (long)ahead_max, (unsigned long)phase_n,
           (unsigned long)ctx->trims, (unsigned long)ctx->trim_bytes,
-          (unsigned long)ctx->slip_drops, (unsigned long)ctx->slip_repeats);
+          (unsigned long)ctx->slip_drops, (unsigned long)ctx->slip_repeats,
+          (unsigned long)src_cycles, (unsigned long)ctx->src.walks);
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
@@ -4692,10 +4802,18 @@ static int avb_start_stream_in_crf(avb_state_s *state, uint16_t index) {
  * on a C6 nine minutes after boot, and at a station's first listener
  * start after talker runs: no 64 KB block was left. */
 static uint8_t *s_jitter_ring_buf;
+#if CONFIG_ESP_AVB_LISTENER_RESAMPLE
+static uint8_t s_src_in_buf[(STREAM_SRC_MAX_FRAMES + 2) * STREAM_FRAME_BYTES];
+static uint8_t s_src_out_buf[STREAM_SRC_MAX_FRAMES * STREAM_FRAME_BYTES];
+#endif
 
 void avb_stream_in_reserve(void) {
   if (!s_jitter_ring_buf)
     s_jitter_ring_buf = calloc(1, JITTER_RING_SIZE);
+#if CONFIG_ESP_AVB_LISTENER_RESAMPLE
+  avb_src_s probe;
+  avb_src_init(&probe); /* builds the shared table */
+#endif
 }
 
 /* Start AVB stream input — opens codec, creates jitter buffer,
@@ -4757,6 +4875,14 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   ctx->ring.capacity = JITTER_RING_SIZE;
   atomic_store(&ctx->ring.head, 0);
   atomic_store(&ctx->ring.tail, 0);
+#if CONFIG_ESP_AVB_LISTENER_RESAMPLE
+  if (avb_src_init(&ctx->src)) {
+    ctx->src_in = s_src_in_buf;
+    ctx->src_out = s_src_out_buf;
+  } else {
+    avbwarn("Stream in: no memory to resample, slipping frames instead");
+  }
+#endif
 
 #if portNUM_PROCESSORS == 1
   if (xTaskCreate(stream_in_drain_task, "avb_drain", 3072, ctx,
