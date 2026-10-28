@@ -2907,9 +2907,24 @@ bool mrp_talker_forget(int port, const unique_id_t *stream_id) {
   msrp_talker_entry_t *entries[2] = {
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_advertise),
       msrp_talker_find(port, stream_id, msrp_attr_type_talker_failed)};
-  for (int i = 0; i < 2; i++)
-    if (entries[i] != NULL && !mrp_sm_idle(&entries[i]->sm))
-      return false;
+  for (int i = 0; i < 2; i++) {
+    if (entries[i] == NULL || mrp_sm_idle(&entries[i]->sm))
+      continue;
+    /* Say what holds it: once on the bench every retired ID stayed
+     * held for minutes, and the grow waited two LeaveAlls instead. */
+    static const char *const applicant_names[] = {
+        "VO", "VP", "VN", "AN", "AA", "QA", "LA", "AO", "QO", "AP", "QP", "LO"};
+    static const char *const registrar_names[] = {"IN", "LV", "MT"};
+    const mrp_sm_state_t *sm = &entries[i]->sm;
+    const uint8_t *sid = (const uint8_t *)stream_id;
+    avbinfo("MSRP: stream %02x%02x%02x%02x%02x%02x%02x%02x still held, %s "
+            "registrar %s, applicant %s%s",
+            sid[0], sid[1], sid[2], sid[3], sid[4], sid[5], sid[6], sid[7],
+            i == 0 ? "Talker Advertise" : "Talker Failed",
+            registrar_names[sm->registrar], applicant_names[sm->applicant],
+            sm->pending_tx != mrp_tx_none ? ", a send pending" : "");
+    return false;
+  }
   for (int i = 0; i < 2; i++)
     if (entries[i] != NULL)
       memset(entries[i], 0, sizeof(*entries[i]));

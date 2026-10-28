@@ -453,8 +453,14 @@ static bool avb_output_stream_renew_id(avb_state_s *state, uint16_t index,
   for (int step = 1; step < AVB_STREAM_ID_GENERATIONS; step++) {
     uint8_t gen = (uint8_t)((stream->stream_id_gen + step) %
                             AVB_STREAM_ID_GENERATIONS);
-    if (now_us - stream->stream_id_retired_us[gen] < AVB_STREAM_ID_REUSE_US)
+    if (now_us - stream->stream_id_retired_us[gen] < AVB_STREAM_ID_REUSE_US) {
+      avbinfo("Stream out %u: stream ID generation %u left the wire %lld s "
+              "ago",
+              index, gen,
+              (long long)((now_us - stream->stream_id_retired_us[gen]) /
+                          1000000));
       continue;
+    }
     unique_id_t next;
     memcpy(next, stream->stream_id, UNIQUE_ID_LEN);
     stream_id_set_generation(next, gen);
