@@ -2260,7 +2260,7 @@ err:
 
 /* Stream Input (Listener) — jitter-buffered AVTP → I2S.
  *   EMAC RX handler → ring_write (non-blocking)
- *   esp_timer 1 ms  → ring_read → i2s_channel_write
+ *   drain task      → ring_read → i2s_channel_write
  * SPSC lock-free ring decouples bursty EMAC RX from steady I2S DMA.
  * Milan-compliant: buffers ≥ 2.126 ms. */
 
@@ -2270,7 +2270,7 @@ err:
  * presentation time has come rather than in arrival order.
  *
  * Producer: audio stream RX handler (EMAC task).
- * Consumer: drain callback (esp_timer task).
+ * Consumer: drain callback (drain task).
  * Single-producer / single-consumer ring of fixed-size packet slots.
  *
  * Class-agnostic: queue depth is sized for Class B's 50 ms
@@ -2364,7 +2364,7 @@ static inline uint32_t ring_read(jitter_ring_t *r, uint8_t *dst, uint32_t len) {
 }
 
 /* Stream RX handler context — file-static, accessed by EMAC RX task
- * (handler, producer) and esp_timer task (drain, consumer). Allocated
+ * (handler, producer) and the drain task (consumer). Allocated
  * by avb_start_stream_in. All hot-path counters are plain volatile —
  * the emac_rx handler is the only writer, periodic stats task is the
  * only reader, and word-aligned 32-bit accesses are torn-free on RISC-V. */
@@ -2372,8 +2372,8 @@ typedef struct {
   avb_state_s *state;                        /* for media_clock stats update */
   i2s_chan_handle_t i2s_tx_handle;
   jitter_ring_t ring;                        /* SPSC byte ring, handler→drain */
-  esp_timer_handle_t drain_timer;            /* periodic 1 ms drain */
-  TaskHandle_t drain_task;                   /* single-core: ISR-woken drain */
+  esp_timer_handle_t drain_timer;            /* wired: 1 ms drain wake */
+  TaskHandle_t drain_task;                   /* see stream_in_drain_task */
   volatile bool drain_stop;
   volatile bool drain_task_exited;
   uint8_t expected_stream_id[UNIQUE_ID_LEN]; /* filter: only accept this stream */
@@ -2616,11 +2616,11 @@ bool avb_crf_stream_valid(void) {
          s_crf_rx_ctx->drift_latest_valid;
 }
 
-/* Listener drain — runs in the esp_timer task (prio 22, core 0) every
- * 1 ms. Pulls whatever bytes are available from the jitter ring and
- * pushes them to I2S TX. The I2S driver paces playout at the DAC rate,
- * so the ring fill level (= playout latency) self-stabilises once the
- * PLL has locked MCLK to the talker's rate.
+/* Listener drain — runs in its task (see stream_in_drain_task) at
+ * least every 1 ms. Pulls whatever bytes are available from the jitter
+ * ring and pushes them to I2S TX. The I2S driver paces playout at the
+ * DAC rate, so the ring fill level (= playout latency) self-stabilises
+ * once the PLL has locked MCLK to the talker's rate.
  *
  * This replaces the former on_sent callback drain which ran in I2S ISR
  * context and had to carry partial-packet state across DMA-descriptor
@@ -3377,13 +3377,19 @@ static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
   return written_total;
 }
 
-/* Single-core stations: the 1 ms esp_timer drain runs below the Wi-Fi
- * task, which also runs this station's own receive path, so during a
- * burst the drain waited past the ~2 ms of audio queued in the TX DMA
- * and the DAC played silence without consuming the ring (measured
- * ~0.1 % of playback, and the ring then overflowed). This task sits
- * above Wi-Fi and is woken by each TX DMA completion; its work
- * is a few microseconds a millisecond. */
+/* The drain's task. Single-core stations: the 1 ms esp_timer drain ran
+ * below the Wi-Fi task, which also runs this station's own receive
+ * path, so during a burst the drain waited past the ~2 ms of audio
+ * queued in the TX DMA and the DAC played silence without consuming the
+ * ring (measured ~0.1 % of playback, and the ring then overflowed). This
+ * task sits above Wi-Fi and is woken by each TX DMA completion; its work
+ * is a few microseconds a millisecond.
+ * Wired boards: the timer task shares core 0 and its priority with
+ * Ethernet receive, and its passes came up to 1.33 ms apart while a
+ * whole DMA buffer of arrived audio waited for the next one. Playing
+ * about 1 ms after arrival, the DAC starved a buffer every minute or
+ * two. This task sits above receive, which wakes it as each half
+ * millisecond of audio arrives; a 1 ms timer wakes it in between. */
 static void stream_in_drain_task(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
   while (!ctx->drain_stop) {
@@ -3395,6 +3401,41 @@ static void stream_in_drain_task(void *arg) {
   ctx->drain_task_exited = true;
   vTaskDelete(NULL);
 }
+
+static void stream_in_drain_task_stop(stream_rx_ctx_t *ctx) {
+  ctx->drain_stop = true;
+  xTaskNotifyGive(ctx->drain_task);
+  while (!ctx->drain_task_exited)
+    vTaskDelay(1);
+}
+
+#if portNUM_PROCESSORS > 1
+static void stream_in_drain_wake_cb(void *arg) {
+  xTaskNotifyGive(((stream_rx_ctx_t *)arg)->drain_task);
+}
+
+/* From the receive path: wake the drain each time another half
+ * millisecond, and at least a whole DMA buffer, is ready to write. A
+ * wake per 24-frame buffer at 192 kHz (8000 a second) starved gPTP on
+ * core 0 within two seconds. */
+static inline void stream_in_wake_drain(stream_rx_ctx_t *ctx,
+                                        uint32_t before, uint32_t total) {
+  TaskHandle_t drain = ctx->drain_task;
+  if (!drain || ctx->drain_stop)
+    return;
+  uint32_t unit = ctx->state->media_clock.i2s_tx_dma_buf_bytes
+                      ? ctx->state->media_clock.i2s_tx_dma_buf_bytes
+                      : 8;
+  uint32_t ready = ctx->ring_bytes_per_sec / 2000;
+  ready -= ready % unit;
+  if (ready < unit)
+    ready = unit;
+  if (ctx->src_out)
+    before -= before < STREAM_FRAME_BYTES ? before : STREAM_FRAME_BYTES;
+  if ((before + total) / ready != before / ready)
+    xTaskNotifyGive(drain);
+}
+#endif
 
 /* Drain cost per stats window (diagnostic, see avb_stream_in_drain_prof):
  * calls, CPU cycles in the whole callback and in its I2S writes. */
@@ -3573,7 +3614,7 @@ static void stream_in_drain_body(void *arg) {
     if (ctx->state)
       atomic_fetch_add_explicit(&ctx->state->media_clock.stream_ref_epoch, 1u,
                                 memory_order_relaxed);
-    /* No logging here (esp_timer task) — stash for the stats printer. */
+    /* No logging here (drain task) — stash for the stats printer. */
     ctx->diag_gate_mode = pt_mode ? 1 : 2;
     if (pt_mode) {
       ctx->pt_regate_interval_us = 0;
@@ -4362,6 +4403,9 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
         atomic_store_explicit(&ctx->gate_armed, true, memory_order_release);
       }
     }
+#if portNUM_PROCESSORS > 1
+    stream_in_wake_drain(ctx, pre_fill, total);
+#endif
   } else if (total > 0) {
     ctx->ring_write_fail++;
   }
@@ -4999,11 +5043,10 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   }
   state->media_clock.drain_task = ctx->drain_task;
 #else
-  /* Create the drain timer — fires every 1 ms, reads from ring, writes
-   * to I2S TX. Runs in the esp_timer task (prio 22, core 0). Fast
-   * callback (~2-10 µs typical) so it doesn't perturb anything. */
+  /* Core 0, away from the talker's busy-wait on core 1, above Ethernet
+   * receive (22). */
   const esp_timer_create_args_t drain_args = {
-      .callback = stream_in_drain_cb,
+      .callback = stream_in_drain_wake_cb,
       .arg = ctx,
       .dispatch_method = ESP_TIMER_TASK,
       .name = "stream-in-drain",
@@ -5014,8 +5057,16 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     free(ctx);
     return ERROR;
   }
+  if (xTaskCreatePinnedToCore(stream_in_drain_task, "avb_drain", 4096, ctx,
+                              23, &ctx->drain_task, 0) != pdPASS) {
+    avberr("Stream in: failed to start drain task");
+    esp_timer_delete(ctx->drain_timer);
+    free(ctx);
+    return ERROR;
+  }
   if (esp_timer_start_periodic(ctx->drain_timer, 1000) != ESP_OK) {
     avberr("Stream in: failed to start drain timer");
+    stream_in_drain_task_stop(ctx);
     esp_timer_delete(ctx->drain_timer);
     free(ctx);
     return ERROR;
@@ -5132,10 +5183,7 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
     }
     if (ctx_to_free->drain_task) {
       state->media_clock.drain_task = NULL;
-      ctx_to_free->drain_stop = true;
-      xTaskNotifyGive(ctx_to_free->drain_task);
-      while (!ctx_to_free->drain_task_exited)
-        vTaskDelay(1);
+      stream_in_drain_task_stop(ctx_to_free);
     }
 
     avbinfo("Stream in stopped: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "

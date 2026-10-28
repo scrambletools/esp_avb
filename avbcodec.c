@@ -503,9 +503,9 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    * and a third of core 0 in the drain, which starved gPTP on a v1.x P4
    * listener (its Pdelay replies went unread and it fell into AVB Lite).
    * 24 frames: 32 x 192 B = 6 KB, about 4 ms at 192 kHz stereo
-   * 24-in-32. The listener drain in avtp.c runs as an esp_timer 1 ms
-   * task that calls i2s_channel_write; the I2S driver paces playout at
-   * the DAC rate. */
+   * 24-in-32. The listener drain in avtp.c runs at least every 1 ms
+   * and calls i2s_channel_write; the I2S driver paces playout at the
+   * DAC rate. */
   chan_cfg.dma_frame_num = 24;
   chan_cfg.dma_desc_num = 32;
   ESP_ERROR_CHECK(
