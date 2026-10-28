@@ -12,6 +12,7 @@
 #     after the SRP move). Excluded from the bridge build because the
 #     bridge has no talker/listener.
 #   - avbcodec.c, avbpll.c — bridge has no codec or media-clock PLL.
+#   - avbsrc.c, the sample-rate converter for codecs without an APLL.
 #
 # Bridge-only:
 #   - avbbridge.c (L2 forwarding + codec/PLL no-op stubs)
@@ -29,7 +30,7 @@ set(avb_embed "")
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)
     list(APPEND avb_srcs avbbridge.c avbfqtss.c)
 else()
-    list(APPEND avb_srcs avtp.c avbcodec.c avbpll.c)
+    list(APPEND avb_srcs avtp.c avbcodec.c avbpll.c avbsrc.c)
 endif()
 
 if(CONFIG_ESP_AVB_ATDECC)
@@ -45,6 +46,10 @@ idf_component_register(SRCS ${avb_srcs}
 
 target_sources(${COMPONENT_LIB} PRIVATE)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)
+# The converter runs per sample on a single-core station: at -Og each
+# 32 x 32 multiply became a sequence of partial products and spills, and
+# -O3 unrolls its 16-tap loops.
+set_source_files_properties(avbsrc.c PROPERTIES COMPILE_OPTIONS "-O3")
 
 # The release version from the manifest, reported in the ENTITY
 # descriptor's firmware_version.
