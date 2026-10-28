@@ -2406,6 +2406,16 @@ static esp_err_t avb_wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
   wifi_rx_lock_init();
 #if CONFIG_ESP_AVB_STATION_RX_WORKER
+#if defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
+  /* A NACK for the uplink is answered here: behind the worker's queue of
+   * downlink bundles it waited 20 to 60 ms, and the bundles it asked
+   * for had left the history. */
+  if (wifi_nack_is(buf, len)) {
+    wifi_tx_nack_handle(buf);
+    free(buf);
+    return ESP_OK;
+  }
+#endif
   /* To the worker; a full queue drops the frame rather than make the
    * Wi-Fi task wait. */
   if (s_wifi_rx_lock && wifi_rx_worker_ready()) {
