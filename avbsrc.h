@@ -41,6 +41,7 @@ typedef struct {
   int64_t owed;
   int32_t walk_step; /* per-frame position change of the walk in progress */
   int32_t walk_left; /* its frames still to run */
+  int32_t extra;     /* whole frames to take (+) or give back (-) by walks */
 } avb_src_pos_s;
 
 typedef struct {
@@ -61,6 +62,10 @@ bool avb_src_init(avb_src_s *src);
  * before it may be ones already played, the rest count as consumed. */
 void avb_src_prime(avb_src_s *src, const uint8_t *in, int slots,
                    int frame_bytes);
+
+/* Takes frames more (positive) or fewer input frames than the ratio
+ * asks, one walk each, between the walks the ratio owes. */
+void avb_src_owe(avb_src_s *src, int32_t frames);
 
 /* Input frames the next out_frames outputs consume at a ratio of
  * 1 + rate_q32 / 2^32 inputs per output. */

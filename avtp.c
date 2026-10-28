@@ -2578,6 +2578,7 @@ typedef struct {
   uint32_t src_out_pos;
   uint32_t src_pending;
   uint32_t src_cycles, src_frames; /* CPU cycles, frames converted */
+  uint32_t src_trim_bytes; /* latency trim still to take by walks */
 } stream_rx_ctx_t;
 
 static stream_rx_ctx_t *s_stream_rx_ctx = NULL;
@@ -2800,6 +2801,7 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
     avb_src_init(&ctx->src);
     ctx->src_primed = false;
     ctx->src_pending = 0;
+    ctx->src_trim_bytes = 0;
   }
   ctx->phase_valid = true;
   atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
@@ -2903,7 +2905,7 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
                                    int32_t ahead_us, uint32_t unit) {
 #if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0 || \
     CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S > 0
-  if (ctx->diag_gate_mode != 1 || ctx->slip_dir != 0)
+  if (ctx->diag_gate_mode != 1 || ctx->slip_dir != 0 || ctx->src_trim_bytes)
     return;
   int64_t window_s = ctx->state->port[0].medium == avb_port_medium_wifi_ftm
                          ? CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
@@ -2934,13 +2936,20 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
   surplus_bytes -= surplus_bytes % unit;
   if (surplus_bytes == 0)
     return;
+  ctx->trims++;
+  ctx->trim_bytes += surplus_bytes;
+  if (ctx->src_out) {
+    /* Walks take the surplus, about 4 s for 1 ms, with no splice: a
+     * crossfade over 1 ms of a tone clicks unless it cuts whole cycles. */
+    avb_src_owe(&ctx->src, (int32_t)(surplus_bytes / STREAM_FRAME_BYTES));
+    ctx->src_trim_bytes += surplus_bytes;
+    return;
+  }
   uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
   stream_trim_crossfade(ctx, tail, surplus_bytes, avail - surplus_bytes);
   atomic_store_explicit(&ctx->ring.tail, tail + surplus_bytes,
                         memory_order_release);
   ctx->phase_trimmed += surplus_bytes;
-  ctx->trims++;
-  ctx->trim_bytes += surplus_bytes;
 #else
   (void)ctx;
   (void)phase_ns;
@@ -3323,7 +3332,18 @@ static uint32_t stream_in_write_converted(stream_rx_ctx_t *ctx,
     ctx->src_frames += (uint32_t)out_frames;
     atomic_store_explicit(&ctx->ring.tail, tail + in_bytes,
                           memory_order_release);
-    ctx->phase_slipped += (int32_t)(in_frames - out_frames) * STREAM_FRAME_BYTES;
+    /* Frames a trim's walks take count as trimmed, which the phase
+     * sensors leave out like the crossfaded trim they replace. */
+    int32_t taken = (in_frames - out_frames) * STREAM_FRAME_BYTES;
+    if (taken > 0 && ctx->src_trim_bytes) {
+      uint32_t trimmed = (uint32_t)taken < ctx->src_trim_bytes
+                             ? (uint32_t)taken
+                             : ctx->src_trim_bytes;
+      ctx->src_trim_bytes -= trimmed;
+      ctx->phase_trimmed += trimmed;
+      taken -= (int32_t)trimmed;
+    }
+    ctx->phase_slipped += taken;
     ctx->src_out_pos = 0;
     ctx->src_pending = (uint32_t)out_frames * STREAM_FRAME_BYTES;
   }

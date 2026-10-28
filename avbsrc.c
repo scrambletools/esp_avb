@@ -123,10 +123,16 @@ static inline int32_t src_next_step(avb_src_pos_s *pos, int32_t rate_q32) {
   else if (pos->owed < -4 * SRC_ONE)
     pos->owed = -4 * SRC_ONE;
   if (pos->walk_left == 0) {
-    if (pos->owed < SRC_ONE && pos->owed > -SRC_ONE)
+    int32_t sign;
+    if (pos->owed >= SRC_ONE || pos->owed <= -SRC_ONE) {
+      sign = pos->owed > 0 ? 1 : -1;
+      pos->owed -= sign * SRC_ONE;
+    } else if (pos->extra) {
+      sign = pos->extra > 0 ? 1 : -1;
+      pos->extra -= sign;
+    } else {
       return 0;
-    int32_t sign = pos->owed > 0 ? 1 : -1;
-    pos->owed -= sign * SRC_ONE;
+    }
     pos->walk_step = sign * (int32_t)(SRC_ONE / AVB_SRC_WALK_FRAMES);
     pos->walk_left = AVB_SRC_WALK_FRAMES;
   }
@@ -140,6 +146,8 @@ static inline int src_advance(avb_src_pos_s *pos, int32_t step) {
   pos->frac = (uint32_t)next;
   return (int)(next >> 32);
 }
+
+void avb_src_owe(avb_src_s *src, int32_t frames) { src->pos.extra += frames; }
 
 int avb_src_inputs(const avb_src_s *src, int out_frames, int32_t rate_q32) {
   avb_src_pos_s pos = src->pos;

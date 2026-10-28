@@ -610,7 +610,8 @@ menu "AVB Configuration"
             crossfade. With this on, the drain plays the stream through
             the converter instead: unchanged while nothing is owed, and
             each owed frame paid as an 85 ms polyphase walk (flat within
-            0.1 dB to 15 kHz).
+            0.1 dB to 15 kHz). A latency trim is taken by walks too,
+            rather than spliced out with a crossfade.
 
     config ESP_AVB_LISTENER_LATENCY_TRIM_S
         int "Trim surplus playout latency every this many seconds (0 = never)"
