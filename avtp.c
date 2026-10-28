@@ -3409,8 +3409,17 @@ void avb_stream_in_drain_prof(uint32_t *calls, uint32_t *cycles,
 }
 
 static void stream_in_drain_body(void *arg);
+/* Longest wait between drain passes this stats window: the DMA queue
+ * holds only what has arrived, so a late pass starves the DAC. */
+static int64_t s_drain_last_us;
+static volatile uint32_t s_drain_gap_max_us;
+
 static void stream_in_drain_cb(void *arg) {
   uint32_t start = esp_cpu_get_cycle_count();
+  int64_t now_us = esp_timer_get_time();
+  if (s_drain_last_us && now_us - s_drain_last_us > s_drain_gap_max_us)
+    s_drain_gap_max_us = (uint32_t)(now_us - s_drain_last_us);
+  s_drain_last_us = now_us;
   stream_in_drain_body(arg);
   s_drain_prof_cycles += esp_cpu_get_cycle_count() - start;
   s_drain_prof_calls++;
@@ -4475,6 +4484,8 @@ void avb_stream_in_print_diag(void) {
   int32_t ahead_max = phase_n ? ctx->ahead_max_us : 0;
   ctx->phase_reset = true;
   uint32_t src_cycles = ctx->src_frames ? ctx->src_cycles / ctx->src_frames : 0;
+  uint32_t drain_gap_us = s_drain_gap_max_us;
+  s_drain_gap_max_us = 0;
   ctx->src_cycles = ctx->src_frames = 0;
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
@@ -4483,7 +4494,8 @@ void avb_stream_in_print_diag(void) {
           "bundles=%lu/%lu nack=%lu nack_skip=%lu rec=%lu gaveup=%lu dup=%lu "
           "starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
-          "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu",
+          "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
+          "dgap=%luus",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -4516,7 +4528,8 @@ void avb_stream_in_print_diag(void) {
           (long)ahead_max, (unsigned long)phase_n,
           (unsigned long)ctx->trims, (unsigned long)ctx->trim_bytes,
           (unsigned long)ctx->slip_drops, (unsigned long)ctx->slip_repeats,
-          (unsigned long)src_cycles, (unsigned long)ctx->src.walks);
+          (unsigned long)src_cycles, (unsigned long)ctx->src.walks,
+          (unsigned long)drain_gap_us);
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
@@ -4976,6 +4989,7 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   }
 #endif
 
+  s_drain_last_us = 0;
 #if portNUM_PROCESSORS == 1
   if (xTaskCreate(stream_in_drain_task, "avb_drain", 3072, ctx,
                   configMAX_PRIORITIES - 1, &ctx->drain_task) != pdPASS) {
