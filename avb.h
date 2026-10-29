@@ -888,6 +888,9 @@ typedef struct avb_state_s {
     /* Playback bytes the TX DMA sent from a buffer nobody refilled
      * (on_send_q_ovf): silence at the DAC that consumed no ring data. */
     _Atomic uint64_t i2s_tx_starved_bytes;
+    /* esp_timer's low word at the last TX DMA completion, stored after
+     * i2s_bytes_written; 0 = not kept (esp_timer not in IRAM). */
+    _Atomic uint32_t i2s_tx_sent_us;
     /* Listener drain task on single-core chips, woken by the TX DMA's
      * on_sent interrupt; NULL when the drain runs from a timer. */
     void *volatile drain_task;

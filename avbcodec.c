@@ -18,6 +18,7 @@
 #include "es8389_codec.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_timer.h"
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
 #include <stdatomic.h>    /* media-clock byte counter in i2s_tx_on_sent_cb */
 #include <string.h>
@@ -411,6 +412,12 @@ static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_written,
                             (uint64_t)event->size, memory_order_relaxed);
+#if CONFIG_ESP_TIMER_IN_IRAM
+  /* Where the DAC is inside the next buffer, for the playout phase. */
+  atomic_store_explicit(&state->media_clock.i2s_tx_sent_us,
+                        (uint32_t)esp_timer_get_time() | 1u,
+                        memory_order_release);
+#endif
   /* Wake the drain once per 24-frame buffer, half a millisecond at
    * 48 kHz: with 6-frame buffers a wake per buffer cost a single-core
    * station 15 % of its CPU in context switches, so it woke every

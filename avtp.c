@@ -2816,6 +2816,33 @@ static uint32_t stream_in_dac_pos(stream_rx_ctx_t *ctx) {
   return dac_pos;
 }
 
+/* The DAC position now: completions move stream_in_dac_pos in whole DMA
+ * buffers, a 0 to 0.5 ms sawtooth in every phase sample whose short
+ * averages were biased by where the drain's wakes fell (a lock's second
+ * of phase read 0.15 ms off its later mean). Add what has played of the
+ * next buffer since the last completion, at most one buffer. */
+static uint32_t stream_in_dac_pos_now(stream_rx_ctx_t *ctx) {
+  avb_state_s *state = ctx->state;
+  for (int retry = 0; retry < 4; retry++) {
+    uint32_t sent_us = atomic_load_explicit(
+        &state->media_clock.i2s_tx_sent_us, memory_order_acquire);
+    uint32_t dac_pos = stream_in_dac_pos(ctx);
+    uint32_t now_us = (uint32_t)esp_timer_get_time();
+    if (atomic_load_explicit(&state->media_clock.i2s_tx_sent_us,
+                             memory_order_acquire) != sent_us)
+      continue; /* a completion in between */
+    if (sent_us == 0)
+      return dac_pos;
+    uint64_t partial =
+        (uint64_t)(now_us - sent_us) * ctx->ring_bytes_per_sec / 1000000ULL;
+    uint32_t buffer_bytes = state->media_clock.i2s_tx_dma_buf_bytes;
+    if (partial > buffer_bytes)
+      partial = buffer_bytes;
+    return dac_pos + (uint32_t)partial;
+  }
+  return stream_in_dac_pos(ctx);
+}
+
 /* Playout latency beyond presentation time: the configured extra
  * latency, plus the Wi-Fi cushion on a station. */
 static inline uint32_t stream_in_extra_latency_ns(const stream_rx_ctx_t *ctx) {
@@ -2832,7 +2859,7 @@ static bool stream_in_phase(stream_rx_ctx_t *ctx, int32_t *phase_ns,
                             int32_t *ahead_us) {
   if (!ctx->phase_valid || !ctx->state)
     return false;
-  uint32_t dac_pos = stream_in_dac_pos(ctx);
+  uint32_t dac_pos = stream_in_dac_pos_now(ctx);
   uint32_t pt;
   struct timespec now_ts;
   if (!stream_in_pt_at(ctx, dac_pos, &pt) || ptpd_now(&now_ts) != 0)
