@@ -2892,6 +2892,11 @@ static bool stream_in_phase(stream_rx_ctx_t *ctx, int32_t *phase_ns,
                             int32_t *ahead_us) {
   if (!ctx->phase_valid || !ctx->state)
     return false;
+  /* Until the lock's silent buffer (see stream_in_phase_lock) has
+   * played, the DAC is before the first marker: a relock read its time
+   * from the last stream's, wrapped (-837 ms after a 21 s outage). */
+  if (stream_in_played(ctx) < ctx->phase_lock_played)
+    return false;
   uint32_t dac_pos = stream_in_dac_pos_now(ctx);
   uint32_t pt;
   struct timespec now_ts;
