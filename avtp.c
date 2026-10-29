@@ -3463,13 +3463,21 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
   int32_t phase_ns, ahead_us;
   if (!stream_in_phase(ctx, &phase_ns, &ahead_us))
     return;
-  /* Only while audio is buffered: through an outage the DAC plays
-   * silence and the phase climbs by the outage itself. A talker with
-   * the 2 ms default transit leaves 0.7 to 1.5 ms buffered, so at the
-   * old 1 ms its dips kept restarting the phase hold, which then never
-   * corrected an early lock (-195 us) or a drift (+0.35 us/s). */
-  bool buffered = ahead_us >= STREAM_PHASE_AHEAD_MIN_US;
+  /* Only while audio plays: through an outage the DAC plays silence and
+   * the phase climbs by the outage itself. A talker with the 2 ms
+   * default transit leaves 0.7 to 1.5 ms buffered, so at the old 1 ms
+   * its dips kept restarting the phase hold, which then never corrected
+   * an early lock (-195 us) or a drift (+0.35 us/s). The buffered audio
+   * alone misses an outage: the drain leaves a remainder under a DMA
+   * buffer (and a converter its half window), 0.8 ms on the amp, whose
+   * climb was learned and its relock played 47 ms late. So no starved
+   * DMA buffer since the last sample either. */
+  bool buffered = false;
   if (ctx->diag_gate_mode == 1) {
+    uint64_t starved = atomic_load_explicit(
+        &ctx->state->media_clock.i2s_tx_starved_bytes, memory_order_relaxed);
+    buffered = ahead_us >= STREAM_PHASE_AHEAD_MIN_US &&
+               ctx->phase_have_prev && starved == ctx->phase_prev_starved;
     stream_in_phase_publish(ctx, phase_ns);
     if (buffered) {
       stream_in_held_slip(ctx, (int64_t)phase_ns - ctx->phase_steps_ns, unit);
