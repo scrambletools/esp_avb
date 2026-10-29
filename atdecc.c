@@ -4268,8 +4268,11 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
   memcpy(msg->stream_dest_addr,
          state->output_streams[talker_uid].stream_dest_addr, ETH_ADDR_LEN);
   memcpy(msg->stream_vlan_id, state->output_streams[talker_uid].vlan_id, 2);
-  memcpy(msg->connection_count,
-         state->output_streams[talker_uid].connection_count, 2);
+  /* ACMP connections only: listeners known only from MSRP (a bridge's
+   * merged Listener) made a DISCONNECT_TX answer 1 with none left, and
+   * GET_TX_STATE disagree with CONNECT_TX. */
+  uint16_t acmp_count = count_acmp_connected_talker_listeners(stream);
+  int_to_octets(&acmp_count, msg->connection_count, 2);
   uint16_t rsp_flags = octets_to_uint(msg->flags, 2);
   if (stream->stream_info_flags.class_b)
     rsp_flags |= 0x0001u;
@@ -4518,10 +4521,21 @@ int avb_process_acmp_get_tx_connection_command(avb_state_s *state,
   }
 
   avb_talker_stream_s *stream = &state->output_streams[talker_uid];
+  /* The index counts ACMP connections, as connection_count does. */
   uint16_t connection_index = octets_to_uint(msg->connection_count, 2);
-  uint16_t count = octets_to_uint(stream->connection_count, 2);
-  if (connection_index >= count ||
-      connection_index >= AVB_MAX_NUM_CONNECTED_LISTENERS) {
+  uint16_t entries = octets_to_uint(stream->connection_count, 2);
+  uint16_t count = count_acmp_connected_talker_listeners(stream);
+  int entry = NOT_FOUND;
+  for (uint16_t i = 0, seen = 0;
+       i < entries && i < AVB_MAX_NUM_CONNECTED_LISTENERS; i++) {
+    if (!stream->connected_listeners[i].acmp_connected)
+      continue;
+    if (seen++ == connection_index) {
+      entry = i;
+      break;
+    }
+  }
+  if (entry == NOT_FOUND) {
     return avb_send_acmp_response(state,
                                   acmp_msg_type_get_tx_connection_response, msg,
                                   acmp_status_no_such_connection);
@@ -4530,10 +4544,9 @@ int avb_process_acmp_get_tx_connection_command(avb_state_s *state,
   acmp_message_s response = {0};
   memcpy(&response, msg, sizeof(acmp_message_s));
   memcpy(response.listener_entity_id,
-         stream->connected_listeners[connection_index].identity.id,
-         UNIQUE_ID_LEN);
+         stream->connected_listeners[entry].identity.id, UNIQUE_ID_LEN);
   memcpy(response.listener_uid,
-         stream->connected_listeners[connection_index].identity.uid, 2);
+         stream->connected_listeners[entry].identity.uid, 2);
   memcpy(response.stream_id, stream->stream_id, UNIQUE_ID_LEN);
   memcpy(response.stream_dest_addr, stream->stream_dest_addr, ETH_ADDR_LEN);
   memcpy(response.stream_vlan_id, stream->vlan_id, 2);
