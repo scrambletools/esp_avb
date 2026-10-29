@@ -1732,8 +1732,6 @@ static int avb_periodic_send(avb_state_s *state) {
 
   // Send MSRP talker and AVTP MAAP announce messages
   if (state->config.talker) {
-    timespecsub(&time_now, &state->port[0].last_transmitted_msrp_talker_adv,
-                            &delta);
     static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
     for (int i = 0; i < state->num_output_streams; i++) {
       /* Skip Talker Advertise until MAAP has acquired a dest — sending
@@ -1746,13 +1744,18 @@ static int avb_periodic_send(avb_state_s *state) {
                  ETH_ADDR_LEN) == 0)
         continue;
       /* MSRP talker — SM-driven; the SM resolves JoinIn vs JoinMt
-       * at TX time. Keep the declaration alive at a steady cadence. */
+       * at TX time. Keep the declaration alive at a steady cadence.
+       * Each stream keeps its own time: on a shared one, a connected
+       * stream's 500 ms redeclares held an idle stream's 1 s interval
+       * off for good, so a CRF output whose MAAP address came after the
+       * audio stream's was never declared (9 min on the amp). */
       int interval = (octets_to_uint(state->output_streams[i].connection_count,
                                      2) > 0)
                          ? MSRP_TALKER_CONN_INTERVAL_MSEC
                          : MSRP_TALKER_IDLE_INTERVAL_MSEC;
+      timespecsub(&time_now, &state->output_streams[i].last_declared, &delta);
       if (timespec_to_ms(&delta) > interval) {
-        state->port[0].last_transmitted_msrp_talker_adv = time_now;
+        state->output_streams[i].last_declared = time_now;
         avb_declare_output_stream(state, i, -1);
       }
     }

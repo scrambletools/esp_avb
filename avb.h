@@ -659,6 +659,7 @@ typedef struct {
   bool lite_multicast_admitted; /* the multicast copy holds egress budget */
   int64_t lite_multicast_tx_at_us;
   int64_t lite_start_retry_us; /* next allowed stream start attempt */
+  struct timespec last_declared; /* periodic Talker Advertise */
   struct {
     eth_addr_t mac_addr;      // from MSRP source
     identity_pair_t identity; // from ACMP connect_tx
@@ -786,7 +787,6 @@ typedef struct {
   struct timespec last_transmitted_adp_entity_avail;
   struct timespec last_transmitted_mvrp_vlan_id;
   struct timespec last_transmitted_msrp_domain;
-  struct timespec last_transmitted_msrp_talker_adv;
   struct timespec last_transmitted_msrp_listener;
   struct timespec last_transmitted_msrp_leaveall;
 
