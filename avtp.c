@@ -1078,7 +1078,9 @@ static void avb_stream_out_task(void *task_param) {
   int64_t sched_ns_adj_q16 = 0;
 
   esp_task_wdt_add_user("AVB-OUT", &wdt_handle);
-  esp_log_level_set("ptpd", ESP_LOG_NONE);
+  /* Warnings and state changes only: muted, an amp's loss of asCapable
+   * went unseen for hours. */
+  esp_log_level_set("ptpd", ESP_LOG_WARN);
   esp_log_level_set("esp.emac", ESP_LOG_NONE);
   /* The Wi-Fi driver logs each FTM ranging session at warning level; on
    * a single-core station those console writes stall the stream. */
