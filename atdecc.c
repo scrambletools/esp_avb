@@ -2869,7 +2869,10 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
      * RATE change cannot be applied while ANY stream runs in either
      * direction — both directions share one I2S/codec clock, and the
      * codec needs a stop/start around a rate change. Milan/1722.1
-     * answer for both cases: STREAM_IS_RUNNING. */
+     * answer for both cases: STREAM_IS_RUNNING, and Milan 5.4.2.7 for a
+     * bound input or streaming output whatever the format. A format not
+     * supported is BAD_ARGUMENTS (1722.1 Table 7-141: NOT_SUPPORTED is a
+     * target that cannot be set, like a read-only control). */
     bool target_running =
         is_output ? state->output_streams[index].streaming
                   : state->input_streams[index].connected;
@@ -2889,18 +2892,26 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
                      : aaf_code_to_sample_rate(requested->aaf_pcm.sample_rate);
     }
     bool rate_change = new_rate != state->config.default_sample_rate;
+    avtp_stream_format_s *current =
+        is_output ? &state->output_streams[index].stream_format
+                  : &state->input_streams[index].stream_format;
 
-    if (!format_supported) {
-      avberr("AECP Set Stream Format: unsupported format requested");
-      status = aecp_status_not_supported;
-    } else if (target_running || (rate_change && any_running)) {
-      avbwarn("AECP Set Stream Format: refused, stream is running%s",
-              rate_change ? " (rate change needs all streams stopped)" : "");
+    if (target_running) {
+      avbwarn("AECP Set Stream Format: refused, stream is running");
+      status = aecp_status_stream_is_running;
+    } else if (!format_supported) {
+      const uint8_t *format_bytes = (const uint8_t *)requested;
+      avberr("AECP Set Stream Format: unsupported format "
+             "%02x%02x%02x%02x%02x%02x%02x%02x requested",
+             format_bytes[0], format_bytes[1], format_bytes[2],
+             format_bytes[3], format_bytes[4], format_bytes[5],
+             format_bytes[6], format_bytes[7]);
+      status = aecp_status_bad_arguments;
+    } else if (rate_change && any_running) {
+      avbwarn("AECP Set Stream Format: refused, rate change needs all "
+              "streams stopped");
       status = aecp_status_stream_is_running;
     } else {
-      avtp_stream_format_s *current =
-          is_output ? &state->output_streams[index].stream_format
-                    : &state->input_streams[index].stream_format;
       changed = memcmp(current, requested, sizeof(avtp_stream_format_s)) != 0;
       if (rate_change && avb_audio_set_rate(state, new_rate) != ESP_OK) {
         status = aecp_status_entity_misbehaving;
@@ -2929,6 +2940,10 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
       if (rate_change && status == aecp_status_success)
         avb_persist_save_rate(state);
     }
+    /* The response carries the current format: the old one when the
+     * command fails (1722.1 7.4.9.1), not the one refused. */
+    if (status != aecp_status_success)
+      memcpy(requested, current, sizeof(avtp_stream_format_s));
   }
 
   // Always send a response — silent drops force the controller to wait for a
