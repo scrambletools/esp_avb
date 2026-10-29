@@ -3068,7 +3068,10 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
   uint32_t surplus_bytes =
       (uint32_t)(((uint64_t)surplus_us * ctx->ring_bytes_per_sec) / 1000000ULL);
   uint32_t avail = ring_readable(&ctx->ring);
-  if (surplus_bytes > avail)
+  /* A walk takes its frames as they arrive, so only a splice needs them
+   * in the ring: capped there, with most of the latency in the DMA
+   * queue, an 18 ms outage took 23 min of 2 to 8 ms trims to undo. */
+  if (!ctx->src_out && surplus_bytes > avail)
     surplus_bytes = avail;
   surplus_bytes -= surplus_bytes % unit;
   if (surplus_bytes == 0)
