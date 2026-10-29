@@ -644,11 +644,12 @@ menu "AVB Configuration"
             DAC playing silence, and playout continues that much later
             so the next equally late arrival still plays. When a whole
             window of this length then passed with more audio buffered
-            at every moment than the latency needed (plus a 3 ms
-            margin), the listener drops the surplus in one skip, never
-            below presentation time. Latency then follows the worst
-            lateness of the recent window instead of the worst ever,
-            which also undoes a playout start that locked late. 0 keeps
+            at every moment than the latency needed (plus a 1 ms
+            margin on a wired port, 3 ms on Wi-Fi), the listener
+            drops the surplus in one skip, never below presentation
+            time. Latency then follows the worst lateness of the
+            recent window instead of the worst ever, which also undoes
+            a playout start that locked late. 0 keeps
             any latency once taken. A station uses
             ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S instead.
 

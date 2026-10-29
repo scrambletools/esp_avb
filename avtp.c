@@ -3045,10 +3045,16 @@ static void stream_trim_crossfade(stream_rx_ctx_t *ctx, uint32_t tail,
  * the DAC playing silence and playout that much later; the listener
  * keeps that latency, so the next equally late arrival plays. Once a
  * whole trim window has passed with more audio buffered at every
- * moment than STREAM_TRIM_MARGIN_US, it drops that surplus in one
- * crossfaded skip, so latency follows the path instead of keeping its
- * worst moment. Never below presentation time. Whole DMA buffers only. */
+ * moment than the margin (STREAM_TRIM_MARGIN_US, less when wired), it
+ * drops that surplus in one crossfaded skip, so latency follows the
+ * path instead of keeping its worst moment. Never below presentation
+ * time. Whole DMA buffers only. */
 #define STREAM_TRIM_MARGIN_US 3000
+/* A wired path's jitter is tens of us, and a talker with the 2 ms
+ * default transit leaves only about 1.2 ms buffered on time: under the
+ * 3 ms margin no trim could take back an outage's latency (a guitar
+ * stayed 1.5 ms late after a relock). */
+#define STREAM_TRIM_MARGIN_WIRED_US 1000
 /* Lateness under the trim's 1 ms that the lock residual still walks. */
 #define STREAM_TRIM_RESIDUAL_NS 50000
 static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
@@ -3057,9 +3063,9 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
     CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S > 0
   if (ctx->diag_gate_mode != 1 || ctx->slip_dir != 0 || ctx->src_trim_bytes)
     return;
-  int64_t window_s = ctx->state->port[0].medium == avb_port_medium_wifi_ftm
-                         ? CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
-                         : CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S;
+  bool wifi = ctx->state->port[0].medium == avb_port_medium_wifi_ftm;
+  int64_t window_s = wifi ? CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_WIFI_S
+                          : CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S;
   if (window_s == 0)
     return;
   int64_t now_us = esp_timer_get_time();
@@ -3071,7 +3077,8 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
   }
   if (now_us - ctx->trim_window_start_us < window_s * 1000000LL)
     return;
-  int32_t surplus_us = ctx->trim_min_ahead_us - STREAM_TRIM_MARGIN_US;
+  int32_t surplus_us = ctx->trim_min_ahead_us -
+                       (wifi ? STREAM_TRIM_MARGIN_US : STREAM_TRIM_MARGIN_WIRED_US);
   bool phase_bound = surplus_us > phase_ns / 1000;
   if (phase_bound)
     surplus_us = phase_ns / 1000;
