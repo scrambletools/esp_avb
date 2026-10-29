@@ -3528,6 +3528,37 @@ static void stream_in_drain_cb(void *arg) {
   s_drain_prof_calls++;
 }
 
+/* Empty ring is NORMAL at thin (presentation-time) fill: the standing
+ * buffer is only the talker's transit margin (~2 ms), so a 1 ms drain
+ * tick routinely drains to zero between packet arrivals while the I2S
+ * DMA (2 ms) rides through. Only treat it as a lost stream — unlock and
+ * re-arm the presentation anchor so the next packet re-gates at its own
+ * presentation time — when packets have stopped for longer than the
+ * loss-concealment splice can repair. The splice must fit outage +
+ * transit lead (~12 ms) into the 64 KB ring (≈85 ms at 96 kHz), so
+ * unlock at 65 ms. Shorter outages stay locked: the DAC free-runs
+ * auto_clear silence and the resume packet splices back in at its exact
+ * presentation time, with no flush or gate wait. */
+static void stream_in_drain_empty(stream_rx_ctx_t *ctx) {
+  int64_t since_pkt_us = esp_timer_get_time() - ctx->last_packet_us;
+  if (since_pkt_us <= 65000)
+    return;
+  ctx->drain_underrun++;
+  ctx->drain_locked = false;
+  ctx->gate_late_since_us = 0;
+  /* Drop the remainder so the next packet finds the ring empty and can
+   * anchor the gate. */
+  atomic_store_explicit(
+      &ctx->ring.tail,
+      atomic_load_explicit(&ctx->ring.head, memory_order_acquire),
+      memory_order_release);
+  atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
+  if (ctx->ever_locked) {
+    ctx->media_unlocked_count++;
+    ctx->ever_locked = false;
+  }
+}
+
 static void stream_in_drain_body(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
   if (!ctx)
@@ -3736,35 +3767,7 @@ static void stream_in_drain_body(void *arg) {
   stream_in_slip_fade(ctx);
   uint32_t avail = ring_readable(&ctx->ring);
   if (avail < unit) {
-    /* Empty ring is NORMAL at thin (presentation-time) fill: the
-     * standing buffer is only the talker's transit margin (~2 ms), so
-     * a 1 ms drain tick routinely drains to zero between packet
-     * arrivals while the I2S DMA (2 ms) rides through. Only treat it
-     * as a lost stream — unlock and re-arm the presentation anchor so
-     * the next packet re-gates at its own presentation time — when
-     * packets have stopped for longer than the loss-concealment
-     * splice can repair. The splice must fit outage + transit lead
-     * (~12 ms) into the 64 KB ring (≈85 ms at 96 kHz), so unlock at
-     * 65 ms. Shorter outages stay locked: the DAC free-runs
-     * auto_clear silence and the resume packet splices back in at
-     * its exact presentation time, with no flush or gate wait. */
-    int64_t since_pkt_us = esp_timer_get_time() - ctx->last_packet_us;
-    if (since_pkt_us > 65000) {
-      ctx->drain_underrun++;
-      ctx->drain_locked = false;
-      ctx->gate_late_since_us = 0;
-      /* Drop the remainder so the next packet finds the ring empty and
-       * can anchor the gate. */
-      atomic_store_explicit(
-          &ctx->ring.tail,
-          atomic_load_explicit(&ctx->ring.head, memory_order_acquire),
-          memory_order_release);
-      atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
-      if (ctx->ever_locked) {
-        ctx->media_unlocked_count++;
-        ctx->ever_locked = false;
-      }
-    }
+    stream_in_drain_empty(ctx);
     return;
   }
 
@@ -3786,6 +3789,14 @@ static void stream_in_drain_body(void *arg) {
     uint32_t write_start = esp_cpu_get_cycle_count();
     bytes_written = stream_in_write_converted(ctx, avail, unit);
     s_drain_prof_write_cycles += esp_cpu_get_cycle_count() - write_start;
+    /* The converter takes a frame more than it plays and half its
+     * window to prime, so it can leave a DMA buffer's worth it never
+     * plays: an empty ring too (observed: a 4 min outage that never
+     * unlocked, and playout 10 ms early once packets came back). */
+    if (bytes_written == 0 && ctx->src_pending == 0) {
+      stream_in_drain_empty(ctx);
+      return;
+    }
     goto written;
   }
   /* Zero-copy drain: i2s_channel_write straight from the ring buffer in
