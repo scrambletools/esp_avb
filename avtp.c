@@ -2535,13 +2535,13 @@ typedef struct {
    * long-pause splice aim for it rather than for presentation time. */
   volatile int32_t learned_latency_ns;
   /* The lock's own lateness, see stream_in_lock_residual. */
-  int32_t lock_aim_ns; /* learned latency the lock aimed for */
+  int32_t lock_aim_ns; /* learned latency the lock aimed for, 0 after a trim */
   int64_t lock_us;     /* esp_timer at the lock */
   int64_t lock_sum_ns;
   uint32_t lock_samples;
   int64_t lock_steps_ns; /* phase_steps_ns when the samples began */
   bool lock_residual_done;
-  volatile int32_t diag_lock_residual_ns; /* last lock's, 0 until seen */
+  volatile int32_t diag_lock_residual_ns; /* last one walked, 0 until seen */
   volatile uint32_t pt_regates; /* diagnostic: re-gates performed */
   int64_t pt_regate_interval_us; /* next re-gate spacing, 0 = shortest */
   /* Timeline-validity cache: the check reads the PTP clock, which
@@ -3038,6 +3038,8 @@ static void stream_trim_crossfade(stream_rx_ctx_t *ctx, uint32_t tail,
  * crossfaded skip, so latency follows the path instead of keeping its
  * worst moment. Never below presentation time. Whole DMA buffers only. */
 #define STREAM_TRIM_MARGIN_US 3000
+/* Lateness under the trim's 1 ms that the lock residual still walks. */
+#define STREAM_TRIM_RESIDUAL_NS 50000
 static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
                                    int32_t ahead_us, uint32_t unit) {
 #if CONFIG_ESP_AVB_LISTENER_LATENCY_TRIM_S > 0 || \
@@ -3059,12 +3061,25 @@ static void stream_in_trim_latency(stream_rx_ctx_t *ctx, int32_t phase_ns,
   if (now_us - ctx->trim_window_start_us < window_s * 1000000LL)
     return;
   int32_t surplus_us = ctx->trim_min_ahead_us - STREAM_TRIM_MARGIN_US;
-  if (surplus_us > phase_ns / 1000)
+  bool phase_bound = surplus_us > phase_ns / 1000;
+  if (phase_bound)
     surplus_us = phase_ns / 1000;
   ctx->trim_window_start_us = now_us;
   ctx->trim_min_ahead_us = ahead_us;
-  if (surplus_us < 1000)
+  if (surplus_us < 1000) {
+    /* What a trim cannot take stayed for good (0.65 ms after an 18 ms
+     * outage's trims): the lock residual measures it and walks it out,
+     * aiming like the trim at presentation time. */
+    if (phase_bound && ctx->src_out && ctx->lock_residual_done &&
+        (phase_ns > STREAM_TRIM_RESIDUAL_NS ||
+         phase_ns < -STREAM_TRIM_RESIDUAL_NS)) {
+      ctx->lock_aim_ns = 0;
+      ctx->lock_us = now_us;
+      ctx->lock_samples = 0;
+      ctx->lock_residual_done = false;
+    }
     return;
+  }
   uint32_t surplus_bytes =
       (uint32_t)(((uint64_t)surplus_us * ctx->ring_bytes_per_sec) / 1000000ULL);
   uint32_t avail = ring_readable(&ctx->ring);
