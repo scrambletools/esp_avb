@@ -943,6 +943,8 @@ typedef struct avb_state_s {
     /* Bytes per I2S TX DMA buffer; the drain writes whole buffers so a
      * starved DMA's silence is always counted. */
     uint32_t i2s_tx_dma_buf_bytes;
+    /* Bytes in the whole TX DMA ring. */
+    uint32_t i2s_tx_dma_ring_bytes;
 
     /* Last CONVERGED-STABLE PLL correction (Q16 ppm), 0 = none yet.
      * This is the authoritative live source for the persisted trim:

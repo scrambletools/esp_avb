@@ -2530,6 +2530,11 @@ typedef struct {
   volatile uint32_t pt_unarmed_arrivals;
   uint32_t pt_await_unarmed_base;
   int64_t gate_late_since_us; /* first late anchor passed over, 0 = none */
+  /* The TX DMA's starvation, see stream_in_tx_idle. */
+  uint64_t gate_starved_bytes;
+  int64_t gate_starved_us;
+  int64_t gate_idle_wait_us; /* first pass waiting for it, 0 = none */
+  uint64_t tx_starved_at_write; /* the starvation count at our last write */
   /* Playout latency the path has needed (the presentation phase, kept
    * by the drain while locked on presentation time): a relock and a
    * long-pause splice aim for it rather than for presentation time. */
@@ -2908,14 +2913,18 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
     return;
   ctx->phase_lock_pos = atomic_load_explicit(&ctx->ring.tail,
                                              memory_order_relaxed);
-  ctx->phase_lock_played = stream_in_played(ctx);
+  /* The buffer playing is silence (see stream_in_tx_idle) that counts
+   * as played once the drain's writes leave the driver's queue short of
+   * full: left in, the phase read a buffer early. */
+  ctx->phase_lock_played = stream_in_played(ctx) +
+                           ctx->state->media_clock.i2s_tx_dma_buf_bytes;
   ctx->phase_trimmed = 0;
   ctx->phase_check_us = 0;
   ctx->phase_have_prev = false;
   ctx->trim_window_start_us = 0;
   ctx->phase_slipped = 0;
   ctx->slip_owed = 0;
-  ctx->slip_played = ctx->phase_lock_played;
+  ctx->slip_played = stream_in_played(ctx);
   ctx->slip_dir = 0;
   ctx->held_valid = false;
   ctx->held_taken_q32 = 0;
@@ -3723,6 +3732,43 @@ static void stream_in_drain_empty(stream_rx_ctx_t *ctx) {
   }
 }
 
+/* A lock's first write lands where the TX driver's free queue starts,
+ * right behind the buffer playing only once the DMA has played a whole
+ * ring of auto_clear silence since our last write: until then the
+ * queue can be short (observed 26 of 31 free a buffer after a starved
+ * one, at a re-gate) and the write lands behind buffers that then count
+ * as played: a boot lock played 6 buffers (3 ms) late with the phase
+ * reading on time. Idle is that, with a starved buffer within the last
+ * two (an I2S enable empties the queue); the wait gives up after
+ * STREAM_TX_IDLE_WAIT_US. */
+#define STREAM_TX_IDLE_WAIT_US 100000
+static bool stream_in_tx_idle(stream_rx_ctx_t *ctx) {
+  avb_state_s *state = ctx->state;
+  uint32_t buffer_bytes = state ? state->media_clock.i2s_tx_dma_buf_bytes : 0;
+  if (!buffer_bytes || !ctx->ring_bytes_per_sec)
+    return true;
+  int64_t now_us = esp_timer_get_time();
+  uint64_t starved = atomic_load_explicit(
+      &state->media_clock.i2s_tx_starved_bytes, memory_order_relaxed);
+  if (starved != ctx->gate_starved_bytes) {
+    ctx->gate_starved_bytes = starved;
+    ctx->gate_starved_us = now_us;
+  }
+  int64_t buffer_us = (int64_t)buffer_bytes * 1000000 / ctx->ring_bytes_per_sec;
+  if (now_us - ctx->gate_starved_us <= 2 * buffer_us &&
+      starved - ctx->tx_starved_at_write >=
+          state->media_clock.i2s_tx_dma_ring_bytes) {
+    ctx->gate_idle_wait_us = 0;
+    return true;
+  }
+  if (ctx->gate_idle_wait_us == 0)
+    ctx->gate_idle_wait_us = now_us;
+  if (now_us - ctx->gate_idle_wait_us < STREAM_TX_IDLE_WAIT_US)
+    return false;
+  ctx->gate_idle_wait_us = 0;
+  return true;
+}
+
 static void stream_in_drain_body(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
   if (!ctx)
@@ -3843,7 +3889,7 @@ static void stream_in_drain_body(void *arg) {
      * producer starts dropping. */
     if (!start && fill > (3 * ctx->ring.capacity) / 4)
       start = true;
-    if (!start)
+    if (!start || !stream_in_tx_idle(ctx))
       return;
     ctx->pt_await_anchor = false;
     ctx->gate_late_since_us = 0;
@@ -4005,6 +4051,8 @@ written:
   /* Stream-reference pair for the media-clock PLL, see avb.h. */
   if (ctx->state && bytes_written > 0) {
     avb_state_s *state = ctx->state;
+    ctx->tx_starved_at_write = atomic_load_explicit(
+        &state->media_clock.i2s_tx_starved_bytes, memory_order_relaxed);
     uint64_t written_now = atomic_load_explicit(
         &state->media_clock.i2s_bytes_written, memory_order_relaxed);
     uint64_t credited_now = atomic_load_explicit(
@@ -5227,6 +5275,9 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     return ERROR;
   }
   ctx->state = state;
+  /* A restart's first lock waits out what the last stream left queued. */
+  ctx->tx_starved_at_write = atomic_load_explicit(
+      &state->media_clock.i2s_tx_starved_bytes, memory_order_relaxed);
   ctx->i2s_tx_handle = state->i2s_tx_handle;
   static uint32_t s_rx_start_serial = 0;
   ctx->start_serial = ++s_rx_start_serial;

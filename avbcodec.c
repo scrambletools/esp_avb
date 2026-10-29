@@ -610,9 +610,11 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
    * it for the real size (see i2s_tx_dma_buf_bytes). */
   i2s_chan_info_t tx_info;
   if (i2s_channel_get_info(state->i2s_tx_handle, &tx_info) == ESP_OK &&
-      chan_cfg.dma_desc_num > 0)
+      chan_cfg.dma_desc_num > 0) {
     state->media_clock.i2s_tx_dma_buf_bytes =
         tx_info.total_dma_buf_size / chan_cfg.dma_desc_num;
+    state->media_clock.i2s_tx_dma_ring_bytes = tx_info.total_dma_buf_size;
+  }
   i2s_event_callbacks_t rx_cbs = {.on_recv = i2s_rx_on_recv_cb,
                                   .on_recv_q_ovf = i2s_rx_on_recv_q_ovf_cb};
   ESP_ERROR_CHECK(i2s_channel_register_event_callback(state->i2s_rx_handle,
