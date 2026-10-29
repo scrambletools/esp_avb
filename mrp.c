@@ -1588,7 +1588,18 @@ static void mrp_on_listener_registrar_change(
       break;
     }
 
-    /* Listener leaving — wire-level rLv. */
+    /* Listener leaving — wire-level rLv. The Registrar holds the
+     * registration through its LeaveTimer and a Join in that time keeps
+     * it (802.1Q 10.7.8), so only AVB Lite, whose rows are one listener
+     * each, acts on the Lv itself. Elsewhere the deregistration above
+     * stops the stream: stopping at the Lv turned a bridge's Lv and
+     * redeclaration 190 ms apart into a 3 s outage. */
+    if (attr_event == mrp_attr_event_lv && !state->avb_lite) {
+      avbinfo("MSRP: listener leaving stream %d (held through the leave "
+              "time)",
+              i);
+      break;
+    }
     if (attr_event == mrp_attr_event_lv) {
       int lidx = find_connected_listener(stream, src_addr);
       if (lidx >= 0) {
