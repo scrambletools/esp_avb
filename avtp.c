@@ -758,6 +758,8 @@ static void i2s24_to_am824_stereo(const uint8_t *in, uint8_t *out,
 /* A packet sent this long after its slot counts as a talker stall
  * (STREAM-OUT stalls=), whatever the pacing. */
 #define TALKER_STALL_US 4000
+/* No ADC rate readings for this long after a talker disturbance. */
+#define TALKER_ADC_SETTLE_US (10LL * 60 * 1000000LL)
 
 #if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
 /* Batched pacing on a single-core station (see the top of the talker
@@ -1130,6 +1132,11 @@ static void avb_stream_out_task(void *task_param) {
   int64_t rate_ts_ns = 0, rate_window_ts0 = 0;
   uint64_t rate_samples = 0, rate_window_samples0 = 0;
   int64_t rate_window_us = 0;
+  /* Stalls, lost capture and zero-filled packets so far, and when the
+   * readings may resume after the last of them. */
+  uint64_t rate_disturbances = 0;
+  bool rate_disturbances_valid = false;
+  int64_t rate_quiet_until_us = 0;
 
 /* I2S RX local ring — absorbs DMA buffer timing mismatch.
  * Read larger chunks when available, consume i2s_read_size per packet. */
@@ -1831,6 +1838,21 @@ static void avb_stream_out_task(void *task_param) {
          * differed by a steady 6-7 ppm, so a trim refined to null this
          * one left the talker 6-9 ppm off at every listener. */
         int64_t rate_now_us = esp_timer_get_time();
+        /* A stall, lost capture or zero-filled packet steps the backlog,
+         * and the fill PI then swings for about 10 min (observed: +50
+         * then -14 ppm after a 29 ms NVS flush stall). Read as the ADC's
+         * error, that moved the held trim 5 ppm each way. */
+        uint64_t disturbances =
+            (uint64_t)stall_count + ring_underruns + capture_dropped +
+            atomic_load_explicit(&state->media_clock.i2s_bytes_dropped,
+                                 memory_order_relaxed);
+        if (!rate_disturbances_valid) {
+          rate_disturbances = disturbances;
+          rate_disturbances_valid = true;
+        } else if (disturbances != rate_disturbances) {
+          rate_disturbances = disturbances;
+          rate_quiet_until_us = rate_now_us + TALKER_ADC_SETTLE_US;
+        }
         if (rate_window_us == 0) {
           rate_window_us = rate_now_us;
           rate_window_ts0 = rate_ts_ns;
@@ -1840,7 +1862,7 @@ static void avb_stream_out_task(void *task_param) {
           int64_t samples_ns =
               (int64_t)((rate_samples - rate_window_samples0) *
                         1000000000ULL / params->sample_rate);
-          if (span_ns > 0) {
+          if (span_ns > 0 && rate_now_us >= rate_quiet_until_us) {
             /* Positive: more samples than the timestamps span, the ADC
              * runs fast against gPTP. ppm x 256. Converted, the stream
              * matches its stamps exactly, and the conversion ratio is
