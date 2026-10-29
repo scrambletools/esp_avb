@@ -1534,4 +1534,8 @@ void i2s_task(void *arg);
 /* Helper functions */
 void stream_id_from_mac(eth_addr_t *mac_addr, uint8_t *stream_id, size_t uid);
 
+/* A factory-MAC entity ID of a registered device to its registered one,
+ * in place; false when not one (avbregistry.c). */
+bool avb_registry_translate_entity_id(uint8_t entity_id[8]);
+
 #endif /* _ESP_AVB_AVB_H_ */

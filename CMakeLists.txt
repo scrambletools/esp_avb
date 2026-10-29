@@ -1,6 +1,7 @@
 # Source list.
 #
-# Always-compiled core: avb.c, avbutils.c, avbnet.c, mrp.c, avbstats.c.
+# Always-compiled core: avb.c, avbutils.c, avbnet.c, mrp.c, avbstats.c,
+#   avbregistry.c (the Scramble Tools MA-S device addresses).
 #   - mrp.c holds the MRP family (MSRP / MVRP / MAAP) — the generic
 #     MRP state machines (Applicant/Registrar/LeaveAll/timers per
 #     IEEE 802.1Q-2018 §10) plus the MSRP and MVRP application logic
@@ -24,7 +25,7 @@
 #   - atdecc_unsol.c (registered controllers and unsolicited
 #     notifications).
 
-set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c)
+set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c avbregistry.c)
 set(avb_embed "")
 
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)

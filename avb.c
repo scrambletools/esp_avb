@@ -3190,6 +3190,9 @@ static void avb_persist_apply(avb_state_s *state) {
      * avb_persist_load, after the journal replay has had a chance to
      * override the snapshot, so the message reflects the final state. */
     memcpy(dst->talker_id, src->talker_id, 8);
+    /* A talker that moved to its registered MAC is the same talker. */
+    if (avb_registry_translate_entity_id(dst->talker_id))
+      avbinfo("NVS: stream_input %d talker moved to its registered MAC", i);
     memcpy(dst->talker_uid, src->talker_uid, 2);
     memcpy(dst->controller_id, src->controller_id, 8);
     dst->stream_flags.streaming_wait = src->streaming_wait ? 1 : 0;

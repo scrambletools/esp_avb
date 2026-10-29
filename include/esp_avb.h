@@ -189,6 +189,15 @@ int avb_start(avb_config_s *config);
  * had to change. Returns true when it changed. */
 bool avb_eth_apply_link_policy(esp_eth_handle_t eth_handle, bool restart);
 
+/* Scramble Tools MA-S addresses (avbregistry.c): the first address of
+ * this board's run, false for a board not in the registry. */
+bool avb_registry_base_mac(uint8_t base[6]);
+
+/* Set that run's first address as the base MAC, before Ethernet or
+ * Wi-Fi starts. False, and the factory MAC kept, for a board not in
+ * the registry. */
+bool avb_registry_apply_base_mac(void);
+
 /* @brief Query status from a running AVB task
  *
  * @param status Pointer to status storage structure
