@@ -2625,6 +2625,27 @@ typedef struct {
   int64_t held_ref_ns;
   int64_t held_settle_us;
   int64_t held_last_slip_us;
+  /* The drift since the hold last took its reference, fitted at the
+   * next starvation (see stream_in_held_learn): a starved DMA buffer
+   * since the hold last ran, the segment's start and the converter's
+   * taken frames then, and least-squares sums of the continuous phase
+   * (us, from the start's) against time (ms). */
+  bool held_starved;
+  int64_t held_seg_us;
+  int64_t held_seg_base_ns;
+  int64_t held_seg_taken_q32;
+  int64_t held_seg_n, held_seg_t, held_seg_c, held_seg_tt, held_seg_tc;
+  volatile int32_t diag_held_learned_ppm_x10; /* last rate learned */
+  /* The last learn, for the stats printer: how many, when after the
+   * lock (ms), over how many ticks, its slope and the converter's rate
+   * (0.1 ppm), and the raw phase then (us). */
+  volatile uint32_t diag_held_learns;
+  volatile int32_t diag_held_learn_ms;
+  volatile int32_t diag_held_learn_ticks;
+  volatile int32_t diag_held_learn_slope_x10;
+  volatile int32_t diag_held_learn_taken_x10;
+  volatile int32_t diag_held_learn_phase_us;
+  uint32_t diag_held_learns_printed;
   /* Phase statistics per stats window: playout time less presentation
    * time (plus the extra latency), and the audio buffered ahead of the
    * DAC. The printer sets phase_reset to start a new window. */
@@ -2975,6 +2996,8 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
     if (explained || step_ns > STREAM_PHASE_STEP_NS ||
         step_ns < -STREAM_PHASE_STEP_NS)
       ctx->phase_steps_ns += step_ns;
+    if (starved != ctx->phase_prev_starved)
+      ctx->held_starved = true;
   }
   ctx->phase_have_prev = true;
   ctx->phase_prev_ns = phase_ns;
@@ -3325,6 +3348,61 @@ static void stream_in_held_rate(stream_rx_ctx_t *ctx, int64_t error_ns) {
  * of a following clock too: the media-clock loop matches rates only,
  * within its 2 ppm deadband and the APLL's 1.55 ppm steps, so the phase
  * wandered (Synthia: +0.7 to -1.3 ms in 30 min). */
+static void stream_in_held_segment(stream_rx_ctx_t *ctx, int64_t now_us,
+                                   int64_t continuous_ns) {
+  ctx->held_seg_us = now_us;
+  ctx->held_seg_base_ns = continuous_ns;
+  ctx->held_seg_taken_q32 = ctx->held_taken_q32;
+  ctx->held_seg_n = ctx->held_seg_t = ctx->held_seg_c = 0;
+  ctx->held_seg_tt = ctx->held_seg_tc = 0;
+}
+
+/* A converting drain whose clock is far off its stream (a held trim
+ * seeded against another BTC, 72 ppm observed) drifts until the ring
+ * runs dry, and each starved buffer puts the phase back. The PI
+ * learned that rate only slowly, then walked back in the error the
+ * starvations had already undone in the playout: 1.4 ms late over
+ * 3 min. At a starvation the drift since the reference gives the
+ * rate: the fitted slope plus the rate the converter took meanwhile.
+ * Too short a segment teaches nothing. */
+#define STREAM_HELD_LEARN_MIN_TICKS 100 /* 2 s of phase ticks */
+#define STREAM_HELD_SEGMENT_MAX_US (60LL * 1000000LL)
+static void stream_in_held_learn(stream_rx_ctx_t *ctx, int64_t now_us) {
+  int64_t ticks = ctx->held_seg_n;
+  int64_t denominator =
+      ticks * ctx->held_seg_tt - ctx->held_seg_t * ctx->held_seg_t;
+  int64_t elapsed_us = now_us - ctx->held_seg_us;
+  if (ticks < STREAM_HELD_LEARN_MIN_TICKS || denominator <= 0 ||
+      elapsed_us <= 0)
+    return;
+  /* us per ms is 1000 ppm; late is positive. */
+  double slope_ppm = (double)(ticks * ctx->held_seg_tc -
+                              ctx->held_seg_t * ctx->held_seg_c) /
+                     (double)denominator * 1000.0;
+  double frames = (double)elapsed_us *
+                  ((double)ctx->ring_bytes_per_sec / STREAM_FRAME_BYTES) / 1e6;
+  double taken_ppm = (double)(ctx->held_taken_q32 - ctx->held_seg_taken_q32) /
+                     4294967296.0 / frames * 1e6;
+  double needed_ppm = taken_ppm + slope_ppm;
+  int64_t feed_q16 =
+      ctx->held_mode_held ? (int64_t)ctx->held_base_ppm_q16 -
+                                ctx->state->media_clock.pll_applied_ppm_q16
+                          : 0;
+  int64_t integ_q16 = (int64_t)(needed_ppm * 65536.0) - feed_q16;
+  if (integ_q16 > 150LL * 65536)
+    integ_q16 = 150LL * 65536;
+  else if (integ_q16 < -150LL * 65536)
+    integ_q16 = -150LL * 65536;
+  ctx->held_integ_ppm_q16 = integ_q16;
+  ctx->diag_held_learned_ppm_x10 = (int32_t)(needed_ppm * 10.0);
+  ctx->diag_held_learn_ms = (int32_t)((now_us - ctx->lock_us) / 1000);
+  ctx->diag_held_learn_ticks = (int32_t)ticks;
+  ctx->diag_held_learn_slope_x10 = (int32_t)(slope_ppm * 10.0);
+  ctx->diag_held_learn_taken_x10 = (int32_t)(taken_ppm * 10.0);
+  ctx->diag_held_learn_phase_us = ctx->phase_prev_ns / 1000;
+  ctx->diag_held_learns++;
+}
+
 #define STREAM_HELD_FILTER_SHIFT 7 /* 128 phase ticks, ~2.6 s */
 #define STREAM_HELD_SETTLE_US 3000000
 #define STREAM_HELD_REANCHOR_NS 2000000
@@ -3359,11 +3437,30 @@ static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
     ctx->held_ref_ns = continuous_ns;
     ctx->held_settle_us = now_us + STREAM_HELD_SETTLE_US;
     ctx->held_last_slip_us = 0;
+    ctx->held_starved = false;
+    stream_in_held_segment(ctx, now_us, continuous_ns);
   } else {
     ctx->held_filt_ns += (continuous_ns - ctx->held_filt_ns) >>
                          STREAM_HELD_FILTER_SHIFT;
+    /* The last minute of drift is enough, and keeps the sums in range. */
+    if (now_us - ctx->held_seg_us > STREAM_HELD_SEGMENT_MAX_US)
+      stream_in_held_segment(ctx, now_us, continuous_ns);
+    int64_t segment_ms = (now_us - ctx->held_seg_us) / 1000;
+    int64_t segment_us = (continuous_ns - ctx->held_seg_base_ns) / 1000;
+    ctx->held_seg_n++;
+    ctx->held_seg_t += segment_ms;
+    ctx->held_seg_c += segment_us;
+    ctx->held_seg_tt += segment_ms * segment_ms;
+    ctx->held_seg_tc += segment_ms * segment_us;
     if (now_us < ctx->held_settle_us) {
       ctx->held_ref_ns = ctx->held_filt_ns;
+    } else if (ctx->held_starved) {
+      /* Learn the drift's rate, then hold the phase the starvation
+       * left: it has already undone the drift in the playout. */
+      if (ctx->src_out)
+        stream_in_held_learn(ctx, now_us);
+      ctx->held_ref_ns = ctx->held_filt_ns;
+      stream_in_held_segment(ctx, now_us, continuous_ns);
     } else {
       error_ns = ctx->held_filt_ns - ctx->held_ref_ns;
       settled = error_ns <= STREAM_HELD_REANCHOR_NS &&
@@ -3371,8 +3468,10 @@ static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
       if (!settled) {
         ctx->held_ref_ns = ctx->held_filt_ns;
         error_ns = 0;
+        stream_in_held_segment(ctx, now_us, continuous_ns);
       }
     }
+    ctx->held_starved = false;
   }
   if (ctx->src_out) {
     /* Every tick: the APLL may move before the phase has settled. */
@@ -4848,6 +4947,19 @@ void avb_stream_in_print_diag(void) {
   uint32_t drain_gap_us = s_drain_gap_max_us;
   s_drain_gap_max_us = 0;
   ctx->src_cycles = ctx->src_frames = 0;
+  /* The phase hold (see stream_in_held_rate): the converter rate it
+   * sets, its error against the settled phase, the APLL feed-forward
+   * in its rate and the last rate it learned (0.1 ppm). */
+  int64_t hold_rate_ppm_x10 =
+      (int64_t)ctx->held_rate_q32 * 10000000LL / 4294967296LL;
+  int64_t hold_error_us =
+      ctx->held_valid ? (ctx->held_filt_ns - ctx->held_ref_ns) / 1000 : 0;
+  int64_t hold_feed_ppm_x10 =
+      ctx->held_mode_held && ctx->held_base_valid && ctx->state
+          ? ((int64_t)ctx->held_base_ppm_q16 -
+             ctx->state->media_clock.pll_applied_ppm_q16) *
+                10 / 65536
+          : 0;
 
   avbinfo("STREAM: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
           "qfill=%lu id_skip=%lu rate_mm=%lu seq_gap=%lu conceal=%lu/%lu "
@@ -4856,7 +4968,7 @@ void avb_stream_in_print_diag(void) {
           "starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
-          "dgap=%luus lockres=%ldus",
+          "dgap=%luus lockres=%ldus hold=%ld/%ld/%ld/%ld steps=%ldus clamps=%lu",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -4891,7 +5003,20 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)ctx->slip_drops, (unsigned long)ctx->slip_repeats,
           (unsigned long)src_cycles, (unsigned long)ctx->src.walks,
           (unsigned long)drain_gap_us,
-          (long)(ctx->diag_lock_residual_ns / 1000));
+          (long)(ctx->diag_lock_residual_ns / 1000), (long)hold_rate_ppm_x10,
+          (long)hold_error_us, (long)hold_feed_ppm_x10,
+          (long)ctx->diag_held_learned_ppm_x10,
+          (long)(ctx->phase_steps_ns / 1000), (unsigned long)ctx->phase_clamps);
+  if (ctx->diag_held_learns != ctx->diag_held_learns_printed) {
+    ctx->diag_held_learns_printed = ctx->diag_held_learns;
+    avbinfo("HOLD: learn %lu at %ld ms after the lock, %ld ticks, slope "
+            "%ld taken %ld (0.1 ppm), phase %ld us",
+            (unsigned long)ctx->diag_held_learns, (long)ctx->diag_held_learn_ms,
+            (long)ctx->diag_held_learn_ticks,
+            (long)ctx->diag_held_learn_slope_x10,
+            (long)ctx->diag_held_learn_taken_x10,
+            (long)ctx->diag_held_learn_phase_us);
+  }
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
