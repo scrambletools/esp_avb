@@ -3490,11 +3490,17 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
     }
     /* Under the trim's 1 ms the phase is the lock's and the loops' own
      * error, not latency the path needed: carried into the next lock as
-     * its aim, it added up over relocks (+34, +88, +91 us over three). */
+     * its aim, it added up over relocks (+34, +88, +91 us over three).
+     * A wired path never needs it: reserved frames come before their
+     * presentation time, and a late path's anchor is taken after the
+     * gate's patience anyway. What it learned there was an event's, a
+     * grandmaster flap's timescale offset (a guitar relock 2.7 ms late)
+     * or a swing's, so only a station learns. */
+    bool wifi = ctx->state->port[0].medium == avb_port_medium_wifi_ftm;
     if (buffered)
-      ctx->learned_latency_ns = phase_ns < STREAM_LEARNED_MIN_NS ? 0
-                                : phase_ns > 50000000         ? 50000000
-                                                              : phase_ns;
+      ctx->learned_latency_ns = !wifi || phase_ns < STREAM_LEARNED_MIN_NS ? 0
+                                : phase_ns > 50000000 ? 50000000
+                                                      : phase_ns;
   }
   stream_in_trim_latency(ctx, phase_ns, ahead_us, unit);
   int32_t phase_us = phase_ns / 1000;
