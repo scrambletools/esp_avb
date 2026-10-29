@@ -3687,6 +3687,14 @@ static bool stream_in_convert_block(stream_rx_ctx_t *ctx, uint32_t avail,
     ctx->phase_trimmed += trimmed;
     taken -= (int32_t)trimmed;
   }
+  /* A rate walk landing its frame in the same block as a trim walk's
+   * nets the block to none, so the trim's last bytes were never seen
+   * taken, and every later trim and residual waited on them (a listener
+   * held 0.5 ms late). The trim is done once nothing is owed and no walk
+   * runs; what the walks took is in the phase already. */
+  if (ctx->src_trim_bytes && ctx->src.pos.extra == 0 &&
+      ctx->src.pos.walk_left == 0)
+    ctx->src_trim_bytes = 0;
   ctx->phase_slipped += taken;
   ctx->held_taken_q32 += (int64_t)out_frames * ctx->held_rate_q32;
   ctx->src_out_pos = 0;
@@ -4968,7 +4976,8 @@ void avb_stream_in_print_diag(void) {
           "starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
-          "dgap=%luus lockres=%ldus hold=%ld/%ld/%ld/%ld steps=%ldus clamps=%lu",
+          "dgap=%luus lockres=%ldus hold=%ld/%ld/%ld/%ld steps=%ldus clamps=%lu "
+          "owed=%luB",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -5006,7 +5015,8 @@ void avb_stream_in_print_diag(void) {
           (long)(ctx->diag_lock_residual_ns / 1000), (long)hold_rate_ppm_x10,
           (long)hold_error_us, (long)hold_feed_ppm_x10,
           (long)ctx->diag_held_learned_ppm_x10,
-          (long)(ctx->phase_steps_ns / 1000), (unsigned long)ctx->phase_clamps);
+          (long)(ctx->phase_steps_ns / 1000), (unsigned long)ctx->phase_clamps,
+          (unsigned long)ctx->src_trim_bytes);
   if (ctx->diag_held_learns != ctx->diag_held_learns_printed) {
     ctx->diag_held_learns_printed = ctx->diag_held_learns;
     avbinfo("HOLD: learn %lu at %ld ms after the lock, %ld ticks, slope "
