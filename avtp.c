@@ -2588,6 +2588,10 @@ typedef struct {
   int64_t held_integ_ppm_q16;
   int32_t held_base_ppm_q16;
   bool held_base_valid;
+  bool held_mode_held; /* the mode the loop state belongs to */
+  /* Frames the converter's rate has taken since the lock, x 2^32: the
+   * media-clock loop is shown the phase without them. */
+  int64_t held_taken_q32;
   int64_t held_filt_ns;
   int64_t held_ref_ns;
   int64_t held_settle_us;
@@ -2892,6 +2896,7 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
   ctx->slip_played = ctx->phase_lock_played;
   ctx->slip_dir = 0;
   ctx->held_valid = false;
+  ctx->held_taken_q32 = 0;
   ctx->lock_us = esp_timer_get_time();
   ctx->lock_samples = 0;
   ctx->lock_residual_done = false;
@@ -2908,6 +2913,9 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
   atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
                             memory_order_relaxed);
 }
+
+/* Ring frames are two 32-bit big-endian slots holding 24 bits. */
+#define STREAM_FRAME_BYTES 8
 
 /* A phase step this large between two samples 20 ms apart is never
  * clock drift (150 ppm moves 3 µs); smaller ones count as drift unless
@@ -2943,6 +2951,14 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
   uint64_t gptp_ns =
       (uint64_t)now_ts.tv_sec * 1000000000ULL + (uint64_t)now_ts.tv_nsec;
   int64_t continuous_ns = (int64_t)phase_ns - ctx->phase_steps_ns;
+  /* The phase loop's frames are its own correction, not the clocks'
+   * difference: shown them, the media-clock loop read the held phase as
+   * no error and left the whole difference to the converter. */
+  if (ctx->ring_bytes_per_sec)
+    continuous_ns += (ctx->held_taken_q32 / 65536) *
+                     ((int64_t)STREAM_FRAME_BYTES * 1000000000LL /
+                      ctx->ring_bytes_per_sec) /
+                     65536;
   uint32_t seq = atomic_load_explicit(&state->media_clock.stream_phase.seq,
                                       memory_order_relaxed);
   atomic_store_explicit(&state->media_clock.stream_phase.seq, seq + 1,
@@ -2960,8 +2976,6 @@ static inline int32_t ring_sample_get(const uint8_t *buf, uint32_t mask,
 static inline void ring_sample_put(uint8_t *buf, uint32_t mask, uint32_t pos,
                                    int32_t sample);
 
-/* Ring frames are two 32-bit big-endian slots holding 24 bits. */
-#define STREAM_FRAME_BYTES 8
 
 /* A trim joins the audio at the tail to the audio surplus_bytes later,
  * a step in the waveform that clicks. Crossfade the join instead: the
@@ -3209,15 +3223,16 @@ static void stream_in_rate_slip(stream_rx_ctx_t *ctx, uint32_t unit) {
   }
 }
 
-/* Held clock, converting drain: a PI from the held phase error to the
- * converter's rate, 0.03 ppm per us and 0.00046 ppm per us second, a
- * 33 s loop with damping 0.7. The clocks' difference is then paid in
- * walks at its own rate: slips on a 1.5 frame band held against the
- * drain's +/-0.25 ms phase jitter went both ways about once a second.
- * Late playout raises the rate, which takes more input per frame. The
- * APLL's moves since the hold began (its slew from following the input
- * to the held trim, 0.8 ms of phase in 20 s, and later refinements)
- * go into the rate at once. */
+/* Converting drain: a PI from the held phase error to the converter's
+ * rate, 0.03 ppm per us and 0.00046 ppm per us second, a 33 s loop with
+ * damping 0.7. The clocks' difference is then paid in walks at its own
+ * rate: slips on a 1.5 frame band held against the drain's +/-0.25 ms
+ * phase jitter went both ways about once a second. Late playout raises
+ * the rate, which takes more input per frame. A held clock's APLL moves
+ * since the hold began (its slew from following the input to the held
+ * trim, 0.8 ms of phase in 20 s, and later refinements) go into the
+ * rate at once; a following clock's moves are the media-clock loop
+ * tracking the stream, which the PI only finishes. */
 static void stream_in_held_rate(stream_rx_ctx_t *ctx, int64_t error_ns) {
   int32_t applied_ppm_q16 = ctx->state->media_clock.pll_applied_ppm_q16;
   /* Per phase tick: Ki x STREAM_PHASE_INTERVAL_US, ppm x 65536 per ns. */
@@ -3226,8 +3241,9 @@ static void stream_in_held_rate(stream_rx_ctx_t *ctx, int64_t error_ns) {
     ctx->held_integ_ppm_q16 = 150LL * 65536;
   else if (ctx->held_integ_ppm_q16 < -150LL * 65536)
     ctx->held_integ_ppm_q16 = -150LL * 65536;
-  int64_t ppm_q16 = error_ns * 1966 / 1000 + ctx->held_integ_ppm_q16 +
-                    (ctx->held_base_ppm_q16 - applied_ppm_q16);
+  int64_t ppm_q16 = error_ns * 1966 / 1000 + ctx->held_integ_ppm_q16;
+  if (ctx->held_mode_held)
+    ppm_q16 += ctx->held_base_ppm_q16 - applied_ppm_q16;
   if (ppm_q16 > 200LL * 65536)
     ppm_q16 = 200LL * 65536;
   else if (ppm_q16 < -200LL * 65536)
@@ -3242,7 +3258,10 @@ static void stream_in_held_rate(stream_rx_ctx_t *ctx, int64_t error_ns) {
  * slips instead: the continuous phase (steps taken out), filtered over
  * a few seconds, is kept within a frame and a half of where it settled;
  * a step beyond STREAM_HELD_REANCHOR_NS is an outage or trim, not
- * drift, and moves the reference. */
+ * drift, and moves the reference. A converting drain holds the phase
+ * of a following clock too: the media-clock loop matches rates only,
+ * within its 2 ppm deadband and the APLL's 1.55 ppm steps, so the phase
+ * wandered (Synthia: +0.7 to -1.3 ms in 30 min). */
 #define STREAM_HELD_FILTER_SHIFT 7 /* 128 phase ticks, ~2.6 s */
 #define STREAM_HELD_SETTLE_US 3000000
 #define STREAM_HELD_REANCHOR_NS 2000000
@@ -3251,13 +3270,18 @@ static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
                                 uint32_t unit) {
   avb_state_s *state = ctx->state;
   int64_t now_us = esp_timer_get_time();
-  if (!state->media_clock.stream_ref_held || ctx->ring_bytes_per_sec == 0) {
+  bool held = state->media_clock.stream_ref_held;
+  /* The loop state belongs to one mode: start over on a change. */
+  if ((!held && !ctx->src_out) || ctx->ring_bytes_per_sec == 0 ||
+      held != ctx->held_mode_held) {
     ctx->held_valid = false;
     ctx->held_rate_q32 = 0;
     ctx->held_integ_ppm_q16 = 0;
     ctx->held_base_valid = false;
-    return;
+    ctx->held_mode_held = held;
   }
+  if ((!held && !ctx->src_out) || ctx->ring_bytes_per_sec == 0)
+    return;
   if (!ctx->held_base_valid) {
     ctx->held_base_ppm_q16 = state->media_clock.pll_applied_ppm_q16;
     ctx->held_base_valid = true;
@@ -3321,6 +3345,7 @@ static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
  * second of phase after the lock shows it, walk it out through the
  * converter, as a trim. */
 #define STREAM_LOCK_SETTLE_US 200000
+#define STREAM_LEARNED_MIN_NS 1000000
 #define STREAM_LOCK_SAMPLES 50 /* a second of phase ticks */
 #define STREAM_LOCK_RESIDUAL_MAX_NS GATE_LATE_NS
 static void stream_in_lock_residual(stream_rx_ctx_t *ctx, int32_t phase_ns) {
@@ -3337,16 +3362,34 @@ static void stream_in_lock_residual(stream_rx_ctx_t *ctx, int32_t phase_ns) {
   if (++ctx->lock_samples < STREAM_LOCK_SAMPLES)
     return;
   ctx->lock_residual_done = true;
-  int64_t late_ns = ctx->lock_sum_ns / ctx->lock_samples - ctx->lock_aim_ns;
+  int64_t mean_ns = ctx->lock_sum_ns / ctx->lock_samples;
+  /* The phase loop holds the phase the walk leaves: the samples' mean
+   * continuous phase, which a walk (a trim) does not move, rather than
+   * its own filter's, still settling from the first sample. */
+  if (ctx->held_valid) {
+    ctx->held_filt_ns = mean_ns - ctx->lock_steps_ns;
+    ctx->held_ref_ns = ctx->held_filt_ns;
+    ctx->held_settle_us = esp_timer_get_time();
+  }
+  int64_t late_ns = mean_ns - ctx->lock_aim_ns;
   ctx->diag_lock_residual_ns = (int32_t)late_ns;
-  if (late_ns > STREAM_LOCK_RESIDUAL_MAX_NS || ctx->src_trim_bytes)
+  if (late_ns > STREAM_LOCK_RESIDUAL_MAX_NS ||
+      late_ns < -STREAM_LOCK_RESIDUAL_MAX_NS)
     return;
-  int32_t frames = (int32_t)(late_ns * ctx->ring_bytes_per_sec /
-                             STREAM_FRAME_BYTES / 1000000000LL);
-  if (frames <= 0)
-    return;
-  avb_src_owe(&ctx->src, frames);
-  ctx->src_trim_bytes += (uint32_t)frames * STREAM_FRAME_BYTES;
+  int32_t frames = 0;
+  if (late_ns > 0 && !ctx->src_trim_bytes)
+    frames = (int32_t)(late_ns * ctx->ring_bytes_per_sec /
+                       STREAM_FRAME_BYTES / 1000000000LL);
+  if (frames > 0) {
+    avb_src_owe(&ctx->src, frames);
+    ctx->src_trim_bytes += (uint32_t)frames * STREAM_FRAME_BYTES;
+  }
+  /* The phase loop takes what the walk does not: the walk's part of a
+   * frame, and an early lock (observed: 339 us after a reflash), whose
+   * walk giving frames back would count as drift, not as a trim. */
+  if (ctx->held_valid)
+    ctx->held_ref_ns -= late_ns - (int64_t)frames * STREAM_FRAME_BYTES *
+                                      1000000000LL / ctx->ring_bytes_per_sec;
 }
 
 /* Every STREAM_PHASE_INTERVAL_US while playout is locked: sample the
@@ -3370,11 +3413,14 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
     if (ahead_us >= 1000)
       stream_in_lock_residual(ctx, phase_ns);
     /* Only while audio is buffered: through an outage the DAC plays
-     * silence and the phase climbs by the outage itself. */
+     * silence and the phase climbs by the outage itself. Under the
+     * trim's 1 ms the phase is the lock's and the loops' own error, not
+     * latency the path needed: carried into the next lock as its aim,
+     * it added up over relocks (+34, +88, +91 us over three). */
     if (ahead_us >= 1000)
-      ctx->learned_latency_ns = phase_ns < 0           ? 0
-                                : phase_ns > 50000000 ? 50000000
-                                                      : phase_ns;
+      ctx->learned_latency_ns = phase_ns < STREAM_LEARNED_MIN_NS ? 0
+                                : phase_ns > 50000000         ? 50000000
+                                                              : phase_ns;
   }
   stream_in_trim_latency(ctx, phase_ns, ahead_us, unit);
   int32_t phase_us = phase_ns / 1000;
@@ -3463,6 +3509,7 @@ static bool stream_in_convert_block(stream_rx_ctx_t *ctx, uint32_t avail,
     taken -= (int32_t)trimmed;
   }
   ctx->phase_slipped += taken;
+  ctx->held_taken_q32 += (int64_t)out_frames * ctx->held_rate_q32;
   ctx->src_out_pos = 0;
   ctx->src_pending = (uint32_t)out_frames * STREAM_FRAME_BYTES;
   return true;
