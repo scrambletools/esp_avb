@@ -2925,6 +2925,9 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
         memcpy(&state->input_streams[index].stream_format, requested,
                sizeof(avtp_stream_format_s));
       }
+      /* Before the stream's journal record below. */
+      if (rate_change && status == aecp_status_success)
+        avb_persist_save_rate(state);
     }
   }
 

@@ -2499,6 +2499,8 @@ static void avb_audio_test_run(avb_state_s *state) {
 
 #define AVB_NVS_NAMESPACE "avb"
 #define AVB_NVS_KEY "persist"
+/* Operating sample rate a stream format last set, as a u32 in Hz. */
+#define AVB_NVS_RATE_KEY "rate"
 
 /* Helper: true if any byte in an 8-byte array is non-zero.
  * Used to distinguish "never saved" (all zero) from a valid persisted
@@ -2882,6 +2884,7 @@ static int64_t s_ingress_busy_until_us;
 static int64_t s_ingress_sample_us;
 static uint32_t s_ingress_sample_count;
 static bool s_journal_pending[2][AVB_PERSIST_MAX_INPUT_STREAMS];
+static bool s_rate_pending;
 static int64_t s_journal_pending_since_us;
 
 /* Sampled from the AVB main loop; the persist task only reads the flag. */
@@ -2929,6 +2932,37 @@ static esp_err_t avb_persist_append_stream(avb_state_s *state, bool input,
   return ESP_OK;
 }
 
+static esp_err_t avb_persist_write_rate(avb_state_s *state) {
+  uint32_t rate = state->config.default_sample_rate;
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (err == ESP_OK) {
+    err = nvs_set_u32(handle, AVB_NVS_RATE_KEY, rate);
+    if (err == ESP_OK)
+      err = nvs_commit(handle);
+    nvs_close(handle);
+  }
+  if (err != ESP_OK)
+    avberr("NVS: failed to save sample rate %lu Hz: %d", (unsigned long)rate,
+           err);
+  else
+    avbinfo("NVS: saved sample rate %lu Hz", (unsigned long)rate);
+  return err;
+}
+
+esp_err_t avb_persist_save_rate(avb_state_s *state) {
+  int64_t now = esp_timer_get_time();
+  avb_persist_sample_ingress(now);
+  if (s_ingress_quiet)
+    return avb_persist_write_rate(state);
+  /* The rate is read when it is written, so it is the latest one. */
+  if (s_journal_pending_since_us == 0)
+    s_journal_pending_since_us = now;
+  s_rate_pending = true;
+  avbinfo("NVS: sample rate deferred until ingress calms");
+  return ESP_OK;
+}
+
 void avb_persist_journal_tick(avb_state_s *state) {
   int64_t now = esp_timer_get_time();
   avb_persist_sample_ingress(now);
@@ -2940,6 +2974,11 @@ void avb_persist_journal_tick(avb_state_s *state) {
   if (overdue && !s_ingress_quiet)
     avbwarn("NVS: writing stream journal during heavy ingress");
   s_journal_pending_since_us = 0;
+  /* Before the stream records, whose formats boot checks against it. */
+  if (s_rate_pending) {
+    s_rate_pending = false;
+    avb_persist_write_rate(state);
+  }
   for (int direction = 0; direction < 2; direction++) {
     for (uint16_t index = 0; index < AVB_PERSIST_MAX_INPUT_STREAMS; index++) {
       if (!s_journal_pending[direction][index])
@@ -3079,8 +3118,9 @@ static void avb_persist_gather(avb_state_s *state) {
   p->speaker_vol_db = state->ctrl_speaker_vol;
   p->mic_gain_db = state->ctrl_mic_gain;
   p->active_clock_source_index = state->media_clock.active_clock_source_index;
-  p->audio_unit_sample_rate_hz =
-      0; /* TODO: wire when sample-rate policy lands */
+  /* The rate has its own key (AVB_NVS_RATE_KEY), written when it
+   * changes: this snapshot can wait minutes while a stream runs. */
+  p->audio_unit_sample_rate_hz = 0;
   p->pll_trim_ppm_q16 = state->media_clock.pll_converged_trim_q16;
   memcpy(p->pll_trim_btc_id, state->media_clock.pll_trim_btc_id,
          sizeof(p->pll_trim_btc_id));
@@ -3195,7 +3235,7 @@ static void avb_persist_apply(avb_state_s *state) {
    * zeroed persist struct would leave this at 0, which happens to be the
    * compile-time default anyway, so unconditional restore is safe. */
   state->media_clock.active_clock_source_index = p->active_clock_source_index;
-  /* p->audio_unit_sample_rate_hz ignored for now — placeholder */
+  /* p->audio_unit_sample_rate_hz unused: see avb_persist_restore_rate */
 
   /* v4: preload the persisted media-clock trim so the APLL starts
    * near its converged operating point — streams have not started at
@@ -3217,6 +3257,30 @@ static void avb_persist_apply(avb_state_s *state) {
     state->lite_config_flags = p->lite_config_flags & LITE_CONFIG_FLAGS_KNOWN;
 }
 
+/* Boot brings the audio up at the build's rate. Put it back on the rate
+ * a stream format last set before the saved formats are checked against
+ * it: without this, a board set to 192 kHz came back at 48 kHz and
+ * rewrote its 192 kHz formats to 48 kHz, leaving its peers on 192 kHz. */
+static void avb_persist_restore_rate(avb_state_s *state) {
+  nvs_handle_t handle;
+  if (nvs_open(AVB_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+    return;
+  uint32_t rate = 0;
+  esp_err_t err = nvs_get_u32(handle, AVB_NVS_RATE_KEY, &rate);
+  nvs_close(handle);
+  if (err != ESP_OK || rate == state->config.default_sample_rate)
+    return;
+  if (!state->codec_enabled ||
+      !avb_sample_rate_supported(&state->supported_sample_rates, rate)) {
+    avbwarn("NVS: saved sample rate %lu Hz not usable; staying at %lu Hz",
+            (unsigned long)rate,
+            (unsigned long)state->config.default_sample_rate);
+    return;
+  }
+  if (avb_audio_set_rate(state, rate) == ESP_OK)
+    avbinfo("NVS: restored sample rate %lu Hz", (unsigned long)rate);
+}
+
 /* Load persistent data from NVS */
 esp_err_t avb_persist_load(avb_state_s *state) {
   /* Ensure NVS is initialized */
@@ -3230,6 +3294,8 @@ esp_err_t avb_persist_load(avb_state_s *state) {
     avberr("NVS: flash init failed: %d", err);
     return err;
   }
+
+  avb_persist_restore_rate(state);
 
   bool need_reinit = false; /* true -> overwrite flash with a fresh current blob */
 

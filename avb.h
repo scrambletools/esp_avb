@@ -331,7 +331,7 @@ typedef struct {
   float mic_gain_db;                  /* mic gain in dB */
   uint16_t active_clock_source_index; /* CLOCK_DOMAIN 0 active source */
   uint16_t reserved_cs;               /* pad to 4-byte boundary */
-  uint32_t audio_unit_sample_rate_hz; /* placeholder — wiring TBD */
+  uint32_t audio_unit_sample_rate_hz; /* unused: the rate has its own key */
   /* v4: last converged media-clock PLL correction (Q16 ppm). Preloaded
    * into the APLL at boot (before streams start) so the servo begins
    * within a few ppm of equilibrium instead of slewing tens of ppm
@@ -1499,6 +1499,9 @@ void avb_persist_request_save(avb_state_s *state);
  * paths where a full NVS blob write is too disruptive. */
 esp_err_t avb_persist_append_input_stream(avb_state_s *state, uint16_t index);
 esp_err_t avb_persist_append_output_stream(avb_state_s *state, uint16_t index);
+/* Save the operating sample rate, after a stream format changed it, so
+ * the next boot comes up at that rate. Written like a journal record. */
+esp_err_t avb_persist_save_rate(avb_state_s *state);
 /* SR class an AAF output format's frame interval implies (250 us: Class B,
  * 125 us: Class A); false for any other format. */
 bool avb_output_format_class(const avtp_stream_format_s *fmt, bool *class_b);
