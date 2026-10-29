@@ -3447,6 +3447,7 @@ static void stream_in_lock_residual(stream_rx_ctx_t *ctx, int32_t phase_ns) {
  * phase for the statistics and the media-clock loop, then trim surplus
  * latency. Runs before the drain's write so dropped audio never reaches
  * the DMA. */
+#define STREAM_PHASE_AHEAD_MIN_US 200
 static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
   int64_t now_us = esp_timer_get_time();
   if (now_us - ctx->phase_check_us < STREAM_PHASE_INTERVAL_US)
@@ -3455,20 +3456,22 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
   int32_t phase_ns, ahead_us;
   if (!stream_in_phase(ctx, &phase_ns, &ahead_us))
     return;
+  /* Only while audio is buffered: through an outage the DAC plays
+   * silence and the phase climbs by the outage itself. A talker with
+   * the 2 ms default transit leaves 0.7 to 1.5 ms buffered, so at the
+   * old 1 ms its dips kept restarting the phase hold, which then never
+   * corrected an early lock (-195 us) or a drift (+0.35 us/s). */
+  bool buffered = ahead_us >= STREAM_PHASE_AHEAD_MIN_US;
   if (ctx->diag_gate_mode == 1) {
     stream_in_phase_publish(ctx, phase_ns);
-    if (ahead_us >= 1000)
+    if (buffered) {
       stream_in_held_slip(ctx, (int64_t)phase_ns - ctx->phase_steps_ns, unit);
-    else
-      ctx->held_valid = false;
-    if (ahead_us >= 1000)
       stream_in_lock_residual(ctx, phase_ns);
-    /* Only while audio is buffered: through an outage the DAC plays
-     * silence and the phase climbs by the outage itself. Under the
-     * trim's 1 ms the phase is the lock's and the loops' own error, not
-     * latency the path needed: carried into the next lock as its aim,
-     * it added up over relocks (+34, +88, +91 us over three). */
-    if (ahead_us >= 1000)
+    }
+    /* Under the trim's 1 ms the phase is the lock's and the loops' own
+     * error, not latency the path needed: carried into the next lock as
+     * its aim, it added up over relocks (+34, +88, +91 us over three). */
+    if (buffered)
       ctx->learned_latency_ns = phase_ns < STREAM_LEARNED_MIN_NS ? 0
                                 : phase_ns > 50000000         ? 50000000
                                                               : phase_ns;
