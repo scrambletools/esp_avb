@@ -2512,6 +2512,14 @@ typedef struct {
    * by the drain while locked on presentation time): a relock and a
    * long-pause splice aim for it rather than for presentation time. */
   volatile int32_t learned_latency_ns;
+  /* The lock's own lateness, see stream_in_lock_residual. */
+  int32_t lock_aim_ns; /* learned latency the lock aimed for */
+  int64_t lock_us;     /* esp_timer at the lock */
+  int64_t lock_sum_ns;
+  uint32_t lock_samples;
+  int64_t lock_steps_ns; /* phase_steps_ns when the samples began */
+  bool lock_residual_done;
+  volatile int32_t diag_lock_residual_ns; /* last lock's, 0 until seen */
   volatile uint32_t pt_regates; /* diagnostic: re-gates performed */
   int64_t pt_regate_interval_us; /* next re-gate spacing, 0 = shortest */
   /* Timeline-validity cache: the check reads the PTP clock, which
@@ -2857,6 +2865,10 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
   ctx->slip_played = ctx->phase_lock_played;
   ctx->slip_dir = 0;
   ctx->held_valid = false;
+  ctx->lock_us = esp_timer_get_time();
+  ctx->lock_samples = 0;
+  ctx->lock_residual_done = false;
+  ctx->diag_lock_residual_ns = 0;
   /* Converted audio still queued belongs to the playout before the
    * lock. */
   if (ctx->src_out) {
@@ -3274,6 +3286,42 @@ static void stream_in_held_slip(stream_rx_ctx_t *ctx, int64_t continuous_ns,
   }
 }
 
+/* A presentation lock plays late by the wait for the DMA buffer already
+ * playing and a little more (0.3 to 0.7 ms measured at 48 kHz). The
+ * phase loops held that lateness, the trim takes only 1 ms or more, and
+ * the next lock aimed for it again as learned latency, so each relock
+ * added its own (Synthia: 0.3, 1.0, 1.3, 2.0 ms over four). Once a
+ * second of phase after the lock shows it, walk it out through the
+ * converter, as a trim. */
+#define STREAM_LOCK_SETTLE_US 200000
+#define STREAM_LOCK_SAMPLES 50 /* a second of phase ticks */
+#define STREAM_LOCK_RESIDUAL_MAX_NS GATE_LATE_NS
+static void stream_in_lock_residual(stream_rx_ctx_t *ctx, int32_t phase_ns) {
+  if (!ctx->src_out || ctx->lock_residual_done ||
+      esp_timer_get_time() - ctx->lock_us < STREAM_LOCK_SETTLE_US)
+    return;
+  /* A starvation or slip in the samples moves the phase: start again. */
+  if (ctx->lock_samples == 0 || ctx->lock_steps_ns != ctx->phase_steps_ns) {
+    ctx->lock_samples = 0;
+    ctx->lock_sum_ns = 0;
+    ctx->lock_steps_ns = ctx->phase_steps_ns;
+  }
+  ctx->lock_sum_ns += phase_ns;
+  if (++ctx->lock_samples < STREAM_LOCK_SAMPLES)
+    return;
+  ctx->lock_residual_done = true;
+  int64_t late_ns = ctx->lock_sum_ns / ctx->lock_samples - ctx->lock_aim_ns;
+  ctx->diag_lock_residual_ns = (int32_t)late_ns;
+  if (late_ns > STREAM_LOCK_RESIDUAL_MAX_NS || ctx->src_trim_bytes)
+    return;
+  int32_t frames = (int32_t)(late_ns * ctx->ring_bytes_per_sec /
+                             STREAM_FRAME_BYTES / 1000000000LL);
+  if (frames <= 0)
+    return;
+  avb_src_owe(&ctx->src, frames);
+  ctx->src_trim_bytes += (uint32_t)frames * STREAM_FRAME_BYTES;
+}
+
 /* Every STREAM_PHASE_INTERVAL_US while playout is locked: sample the
  * phase for the statistics and the media-clock loop, then trim surplus
  * latency. Runs before the drain's write so dropped audio never reaches
@@ -3292,6 +3340,8 @@ static void stream_in_phase_tick(stream_rx_ctx_t *ctx, uint32_t unit) {
       stream_in_held_slip(ctx, (int64_t)phase_ns - ctx->phase_steps_ns, unit);
     else
       ctx->held_valid = false;
+    if (ahead_us >= 1000)
+      stream_in_lock_residual(ctx, phase_ns);
     /* Only while audio is buffered: through an outage the DAC plays
      * silence and the phase climbs by the outage itself. */
     if (ahead_us >= 1000)
@@ -3659,6 +3709,7 @@ static void stream_in_drain_body(void *arg) {
           start = true;
           pt_mode = true;
           pt_err_ns = diff;
+          ctx->lock_aim_ns = ctx->learned_latency_ns;
         } else if (diff >= 0) {
           /* Stale/mis-timeline anchor: discard it and hold for a
            * fresh packet to re-arm on an empty ring (via the
@@ -4612,7 +4663,7 @@ void avb_stream_in_print_diag(void) {
           "starved=%luB "
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
-          "dgap=%luus",
+          "dgap=%luus lockres=%ldus",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -4646,7 +4697,8 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)ctx->trims, (unsigned long)ctx->trim_bytes,
           (unsigned long)ctx->slip_drops, (unsigned long)ctx->slip_repeats,
           (unsigned long)src_cycles, (unsigned long)ctx->src.walks,
-          (unsigned long)drain_gap_us);
+          (unsigned long)drain_gap_us,
+          (long)(ctx->diag_lock_residual_ns / 1000));
   /* Ground-truth snapshot of what the drain is feeding the DAC: 12
    * bytes at the ring tail (2 stereo 24-bit frames). Distinguishes
    * "ring holds real audio, fault is downstream of i2s_channel_write"
