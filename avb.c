@@ -3392,7 +3392,7 @@ esp_err_t avb_persist_save(avb_state_s *state) {
 /* Hot-path API. Gather under the snapshot mutex (micro-second memcpy),
  * then set the dirty flag. The actual flash write happens later from
  * the persist task, so the caller never blocks on nvs_commit. */
-void avb_persist_request_save(avb_state_s *state) {
+static void avb_persist_gather_locked(avb_state_s *state) {
   if (state->persist_mutex) {
     xSemaphoreTake(state->persist_mutex, portMAX_DELAY);
     avb_persist_gather(state);
@@ -3403,12 +3403,28 @@ void avb_persist_request_save(avb_state_s *state) {
      * point in startup so no race. */
     avb_persist_gather(state);
   }
+}
+
+void avb_persist_request_save(avb_state_s *state) {
+  avb_persist_gather_locked(state);
   /* Stamp the 0→1 edge so the persist task can force a flush past the
    * streaming gate after AVB_PERSIST_FORCED_FLUSH_MSEC. Subsequent
-   * marks before the task clears the flag don't reset the timer. */
-  if (!state->persist_dirty) {
+   * marks before the task clears the flag don't reset the timer; lazy
+   * ones never started it. */
+  if (!state->persist_dirty || state->persist_lazy) {
     state->persist_dirty_since_tick = xTaskGetTickCount();
   }
+  state->persist_lazy = false;
+  state->persist_dirty = true;
+}
+
+/* A media-clock trim saved on every refinement (about every 6 min on
+ * the mic) kept the snapshot dirty, so a forced flush stalled the
+ * talker every 12 min and each listener starved for up to 18 ms. */
+void avb_persist_request_lazy_save(avb_state_s *state) {
+  avb_persist_gather_locked(state);
+  if (!state->persist_dirty)
+    state->persist_lazy = true;
   state->persist_dirty = true;
 }
 
@@ -3460,6 +3476,8 @@ void avb_persist_task(void *arg) {
      * can latch the EMAC RX FIFO, see AVB_PERSIST_QUIET_US. */
     streaming = streaming || !avb_persist_ingress_quiet();
     if (streaming) {
+      if (state->persist_lazy)
+        continue;
       TickType_t age = xTaskGetTickCount() - state->persist_dirty_since_tick;
       if (age < pdMS_TO_TICKS(AVB_PERSIST_FORCED_FLUSH_MSEC)) {
         continue;
@@ -3468,6 +3486,8 @@ void avb_persist_task(void *arg) {
               "expect a brief audio/CRF glitch",
               (unsigned)(age * portTICK_PERIOD_MS));
     }
+    /* Lazy first: a lazy mark between the two then still reads lazy. */
+    state->persist_lazy = false;
     state->persist_dirty = false;
     xSemaphoreTake(state->persist_mutex, portMAX_DELAY);
     memcpy(&snapshot, &state->persist, sizeof(snapshot));

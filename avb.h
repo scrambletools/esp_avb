@@ -1083,6 +1083,9 @@ typedef struct avb_state_s {
    * than AVB_PERSIST_FORCED_FLUSH_MSEC. Cleared together with
    * persist_dirty when the task completes a write. */
   volatile TickType_t persist_dirty_since_tick;
+  /* Only lazy marks since the last write (avb_persist_request_lazy_save):
+   * nothing forces those past the streaming gate. */
+  volatile bool persist_lazy;
   SemaphoreHandle_t persist_mutex;
 
   /* Latest received packet and its timestamp (CLOCK_REALTIME)
@@ -1497,6 +1500,10 @@ void avb_stream_out_print_diag(void);
  * write happens later from the persist task. Safe to call from any
  * task that writes persist-tracked state. */
 void avb_persist_request_save(avb_state_s *state);
+/* As avb_persist_request_save, for state that only seeds the next boot
+ * (the media-clock trim): written with the next save or once streams
+ * stop, never by a forced flush, which stalls a talker about 30 ms. */
+void avb_persist_request_lazy_save(avb_state_s *state);
 /* Stream-journal persistence: append one 32-byte stream record instead of
  * rewriting the whole persistent blob. Intended for connect/disconnect hot
  * paths where a full NVS blob write is too disruptive. */

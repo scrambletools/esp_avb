@@ -852,13 +852,21 @@ void avb_pll_print_stats(avb_state_s *state) {
 }
 
 /* Record trim_q16 as the converged trim against the current BTC and
- * queue the deferred NVS write. */
+ * queue a lazy NVS write: the trim only seeds the next boot. Moves of
+ * 2 ppm or less (about one APLL step) against the same BTC are not
+ * worth a write. */
 static void persist_trim(avb_state_s *state, int32_t trim_q16) {
+  int32_t delta_q16 = trim_q16 - state->media_clock.pll_converged_trim_q16;
+  bool same_btc = memcmp(state->media_clock.pll_trim_btc_id,
+                         state->ptp_status.clock_source_info.btc_id,
+                         sizeof(state->media_clock.pll_trim_btc_id)) == 0;
+  if (same_btc && delta_q16 <= 2 * 65536 && delta_q16 >= -2 * 65536)
+    return;
   state->media_clock.pll_converged_trim_q16 = trim_q16;
   memcpy(state->media_clock.pll_trim_btc_id,
          state->ptp_status.clock_source_info.btc_id,
          sizeof(state->media_clock.pll_trim_btc_id));
-  avb_persist_request_save(state);
+  avb_persist_request_lazy_save(state);
   ESP_LOGI(TAG, "persisting media-clock trim %ld ppm", (long)(trim_q16 / 65536));
 }
 
@@ -1501,8 +1509,7 @@ void avb_pll_tick(avb_state_s *state) {
    * true at every rest between convergence steps, and persisting a
    * mid-climb value would poison the next boot's preload (observed:
    * a 10-minute check landing during the staircase persisted ~0).
-   * Written only when > 2 ppm from the saved value; the write rides
-   * the deferred NVS writer. */
+   * persist_trim writes only moves of more than 2 ppm. */
   if (state->media_clock.pll_applied_ppm_q16 ==
           state->media_clock.pll_target_ppm_q16 &&
       now_us - s_pll.last_trim_check_us > 600LL * 1000000LL) {
@@ -1518,9 +1525,7 @@ void avb_pll_tick(avb_state_s *state) {
       ESP_LOGI(TAG, "internal reference converged — holding trim at %ld ppm",
                (long)(applied_now_q16 / 65536));
     }
-    int32_t trim_delta_q16 =
-        applied_now_q16 - state->media_clock.pll_converged_trim_q16;
-    if (stable && (trim_delta_q16 > 2 * 65536 || trim_delta_q16 < -2 * 65536))
+    if (stable)
       persist_trim(state, applied_now_q16);
   }
 
