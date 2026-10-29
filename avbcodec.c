@@ -188,10 +188,10 @@ static const avb_codec_caps_s s_es8389_caps = {
     .max_mclk_hz = 49200000, /* datasheet rev 6.0 */
     .min_mclk_bclk_ratio = 2, /* ratio 2 proven at 88.2 and 192 kHz */
     .apply_clock = es8389_apply_clock,
-    /* Scope on a hat's output: 518 us at 48 kHz, 202 us at 96 kHz,
-     * 98 us at 192 kHz. */
-    .output_delay_frames = 25,
-    .output_delay_frames_fast = 19,
+    /* Scope on a hat's output, from the buffer the DMA plays: 286 us
+     * at 48 kHz, 87 us at 96 kHz, 37 us at 192 kHz. */
+    .output_delay_frames = 14,
+    .output_delay_frames_fast = 8,
 };
 
 int16_t avb_codec_quantize_tenth_db(const codec_control_range_s *ranges,
