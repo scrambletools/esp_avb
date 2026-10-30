@@ -92,6 +92,7 @@ typedef enum {
   aecp_cmd_code_get_audio_map = 0x002b,
   aecp_cmd_code_add_audio_mappings = 0x002c,
   aecp_cmd_code_remove_audio_mappings = 0x002d,
+  aecp_cmd_code_get_dynamic_info = 0x004b,
   aecp_cmd_code_set_max_transit_time = 0x004c,
   aecp_cmd_code_get_max_transit_time = 0x004d,
   aecp_cmd_code_expansion = 0xffff // for milan
@@ -1923,6 +1924,9 @@ int avb_process_aecp_cmd_streaming(avb_state_s *state, aecp_message_u *msg,
                                    eth_addr_t *src_addr);
 int avb_process_aecp_cmd_get_audio_map(avb_state_s *state, aecp_message_u *msg,
                                        eth_addr_t *src_addr);
+int avb_process_aecp_cmd_get_dynamic_info(avb_state_s *state,
+                                          aecp_message_u *msg,
+                                          eth_addr_t *src_addr);
 int avb_process_aecp_cmd_audio_mappings(avb_state_s *state,
                                         aecp_message_u *msg,
                                         eth_addr_t *src_addr);

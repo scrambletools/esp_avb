@@ -2896,9 +2896,36 @@ void avb_net_tx_end(UBaseType_t prio) { (void)prio; }
 #endif
 
 /* Send an Ethernet frame */
+/* While a GET_DYNAMIC_INFO answers a packed command with that command's
+ * own handler, the handler's reply lands here instead of on the wire;
+ * sends from any other task go out as usual. */
+static uint8_t *s_capture_buf;
+static size_t s_capture_cap;
+static int s_capture_len;
+static TaskHandle_t s_capture_task;
+
+void avb_net_capture_begin(uint8_t *buf, size_t cap) {
+  s_capture_cap = cap;
+  s_capture_len = -1;
+  s_capture_task = xTaskGetCurrentTaskHandle();
+  s_capture_buf = buf;
+}
+
+int avb_net_capture_end(void) {
+  s_capture_buf = NULL;
+  s_capture_task = NULL;
+  return s_capture_len;
+}
+
 int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
                     uint16_t msg_len, struct timespec *ts,
                     eth_addr_t *dest_addr) {
+  if (s_capture_buf && s_capture_task == xTaskGetCurrentTaskHandle()) {
+    size_t length = msg_len < s_capture_cap ? msg_len : s_capture_cap;
+    memcpy(s_capture_buf, msg, length);
+    s_capture_len = (int)length;
+    return msg_len;
+  }
   /* Match the guard in avb_net_send_on: skip TX silently when port 0
    * has no carrier so periodic ADP / MAAP / AECP cycles do not spam
    * the failure log. Single source of truth is esp_ptp. */

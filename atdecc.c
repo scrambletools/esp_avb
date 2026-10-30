@@ -3048,6 +3048,140 @@ int avb_process_aecp_cmd_audio_mappings(avb_state_s *state,
   return ret;
 }
 
+/* GET_DYNAMIC_INFO's packed GETs: the fixed-size ones (IEEE 1722.1-2021
+ * §7.4.76.2). */
+static bool avb_dynamic_info_command(uint16_t type) {
+  switch (type) {
+  case 0x0007: // GET_CONFIGURATION
+  case 0x0009: // GET_STREAM_FORMAT
+  case 0x000b: // GET_VIDEO_FORMAT
+  case 0x000d: // GET_SENSOR_FORMAT
+  case 0x000f: // GET_STREAM_INFO
+  case 0x0011: // GET_NAME
+  case 0x0013: // GET_ASSOCIATION_ID
+  case 0x0015: // GET_SAMPLING_RATE
+  case 0x0017: // GET_CLOCK_SOURCE
+  case 0x001d: // GET_SIGNAL_SELECTOR
+  case 0x0029: // GET_COUNTERS
+  case 0x0048: // GET_MEMORY_OBJECT_LENGTH
+  case 0x004a: // GET_STREAM_BACKUP
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* One dynamic_info: its data length, status and command type, then
+ * its command-specific data. */
+#define AECP_DYNAMIC_INFO_HEADER_LEN 8
+/* Largest AECPDU control_data_length (IEEE 1722.1-2021 §9.2.1.1.7). */
+#define AECP_MAX_CONTROL_DATA_LEN 524
+
+/* Process AECP command get dynamic info (IEEE 1722.1-2021 §7.4.76, Milan
+ * v1.3 5.4.2.29). Each packed GET goes through the AEM dispatcher as if
+ * it came alone, and the reply its handler sends is caught and packed;
+ * a reply that would overflow the AECPDU is left out. */
+int avb_process_aecp_cmd_get_dynamic_info(avb_state_s *state,
+                                          aecp_message_u *msg,
+                                          eth_addr_t *src_addr) {
+  struct timespec ts;
+  uint16_t cdl = (msg->header.control_data_len_h << 8) |
+                 msg->header.control_data_len;
+  size_t total = AVTP_CDL_PREAMBLE_LEN + cdl;
+  size_t head = sizeof(aecp_aem_basic_s);
+  if (total > sizeof(msg->raw))
+    total = sizeof(msg->raw);
+  const uint8_t *in = msg->raw;
+
+  /* Every element must be a fixed-size GET that fits the command. */
+  aecp_status_t status = aecp_status_success;
+  for (size_t at = head; at < total;) {
+    if (at + AECP_DYNAMIC_INFO_HEADER_LEN > total) {
+      status = aecp_status_bad_arguments;
+      break;
+    }
+    uint16_t length = (uint16_t)((in[at] << 8) | in[at + 1]);
+    uint16_t type = (uint16_t)(((in[at + 6] << 8) | in[at + 7]) & 0x7FFF);
+    if (!avb_dynamic_info_command(type) ||
+        at + AECP_DYNAMIC_INFO_HEADER_LEN + length > total) {
+      status = aecp_status_bad_arguments;
+      break;
+    }
+    at += AECP_DYNAMIC_INFO_HEADER_LEN + length;
+  }
+
+  static aecp_message_u rsp;
+  size_t out = head;
+  memcpy(&rsp, msg, head);
+  if (status != aecp_status_success) {
+    memcpy(rsp.raw, in, total);
+    out = total;
+  } else {
+    static aecp_message_u sub;
+    static uint8_t reply[AVB_MAX_MSG_LEN];
+    for (size_t at = head; at < total;) {
+      uint16_t length = (uint16_t)((in[at] << 8) | in[at + 1]);
+      uint16_t type = (uint16_t)(((in[at + 6] << 8) | in[at + 7]) & 0x7FFF);
+      const uint8_t *data = in + at + AECP_DYNAMIC_INFO_HEADER_LEN;
+      at += AECP_DYNAMIC_INFO_HEADER_LEN + length;
+
+      memset(&sub, 0, sizeof(sub));
+      memcpy(&sub, msg, head);
+      sub.header.msg_type = aecp_msg_type_aem_command;
+      sub.basic.aem.unsolicited = 0;
+      sub.basic.aem.cr = 0;
+      sub.basic.aem.command_type_h = (type >> 8) & 0x3F;
+      sub.basic.aem.command_type = type & 0xFF;
+      memcpy(sub.raw + head, data, length);
+      uint16_t sub_cdl = head + length - AVTP_CDL_PREAMBLE_LEN;
+      sub.header.control_data_len_h = (sub_cdl >> 8) & 0x07;
+      sub.header.control_data_len = sub_cdl & 0xFF;
+
+      avb_net_capture_begin(reply, sizeof(reply));
+      avb_process_aecp(state, &sub, src_addr);
+      int replied = avb_net_capture_end();
+
+      uint8_t info_status;
+      const uint8_t *info_data;
+      size_t info_length;
+      if (replied >= (int)head) {
+        info_status = ((aecp_message_u *)reply)->header.status_valtime;
+        info_data = reply + head;
+        info_length = (size_t)replied - head;
+      } else {
+        info_status = aecp_status_not_supported;
+        info_data = data;
+        info_length = length;
+      }
+      if (info_status == aecp_status_not_implemented)
+        info_status = aecp_status_not_supported;
+      if (out + AECP_DYNAMIC_INFO_HEADER_LEN + info_length >
+          AVTP_CDL_PREAMBLE_LEN + AECP_MAX_CONTROL_DATA_LEN)
+        continue;
+      uint8_t *element = rsp.raw + out;
+      element[0] = (uint8_t)(info_length >> 8);
+      element[1] = (uint8_t)info_length;
+      element[2] = element[3] = 0;
+      element[4] = info_status;
+      element[5] = 0;
+      element[6] = (uint8_t)(type >> 8);
+      element[7] = (uint8_t)type;
+      memcpy(element + AECP_DYNAMIC_INFO_HEADER_LEN, info_data, info_length);
+      out += AECP_DYNAMIC_INFO_HEADER_LEN + info_length;
+    }
+  }
+
+  rsp.header.msg_type = aecp_msg_type_aem_response;
+  rsp.header.status_valtime = (uint8_t)status;
+  uint16_t rsp_cdl = out - AVTP_CDL_PREAMBLE_LEN;
+  rsp.header.control_data_len_h = (rsp_cdl >> 8) & 0x07;
+  rsp.header.control_data_len = rsp_cdl & 0xFF;
+  int ret = avb_net_send_to(state, ethertype_avtp, &rsp, out, &ts, src_addr);
+  if (ret < 0)
+    avberr("send AECP Get Dynamic Info response failed: %d", errno);
+  return ret;
+}
+
 int avb_process_aecp_cmd_read_descriptor(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr) {
@@ -4059,6 +4193,8 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
       return avb_process_aecp_cmd_streaming(state, msg, src_addr);
     case aecp_cmd_code_get_audio_map:
       return avb_process_aecp_cmd_get_audio_map(state, msg, src_addr);
+    case aecp_cmd_code_get_dynamic_info:
+      return avb_process_aecp_cmd_get_dynamic_info(state, msg, src_addr);
     case aecp_cmd_code_add_audio_mappings:
     case aecp_cmd_code_remove_audio_mappings:
       return avb_process_aecp_cmd_audio_mappings(state, msg, src_addr);

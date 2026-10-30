@@ -1171,6 +1171,10 @@ int avb_net_recv_ctrl(avb_state_s *state, int *protocol_idx, int *ingress_port,
  * wifi-backed ports. Callers don't branch on medium. */
 esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
                                size_t frame_len);
+/* Catch the calling task's next avb_net_send_to message in buf instead of
+ * sending it; end returns its length, or -1 when nothing was sent. */
+void avb_net_capture_begin(uint8_t *buf, size_t cap);
+int avb_net_capture_end(void);
 
 /* A dual-core talker runs its send loop from IRAM. In flash, the
  * listener's data streaming through the shared L2 cache evicted the
