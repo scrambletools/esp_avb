@@ -89,6 +89,10 @@ typedef struct {
   volatile int32_t ts_err_ns;          /* stamp error vs gPTP schedule */
   volatile uint32_t wakes;             /* batched pacing: sleeps ended */
   volatile uint32_t stalls;            /* packets sent TALKER_STALL_US late */
+  /* Frames sent TALKER_SENT_LATE_US later after their slot than the
+   * typical frame, and the most any went past the typical (us). */
+  volatile uint32_t sent_late;
+  volatile uint32_t sent_late_max_us;
   volatile uint32_t src_cycles;        /* CPU cycles per resampled frame */
   volatile uint32_t src_walks;         /* converter walks started */
 } stream_tx_ctx_t;
@@ -763,6 +767,10 @@ static AVB_TALKER_IRAM_ATTR void i2s24_to_am824_stereo(const uint8_t *in,
 /* A packet sent this long after its slot counts as a talker stall
  * (STREAM-OUT stalls=), whatever the pacing. */
 #define TALKER_STALL_US 4000
+/* On Ethernet, a frame sent this much later after its slot than the
+ * typical frame counts as late (STREAM-OUT tx_late=). A frame leaves its
+ * build time after its slot, about 35 us on a P4. */
+#define TALKER_SENT_LATE_US 25
 /* No ADC rate readings for this long after a talker disturbance. */
 #define TALKER_ADC_SETTLE_US (10LL * 60 * 1000000LL)
 
@@ -1108,6 +1116,9 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   uint32_t loop_count = 0;
   uint32_t overrun_count = 0;
   int64_t overrun_max = 0;
+  uint32_t sent_late = 0;
+  int64_t sent_late_max_us = 0;
+  int64_t sent_typical_q8 = 0; /* slot to sent, us x 256 */
   uint32_t send_fail_count = 0;
   esp_err_t last_send_error = ESP_OK;
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
@@ -1939,6 +1950,10 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
         tx_ctx->ts_err_ns = ts_err_last;
         tx_ctx->wakes = wake_count;
         tx_ctx->stalls = stall_count;
+        tx_ctx->sent_late = sent_late;
+        if (sent_late_max_us > tx_ctx->sent_late_max_us)
+          tx_ctx->sent_late_max_us = (uint32_t)sent_late_max_us;
+        sent_late_max_us = 0;
         tx_ctx->i2s_dropped_bytes =
             capture_ring
                 ? (uint32_t)capture_dropped
@@ -2264,7 +2279,19 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
       memcpy(tx_frame, &das[copy], ETH_ADDR_LEN);
       esp_err_t sent =
           avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len);
-      avb_net_talker_tx_done((uint32_t)esp_timer_get_time());
+      int64_t sent_us = esp_timer_get_time();
+      avb_net_talker_tx_done((uint32_t)sent_us);
+      if (copy == 0 && params->eth_handle != NULL) {
+        int64_t sent_after_us = sent_us - packet_sched_us;
+        int64_t typical_us = sent_typical_q8 >> 8;
+        sent_typical_q8 += ((sent_after_us << 8) - sent_typical_q8) >> 8;
+        if (loop_count > 8192 &&
+            sent_after_us > typical_us + TALKER_SENT_LATE_US) {
+          sent_late++;
+          if (sent_after_us - typical_us > sent_late_max_us)
+            sent_late_max_us = sent_after_us - typical_us;
+        }
+      }
       if (sent != ESP_OK && params->eth_handle != NULL) {
         /* One immediate retry on Ethernet. Per-listener duplication raises
          * TX-ring pressure enough that the once-per-second control-plane
@@ -5090,13 +5117,13 @@ void avb_stream_out_print_diag(void) {
   static uint32_t last_slip = 0, last_slip_pkts = 0;
   static uint32_t last_resync = 0;
   static uint32_t last_anchors = 0, last_dropped = 0;
-  static uint32_t last_wakes = 0, last_stalls = 0;
+  static uint32_t last_wakes = 0, last_stalls = 0, last_late = 0;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = last_under = 0;
     last_slip = last_slip_pkts = 0;
     last_anchors = last_dropped = 0;
-    last_wakes = last_stalls = 0;
+    last_wakes = last_stalls = last_late = 0;
   }
 
   uint32_t pkts = ctx->pkt_count;
@@ -5113,6 +5140,9 @@ void avb_stream_out_print_diag(void) {
   uint32_t dropped = ctx->i2s_dropped_bytes;
   uint32_t wakes = ctx->wakes;
   uint32_t stalls = ctx->stalls;
+  uint32_t late = ctx->sent_late;
+  uint32_t late_max_us = ctx->sent_late_max_us;
+  ctx->sent_late_max_us = 0;
   uint32_t wbundles = 0, wbundle_frames = 0, wnacks = 0, wretx = 0;
   uint32_t wretx_late = 0, wretx_evicted = 0;
 #if !defined(CONFIG_ESP_AVB_ROLE_BRIDGE) && defined(CONFIG_ESP_AVB_WIFI_BUNDLE)
@@ -5143,7 +5173,8 @@ void avb_stream_out_print_diag(void) {
           "i2s_zero=%lu i2s_nz=%lu under=%lu pll=[%s] pll_skip=%lu "
           "drift=%s%ld.%02d ppm fill=%s%ld.%02d ppm backlog=%ldB rem=[%s] "
           "resync=%lu slips=%lu/%lu anchors=%lu dropped=%luB ts_err=%ldus "
-          "wbundles=%lu wnack=%lu wretx=%lu/%lu/%lu src=%lucyc/%lu",
+          "wbundles=%lu wnack=%lu wretx=%lu/%lu/%lu src=%lucyc/%lu "
+          "tx_late=%lu/%luus",
           (unsigned long)(pkts - last_pkts),
           (unsigned long)(fail - last_fail),
           (unsigned long)(over - last_over), (long long)over_max,
@@ -5168,7 +5199,8 @@ void avb_stream_out_print_diag(void) {
           (long)(ctx->ts_err_ns / 1000), (unsigned long)wbundles,
           (unsigned long)wnacks, (unsigned long)wretx,
           (unsigned long)wretx_late, (unsigned long)wretx_evicted,
-          (unsigned long)ctx->src_cycles, (unsigned long)ctx->src_walks);
+          (unsigned long)ctx->src_cycles, (unsigned long)ctx->src_walks,
+          (unsigned long)(late - last_late), (unsigned long)late_max_us);
 
   /* Secondary detail lines only emitted when samples were actually
    * collected, to keep noise-free output when the stream is idle. */
@@ -5197,6 +5229,7 @@ void avb_stream_out_print_diag(void) {
   last_over = over;
   last_wakes = wakes;
   last_stalls = stalls;
+  last_late = late;
   last_z = z;
   last_nz = nz;
   last_under = under;
