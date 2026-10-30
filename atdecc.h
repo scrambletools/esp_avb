@@ -81,8 +81,8 @@ typedef enum {
   aecp_cmd_code_get_clock_source = 0x0017,
   aecp_cmd_code_set_control = 0x0018,
   aecp_cmd_code_get_control = 0x0019,
-  aecp_cmd_code_start_streaming = 0x0022, // unsupported
-  aecp_cmd_code_stop_streaming = 0x0023,  // unsupported
+  aecp_cmd_code_start_streaming = 0x0022,
+  aecp_cmd_code_stop_streaming = 0x0023,
   aecp_cmd_code_register_unsol_notif = 0x0024,
   aecp_cmd_code_deregister_unsol_notif = 0x0025,
   aecp_cmd_code_get_avb_info = 0x0027,
@@ -1883,6 +1883,8 @@ int avb_process_aecp_cmd_set_clock_source(avb_state_s *state,
 int avb_process_aecp_cmd_sampling_rate(avb_state_s *state,
                                        aecp_message_u *msg,
                                        eth_addr_t *src_addr);
+int avb_process_aecp_cmd_streaming(avb_state_s *state, aecp_message_u *msg,
+                                   eth_addr_t *src_addr);
 int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
                                               aecp_message_u *msg,
                                               eth_addr_t *src_addr);

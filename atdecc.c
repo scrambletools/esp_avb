@@ -2745,6 +2745,58 @@ int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
   return ret;
 }
 
+/* Process AECP commands start and stop streaming (IEEE 1722.1-2021
+ * §7.4.35/36, Milan v1.3 §5.4.2.19/20): a bound Stream Input's started
+ * or stopped state, the one BIND_STREAM sets with STREAMING_WAIT, and
+ * saved with it. A stopped input discards its stream (avtp.c). Milan
+ * leaves a Stream Output always streaming: NOT_SUPPORTED. An unbound
+ * input is left as it is. */
+int avb_process_aecp_cmd_streaming(avb_state_s *state, aecp_message_u *msg,
+                                   eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_aem_short_s *cmd = (aecp_aem_short_s *)msg;
+  bool start = cmd->aem.command_type == aecp_cmd_code_start_streaming;
+  uint16_t descriptor_type = octets_to_uint(cmd->descriptor_type, 2);
+  uint16_t index = octets_to_uint(cmd->descriptor_index, 2);
+  static const uint8_t unbound[UNIQUE_ID_LEN] = {0};
+
+  aecp_status_t status = aecp_status_success;
+  bool changed = false;
+  if (descriptor_type == aem_desc_type_stream_output &&
+      index < state->num_output_streams) {
+    status = aecp_status_not_supported;
+  } else if (descriptor_type != aem_desc_type_stream_input ||
+             index >= state->num_input_streams) {
+    status = aecp_status_no_such_descriptor;
+  } else {
+    avb_listener_stream_s *stream = &state->input_streams[index];
+    uint8_t wait = start ? 0 : 1;
+    if (memcmp(stream->talker_id, unbound, UNIQUE_ID_LEN) != 0 &&
+        stream->stream_flags.streaming_wait != wait) {
+      stream->stream_flags.streaming_wait = wait;
+      changed = true;
+      avbinfo("Stream input %u %s", index, start ? "started" : "stopped");
+    }
+  }
+
+  cmd->common.header.msg_type = aecp_msg_type_aem_response;
+  cmd->common.header.status_valtime = (uint8_t)status;
+  uint16_t cdl = sizeof(*cmd) - AVTP_CDL_PREAMBLE_LEN;
+  cmd->common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  cmd->common.header.control_data_len = cdl & 0xFF;
+  int ret = avb_net_send_to(state, ethertype_avtp, cmd, sizeof(*cmd), &ts,
+                            src_addr);
+  if (ret < 0)
+    avberr("send AECP %s_STREAMING response failed: %d",
+           start ? "START" : "STOP", errno);
+  if (changed) {
+    avb_unsol_notify(state, cmd, sizeof(*cmd), avb_unsol_kind_aem,
+                     cmd->common.controller_entity_id, src_addr);
+    avb_persist_append_input_stream(state, index);
+  }
+  return ret;
+}
+
 int avb_process_aecp_cmd_read_descriptor(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr) {
@@ -3602,6 +3654,8 @@ static bool avb_aem_command_changes_state(uint8_t command_type) {
   case aecp_cmd_code_set_stream_format:
   case aecp_cmd_code_set_clock_source:
   case aecp_cmd_code_set_sampling_rate:
+  case aecp_cmd_code_start_streaming:
+  case aecp_cmd_code_stop_streaming:
   case aecp_cmd_code_set_max_transit_time:
   case aecp_cmd_code_set_name:
   case aecp_cmd_code_set_control:
@@ -3744,6 +3798,9 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     case aecp_cmd_code_get_configuration:
       return avb_process_aecp_cmd_get_configuration(state, msg, src_addr);
       break;
+    case aecp_cmd_code_start_streaming:
+    case aecp_cmd_code_stop_streaming:
+      return avb_process_aecp_cmd_streaming(state, msg, src_addr);
     case aecp_cmd_code_read_descriptor:
       return avb_process_aecp_cmd_read_descriptor(state, msg, src_addr);
       break;
