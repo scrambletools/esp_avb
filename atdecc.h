@@ -89,6 +89,9 @@ typedef enum {
   aecp_cmd_code_get_avb_info = 0x0027,
   aecp_cmd_code_get_as_path = 0x0028,
   aecp_cmd_code_get_counters = 0x0029,
+  aecp_cmd_code_get_audio_map = 0x002b,
+  aecp_cmd_code_add_audio_mappings = 0x002c,
+  aecp_cmd_code_remove_audio_mappings = 0x002d,
   aecp_cmd_code_set_max_transit_time = 0x004c,
   aecp_cmd_code_get_max_transit_time = 0x004d,
   aecp_cmd_code_expansion = 0xffff // for milan
@@ -1396,6 +1399,33 @@ typedef struct {
   aem_audio_mapping_s mappings[AEM_MAX_NUM_MAPPINGS];
 } aem_audio_map_desc_s; // 84 bytes
 
+/* GET_AUDIO_MAP command and response (IEEE 1722.1-2021 §7.4.44). The
+ * command ends after map_index and two reserved octets, where the
+ * response carries number_of_maps. */
+typedef struct {
+  aecp_common_s common;
+  aecp_common_aem_s aem;
+  uint8_t descriptor_type[2];    // STREAM_PORT_INPUT or STREAM_PORT_OUTPUT
+  uint8_t descriptor_index[2];   // stream port index
+  uint8_t map_index[2];          // subset of the mappings
+  uint8_t number_of_maps[2];     // subsets the mappings span
+  uint8_t number_of_mappings[2]; // mappings that follow
+  uint8_t reserved[2];
+  aem_audio_mapping_s mappings[AVB_INPUT_CLUSTER_CHANNELS];
+} aecp_get_audio_map_s;
+
+/* ADD/REMOVE_AUDIO_MAPPINGS command and response (IEEE 1722.1-2021
+ * §7.4.45/46). */
+typedef struct {
+  aecp_common_s common;
+  aecp_common_aem_s aem;
+  uint8_t descriptor_type[2];    // STREAM_PORT_INPUT or STREAM_PORT_OUTPUT
+  uint8_t descriptor_index[2];   // stream port index
+  uint8_t number_of_mappings[2]; // mappings that follow
+  uint8_t reserved[2];
+  aem_audio_mapping_s mappings[AVB_AEM_MAX_MSG_MAPPINGS];
+} aecp_audio_mappings_s;
+
 /* AEM Identify Control value details */
 typedef struct {
   uint8_t values[5];
@@ -1642,6 +1672,8 @@ typedef union {
   aecp_get_as_path_rsp_s get_as_path_rsp;
   aecp_max_transit_time_s max_transit_time;
   aecp_sampling_rate_s sampling_rate;
+  aecp_get_audio_map_s get_audio_map;
+  aecp_audio_mappings_s audio_mappings;
   aecp_get_counters_s get_counters;
   aecp_get_counters_rsp_s get_counters_rsp;
   aecp_register_unsol_notif_s register_unsol_notif;
@@ -1889,6 +1921,11 @@ int avb_process_aecp_cmd_set_configuration(avb_state_s *state,
                                            eth_addr_t *src_addr);
 int avb_process_aecp_cmd_streaming(avb_state_s *state, aecp_message_u *msg,
                                    eth_addr_t *src_addr);
+int avb_process_aecp_cmd_get_audio_map(avb_state_s *state, aecp_message_u *msg,
+                                       eth_addr_t *src_addr);
+int avb_process_aecp_cmd_audio_mappings(avb_state_s *state,
+                                        aecp_message_u *msg,
+                                        eth_addr_t *src_addr);
 int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
                                               aecp_message_u *msg,
                                               eth_addr_t *src_addr);

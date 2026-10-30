@@ -775,19 +775,19 @@ int avb_send_aecp_rsp_read_descr_stream_port(avb_state_s *state,
   int ret = OK;
   struct timespec ts;
 
-  // data for the stream input descriptor
+  /* One cluster per port. The input port maps dynamically, so it has no
+   * AUDIO_MAP (Milan v1.3 5.3.3.9); the output port keeps its static
+   * map, AUDIO_MAP 0. */
   uint16_t num_clusters = 1;
-  uint16_t num_maps = 1;
+  uint16_t num_maps = is_output ? 1 : 0;
 
   aem_stream_port_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_stream_port_desc_s));
 
   int_to_octets(&num_clusters, &descriptor.number_of_clusters, 2);
   int_to_octets(&num_maps, &descriptor.number_of_maps, 2);
-  if (is_output) { // bases are different for output port
+  if (is_output) // the output port's cluster follows the input port's
     descriptor.base_cluster[1] = 1;
-    descriptor.base_map[1] = 1;
-  }
 
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_stream_port_desc_s));
 
@@ -821,7 +821,7 @@ int avb_send_aecp_rsp_read_descr_audio_cluster(avb_state_s *state,
    * cluster and is rejected by spec-strict controllers. */
   aem_desc_type_t signal_type = aem_desc_type_stream_input;
   uint16_t signal_index = 0;
-  uint16_t num_channels = state->config.input_channels_usable;
+  uint16_t num_channels = AVB_INPUT_CLUSTER_CHANNELS;
   if (msg->descriptor_index[1] == 1) { // index 1 used for output port
     localized_description = 3;         // strings desc 0, string_2
     signal_type = aem_desc_type_audio_unit;
@@ -862,12 +862,9 @@ int avb_send_aecp_rsp_read_descr_audio_map(avb_state_s *state,
   int ret = OK;
   struct timespec ts;
 
-  // data for the stream input descriptor
+  /* The output port's static map, the only AUDIO_MAP. */
   uint16_t mappings_offset = 8; // Required by spec
-  uint16_t num_mappings = state->config.input_channels_usable;
-  if (msg->descriptor_index[1] == 1) { // audio map index 1 used for output port
-    num_mappings = state->config.output_channels_usable;
-  }
+  uint16_t num_mappings = state->config.output_channels_usable;
   aem_audio_mapping_s mappings[num_mappings];
   for (uint16_t i = 0; i < num_mappings; i++) {
     aem_audio_mapping_s mapping = {0};
@@ -2837,6 +2834,220 @@ int avb_process_aecp_cmd_streaming(avb_state_s *state, aecp_message_u *msg,
   return ret;
 }
 
+/* The Stream Port a mapping command names. The input port maps
+ * dynamically; the output port has its static AUDIO_MAP, so Milan v1.3
+ * 5.4.2.26-28 answer NOT_SUPPORTED there. */
+static aecp_status_t avb_audio_map_port_status(avb_state_s *state,
+                                               const uint8_t type_octets[2],
+                                               const uint8_t index_octets[2]) {
+  uint16_t type = octets_to_uint(type_octets, 2);
+  uint16_t index = octets_to_uint(index_octets, 2);
+  if (index != 0)
+    return aecp_status_no_such_descriptor;
+  if (type == aem_desc_type_stream_port_input)
+    return aecp_status_success;
+  if (type == aem_desc_type_stream_port_output && state->config.talker)
+    return aecp_status_not_supported;
+  return aecp_status_no_such_descriptor;
+}
+
+/* A Stream Port Input mapping names the audio STREAM_INPUT (0; CRF has no
+ * channels), a channel of its current format, and a channel of the
+ * port's one cluster. */
+static bool avb_input_mapping_valid(avb_state_s *state,
+                                    const aem_audio_mapping_s *mapping) {
+  uint16_t stream_index = octets_to_uint(mapping->mapping_stream_index, 2);
+  uint16_t stream_channel = octets_to_uint(mapping->mapping_stream_channel, 2);
+  uint16_t cluster_offset = octets_to_uint(mapping->mapping_cluster_offset, 2);
+  uint16_t cluster_channel =
+      octets_to_uint(mapping->mapping_cluster_channel, 2);
+  if (stream_index != 0 || state->num_input_streams == 0 ||
+      avb_get_crf_input_index(state) == 0)
+    return false;
+  if (cluster_offset != 0 || cluster_channel >= AVB_INPUT_CLUSTER_CHANNELS)
+    return false;
+  return stream_channel <
+         avb_stream_format_channels(&state->input_streams[0].stream_format);
+}
+
+static void avb_fill_input_mapping(aem_audio_mapping_s *mapping,
+                                   uint16_t stream_channel,
+                                   uint16_t cluster_channel) {
+  uint16_t zero = 0;
+  int_to_octets(&zero, mapping->mapping_stream_index, 2);
+  int_to_octets(&stream_channel, mapping->mapping_stream_channel, 2);
+  int_to_octets(&zero, mapping->mapping_cluster_offset, 2);
+  int_to_octets(&cluster_channel, mapping->mapping_cluster_channel, 2);
+}
+
+/* Process AECP command get audio map (IEEE 1722.1-2021 §7.4.44, Milan
+ * v1.3 5.4.2.26). The input port's few channels are one subset: map
+ * index 0 holds every mapping. */
+int avb_process_aecp_cmd_get_audio_map(avb_state_s *state, aecp_message_u *msg,
+                                       eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_get_audio_map_s *rsp = &msg->get_audio_map;
+  aecp_status_t status = avb_audio_map_port_status(state, rsp->descriptor_type,
+                                                   rsp->descriptor_index);
+  uint16_t map_index = octets_to_uint(rsp->map_index, 2);
+  if (status == aecp_status_success && map_index != 0)
+    status = aecp_status_bad_arguments;
+  uint16_t count = 0;
+  if (status == aecp_status_success) {
+    for (uint16_t channel = 0; channel < AVB_INPUT_CLUSTER_CHANNELS; channel++) {
+      uint16_t source = state->input_map[channel];
+      if (source != AVB_INPUT_MAP_UNMAPPED)
+        avb_fill_input_mapping(&rsp->mappings[count++], source, channel);
+    }
+  }
+  uint16_t number_of_maps = 1;
+  int_to_octets(&number_of_maps, rsp->number_of_maps, 2);
+  int_to_octets(&count, rsp->number_of_mappings, 2);
+  memset(rsp->reserved, 0, sizeof(rsp->reserved));
+  uint16_t msg_len = offsetof(aecp_get_audio_map_s, mappings) +
+                     count * sizeof(aem_audio_mapping_s);
+  rsp->common.header.msg_type = aecp_msg_type_aem_response;
+  rsp->common.header.status_valtime = (uint8_t)status;
+  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
+  rsp->common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  rsp->common.header.control_data_len = cdl & 0xFF;
+  int ret = avb_net_send_to(state, ethertype_avtp, rsp, msg_len, &ts, src_addr);
+  if (ret < 0)
+    avberr("send AECP Get Audio Map response failed: %d", errno);
+  return ret;
+}
+
+/* Process AECP commands add and remove audio mappings (IEEE 1722.1-2021
+ * §7.4.45/46, Milan v1.3 5.4.2.27/28) on the input port, all or none.
+ * An add may replace a cluster channel's mapping; the replaced one goes
+ * out first as an unsolicited REMOVE, as Milan allows. A remove must
+ * name present mappings; repeats are ignored. Mappings can change while
+ * the input is bound (Milan v1.3 5.3.10.1) and are saved. */
+int avb_process_aecp_cmd_audio_mappings(avb_state_s *state,
+                                        aecp_message_u *msg,
+                                        eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_audio_mappings_s *cmd = &msg->audio_mappings;
+  bool add = cmd->aem.command_type == aecp_cmd_code_add_audio_mappings;
+  uint16_t count = octets_to_uint(cmd->number_of_mappings, 2);
+  uint16_t cdl_in = (cmd->common.header.control_data_len_h << 8) |
+                    cmd->common.header.control_data_len;
+  size_t carried = (AVTP_CDL_PREAMBLE_LEN + cdl_in >
+                    offsetof(aecp_audio_mappings_s, mappings))
+                       ? (AVTP_CDL_PREAMBLE_LEN + cdl_in -
+                          offsetof(aecp_audio_mappings_s, mappings)) /
+                             sizeof(aem_audio_mapping_s)
+                       : 0;
+
+  aecp_status_t status = avb_audio_map_port_status(state, cmd->descriptor_type,
+                                                   cmd->descriptor_index);
+  if (status == aecp_status_success &&
+      (count > AVB_AEM_MAX_MSG_MAPPINGS || count > carried))
+    status = aecp_status_bad_arguments;
+
+  uint16_t next[AVB_INPUT_CLUSTER_CHANNELS];
+  uint16_t replaced[AVB_INPUT_CLUSTER_CHANNELS];
+  uint16_t named[AVB_INPUT_CLUSTER_CHANNELS]; /* source this command gives */
+  for (int channel = 0; channel < AVB_INPUT_CLUSTER_CHANNELS; channel++) {
+    next[channel] = state->input_map[channel];
+    replaced[channel] = AVB_INPUT_MAP_UNMAPPED;
+    named[channel] = AVB_INPUT_MAP_UNMAPPED;
+  }
+  for (uint16_t i = 0; status == aecp_status_success && i < count; i++) {
+    const aem_audio_mapping_s *mapping = &cmd->mappings[i];
+    if (!avb_input_mapping_valid(state, mapping)) {
+      status = aecp_status_bad_arguments;
+      break;
+    }
+    uint16_t source = octets_to_uint(mapping->mapping_stream_channel, 2);
+    uint16_t channel = octets_to_uint(mapping->mapping_cluster_channel, 2);
+    uint16_t current = state->input_map[channel];
+    if (add) {
+      /* Two sources for one cluster channel in one command. */
+      if (named[channel] != AVB_INPUT_MAP_UNMAPPED &&
+          named[channel] != source) {
+        status = aecp_status_bad_arguments;
+        break;
+      }
+      named[channel] = source;
+      if (current != AVB_INPUT_MAP_UNMAPPED && current != source)
+        replaced[channel] = current;
+      next[channel] = source;
+    } else {
+      if (current != source) {
+        status = aecp_status_bad_arguments;
+        break;
+      }
+      next[channel] = AVB_INPUT_MAP_UNMAPPED;
+    }
+  }
+  bool changed = false;
+  if (status == aecp_status_success) {
+    for (int channel = 0; channel < AVB_INPUT_CLUSTER_CHANNELS; channel++) {
+      if (next[channel] != state->input_map[channel])
+        changed = true;
+    }
+  }
+
+  /* An add that replaced mappings: their removal goes to every
+   * registered controller, the requester too, before the response. */
+  if (changed && add) {
+    aecp_audio_mappings_s note;
+    memset(&note, 0, offsetof(aecp_audio_mappings_s, mappings));
+    memcpy(&note, cmd, offsetof(aecp_audio_mappings_s, mappings));
+    note.common.header.msg_type = aecp_msg_type_aem_response;
+    note.common.header.status_valtime = aecp_status_success;
+    note.aem.command_type = aecp_cmd_code_remove_audio_mappings;
+    uint16_t removed = 0;
+    for (uint16_t channel = 0; channel < AVB_INPUT_CLUSTER_CHANNELS; channel++) {
+      if (replaced[channel] != AVB_INPUT_MAP_UNMAPPED)
+        avb_fill_input_mapping(&note.mappings[removed++], replaced[channel],
+                               channel);
+    }
+    if (removed) {
+      int_to_octets(&removed, note.number_of_mappings, 2);
+      uint16_t note_len = offsetof(aecp_audio_mappings_s, mappings) +
+                          removed * sizeof(aem_audio_mapping_s);
+      uint16_t note_cdl = note_len - AVTP_CDL_PREAMBLE_LEN;
+      note.common.header.control_data_len_h = (note_cdl >> 8) & 0x07;
+      note.common.header.control_data_len = note_cdl & 0xFF;
+      avb_unsol_notify(state, &note, note_len, avb_unsol_kind_aem, NULL, NULL);
+    }
+  }
+  if (changed) {
+    for (int channel = 0; channel < AVB_INPUT_CLUSTER_CHANNELS; channel++)
+      state->input_map[channel] = next[channel];
+    for (int channel = 0; channel < AVB_INPUT_CLUSTER_CHANNELS; channel++) {
+      if (next[channel] == AVB_INPUT_MAP_UNMAPPED)
+        avbinfo("Input cluster channel %d: unmapped", channel);
+      else
+        avbinfo("Input cluster channel %d: stream channel %u", channel,
+                next[channel]);
+    }
+  }
+
+  uint16_t echoed = count <= carried ? count : (uint16_t)carried;
+  if (echoed > AVB_AEM_MAX_MSG_MAPPINGS)
+    echoed = AVB_AEM_MAX_MSG_MAPPINGS;
+  uint16_t msg_len = offsetof(aecp_audio_mappings_s, mappings) +
+                     echoed * sizeof(aem_audio_mapping_s);
+  cmd->common.header.msg_type = aecp_msg_type_aem_response;
+  cmd->common.header.status_valtime = (uint8_t)status;
+  uint16_t cdl = msg_len - AVTP_CDL_PREAMBLE_LEN;
+  cmd->common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  cmd->common.header.control_data_len = cdl & 0xFF;
+  int ret = avb_net_send_to(state, ethertype_avtp, cmd, msg_len, &ts, src_addr);
+  if (ret < 0)
+    avberr("send AECP %s Audio Mappings response failed: %d",
+           add ? "Add" : "Remove", errno);
+  if (changed) {
+    avb_unsol_notify(state, cmd, msg_len, avb_unsol_kind_aem,
+                     cmd->common.controller_entity_id, src_addr);
+    avb_persist_save_input_map(state);
+  }
+  return ret;
+}
+
 int avb_process_aecp_cmd_read_descriptor(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr) {
@@ -3697,6 +3908,8 @@ static bool avb_aem_command_changes_state(uint8_t command_type) {
   case aecp_cmd_code_set_configuration:
   case aecp_cmd_code_start_streaming:
   case aecp_cmd_code_stop_streaming:
+  case aecp_cmd_code_add_audio_mappings:
+  case aecp_cmd_code_remove_audio_mappings:
   case aecp_cmd_code_set_max_transit_time:
   case aecp_cmd_code_set_name:
   case aecp_cmd_code_set_control:
@@ -3844,6 +4057,11 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     case aecp_cmd_code_start_streaming:
     case aecp_cmd_code_stop_streaming:
       return avb_process_aecp_cmd_streaming(state, msg, src_addr);
+    case aecp_cmd_code_get_audio_map:
+      return avb_process_aecp_cmd_get_audio_map(state, msg, src_addr);
+    case aecp_cmd_code_add_audio_mappings:
+    case aecp_cmd_code_remove_audio_mappings:
+      return avb_process_aecp_cmd_audio_mappings(state, msg, src_addr);
     case aecp_cmd_code_read_descriptor:
       return avb_process_aecp_cmd_read_descriptor(state, msg, src_addr);
       break;

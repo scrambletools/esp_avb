@@ -234,6 +234,12 @@ static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
 #define AEM_CONTROL_TEST_TONE 3     // control index of the talker's test tone
 #define AEM_MAX_NUM_SAMPLE_RATES 10 // max number of sample rates
 #define AEM_MAX_NUM_FORMATS 35      // 8 ch at 5 rates: AM824 + AAF 32/24 at two cadences and 8/2 channels
+/* The listener's one audio cluster: the two I2S slots it plays, each
+ * from the STREAM_INPUT 0 channel its dynamic mapping names. */
+#define AVB_INPUT_CLUSTER_CHANNELS 2
+#define AVB_INPUT_MAP_UNMAPPED 0xFFFF
+/* Mappings one ADD/REMOVE_AUDIO_MAPPINGS command can carry. */
+#define AVB_AEM_MAX_MSG_MAPPINGS 62
 #define AEM_MAX_NUM_MAPPINGS                                                   \
   10 // max number of mappings per map descriptor (spec max is 62)
 #define AEM_MAX_NUM_CLOCK_SOURCES                                              \
@@ -1031,6 +1037,10 @@ typedef struct avb_state_s {
   // index of output_streams is the talker_uid
   avb_listener_stream_s input_streams[AVB_MAX_NUM_INPUT_STREAMS];
   avb_talker_stream_s output_streams[AVB_MAX_NUM_OUTPUT_STREAMS];
+  /* Stream Port Input dynamic mappings (Milan v1.3 5.3.10.1): the
+   * channel of STREAM_INPUT 0 each cluster channel plays, or
+   * AVB_INPUT_MAP_UNMAPPED. */
+  volatile uint16_t input_map[AVB_INPUT_CLUSTER_CHANNELS];
   maap_stream_state_s maap[AVB_MAX_NUM_OUTPUT_STREAMS];
   size_t num_input_streams;
   size_t num_output_streams;
@@ -1535,6 +1545,10 @@ esp_err_t avb_persist_append_output_stream(avb_state_s *state, uint16_t index);
 /* Save the operating sample rate, after a stream format changed it, so
  * the next boot comes up at that rate. Written like a journal record. */
 esp_err_t avb_persist_save_rate(avb_state_s *state);
+/* Save the Stream Port Input mappings, deferred like the rate. */
+esp_err_t avb_persist_save_input_map(avb_state_s *state);
+/* Audio channels a stream format carries; 0 for CRF or unknown. */
+uint16_t avb_stream_format_channels(const avtp_stream_format_s *fmt);
 /* SR class an AAF output format's frame interval implies (250 us: Class B,
  * 125 us: Class A); false for any other format. */
 bool avb_output_format_class(const avtp_stream_format_s *fmt, bool *class_b);

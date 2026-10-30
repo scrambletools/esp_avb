@@ -4611,8 +4611,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * config is big-endian (avbcodec.c: slot_cfg.big_endian = true) so the
    * DMA/DAC path expects [MSB, MID, LSB] in memory — same byte order as
    * AAF wire format, which lets us memcpy the 3 sample bytes straight
-   * across. AM824 prefixes a label byte; skip it. Extra channels are
-   * ignored. */
+   * across. AM824 prefixes a label byte; skip it. Channels no slot maps
+   * are ignored. */
   uint32_t total = (uint32_t)samples * 8; /* stereo 24-in-32 slots */
 
   /* Stream reference for the media-clock PLL: credit the talker's
@@ -4809,10 +4809,17 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     uint32_t mask = ctx->ring.capacity - 1;
     uint8_t *rbuf = ctx->ring.buf;
     uint32_t offset = 0;
+    /* Each I2S slot plays the stream channel its Stream Port Input
+     * mapping names; an unmapped slot, or one mapped past this stream's
+     * channels, plays silence (Milan v1.3 5.3.10.1). */
+    int src_channels[AVB_INPUT_CLUSTER_CHANNELS];
+    for (int ch = 0; ch < AVB_INPUT_CLUSTER_CHANNELS; ch++)
+      src_channels[ch] = ctx->state ? ctx->state->input_map[ch] : ch;
     for (int s = 0; s < samples; s++) {
       for (int ch = 0; ch < 2; ch++) {
-        int src_ch = (ch < channels) ? ch : 0;
-        int src_offset = (s * channels + src_ch) * 4;
+        int src_ch = src_channels[ch];
+        int src_offset = src_ch < channels ? (s * channels + src_ch) * 4
+                                           : pcm_len;
         uint32_t p0 = (h + offset + 0) & mask;
         uint32_t p1 = (h + offset + 1) & mask;
         uint32_t p2 = (h + offset + 2) & mask;

@@ -1424,6 +1424,10 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
       memcpy(&state->input_streams[i], &input_stream,
              sizeof(avb_listener_stream_s));
     }
+    /* Each cluster channel plays the stream channel of its index until a
+     * controller maps it otherwise. */
+    for (int i = 0; i < AVB_INPUT_CLUSTER_CHANNELS; i++)
+      state->input_map[i] = (uint16_t)i;
     /* CRF input carries the IEEE 1722 CRF media-clock format at the
      * configured sample rate */
     uint16_t crf_index = avb_get_crf_input_index(state);
@@ -2504,6 +2508,7 @@ static void avb_audio_test_run(avb_state_s *state) {
 #define AVB_NVS_KEY "persist"
 /* Operating sample rate a stream format last set, as a u32 in Hz. */
 #define AVB_NVS_RATE_KEY "rate"
+#define AVB_NVS_INPUT_MAP_KEY "imap"
 
 /* Helper: true if any byte in an 8-byte array is non-zero.
  * Used to distinguish "never saved" (all zero) from a valid persisted
@@ -2591,6 +2596,14 @@ static bool avb_stream_formats_same_family(const uint8_t first[8],
          one.aaf_pcm.chan_per_frame_h == other.aaf_pcm.chan_per_frame_h &&
          one.aaf_pcm.chan_per_frame == other.aaf_pcm.chan_per_frame &&
          one_class_b == other_class_b;
+}
+
+uint16_t avb_stream_format_channels(const avtp_stream_format_s *fmt) {
+  if (fmt->aaf_pcm.subtype == avtp_subtype_61883)
+    return fmt->am824.dbs;
+  if (fmt->aaf_pcm.subtype == avtp_subtype_aaf)
+    return (fmt->aaf_pcm.chan_per_frame_h << 2) | fmt->aaf_pcm.chan_per_frame;
+  return 0;
 }
 
 bool avb_stream_format_at_rate(avb_state_s *state, bool is_output,
@@ -2916,6 +2929,7 @@ static int64_t s_ingress_sample_us;
 static uint32_t s_ingress_sample_count;
 static bool s_journal_pending[2][AVB_PERSIST_MAX_INPUT_STREAMS];
 static bool s_rate_pending;
+static bool s_input_map_pending;
 static int64_t s_journal_pending_since_us;
 
 /* Sampled from the AVB main loop; the persist task only reads the flag. */
@@ -2981,6 +2995,37 @@ static esp_err_t avb_persist_write_rate(avb_state_s *state) {
   return err;
 }
 
+static esp_err_t avb_persist_write_input_map(avb_state_s *state) {
+  uint16_t map[AVB_INPUT_CLUSTER_CHANNELS];
+  for (int i = 0; i < AVB_INPUT_CLUSTER_CHANNELS; i++)
+    map[i] = state->input_map[i];
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (err == ESP_OK) {
+    err = nvs_set_blob(handle, AVB_NVS_INPUT_MAP_KEY, map, sizeof(map));
+    if (err == ESP_OK)
+      err = nvs_commit(handle);
+    nvs_close(handle);
+  }
+  if (err != ESP_OK)
+    avberr("NVS: failed to save input mappings: %d", err);
+  else
+    avbinfo("NVS: saved input mappings");
+  return err;
+}
+
+esp_err_t avb_persist_save_input_map(avb_state_s *state) {
+  int64_t now = esp_timer_get_time();
+  avb_persist_sample_ingress(now);
+  if (s_ingress_quiet)
+    return avb_persist_write_input_map(state);
+  if (s_journal_pending_since_us == 0)
+    s_journal_pending_since_us = now;
+  s_input_map_pending = true;
+  avbinfo("NVS: input mappings deferred until ingress calms");
+  return ESP_OK;
+}
+
 esp_err_t avb_persist_save_rate(avb_state_s *state) {
   int64_t now = esp_timer_get_time();
   avb_persist_sample_ingress(now);
@@ -3009,6 +3054,10 @@ void avb_persist_journal_tick(avb_state_s *state) {
   if (s_rate_pending) {
     s_rate_pending = false;
     avb_persist_write_rate(state);
+  }
+  if (s_input_map_pending) {
+    s_input_map_pending = false;
+    avb_persist_write_input_map(state);
   }
   for (int direction = 0; direction < 2; direction++) {
     for (uint16_t index = 0; index < AVB_PERSIST_MAX_INPUT_STREAMS; index++) {
@@ -3295,6 +3344,21 @@ static void avb_persist_apply(avb_state_s *state) {
  * a stream format last set before the saved formats are checked against
  * it: without this, a board set to 192 kHz came back at 48 kHz and
  * rewrote its 192 kHz formats to 48 kHz, leaving its peers on 192 kHz. */
+static void avb_persist_restore_input_map(avb_state_s *state) {
+  nvs_handle_t handle;
+  if (nvs_open(AVB_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
+    return;
+  uint16_t map[AVB_INPUT_CLUSTER_CHANNELS];
+  size_t size = sizeof(map);
+  esp_err_t err = nvs_get_blob(handle, AVB_NVS_INPUT_MAP_KEY, map, &size);
+  nvs_close(handle);
+  if (err != ESP_OK || size != sizeof(map))
+    return;
+  for (int i = 0; i < AVB_INPUT_CLUSTER_CHANNELS; i++)
+    state->input_map[i] = map[i];
+  avbinfo("NVS: restored input mappings");
+}
+
 static void avb_persist_restore_rate(avb_state_s *state) {
   nvs_handle_t handle;
   if (nvs_open(AVB_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
@@ -3330,6 +3394,7 @@ esp_err_t avb_persist_load(avb_state_s *state) {
   }
 
   avb_persist_restore_rate(state);
+  avb_persist_restore_input_map(state);
 
   bool need_reinit = false; /* true -> overwrite flash with a fresh current blob */
 
