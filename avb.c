@@ -2593,6 +2593,34 @@ static bool avb_stream_formats_same_family(const uint8_t first[8],
          one_class_b == other_class_b;
 }
 
+bool avb_stream_format_at_rate(avb_state_s *state, bool is_output,
+                               uint16_t index, uint8_t format[8],
+                               uint32_t rate_hz) {
+  bool is_crf_stream =
+      (!is_output && index == avb_get_crf_input_index(state)) ||
+      (is_output && index == avb_get_crf_output_index(state));
+  if (is_crf_stream) {
+    avb_crf_format_for_rate(rate_hz, format);
+    return true;
+  }
+  if (avb_stream_format_rate_hz(format) == rate_hz)
+    return true;
+  const avtp_stream_format_s *supported = is_output
+                                              ? state->supported_formats_out
+                                              : state->supported_formats_in;
+  size_t num_supported = is_output ? state->num_supported_formats_out
+                                   : state->num_supported_formats_in;
+  for (size_t i = 0; i < num_supported; i++) {
+    const uint8_t *candidate = (const uint8_t *)&supported[i];
+    if (avb_stream_format_rate_hz(candidate) == rate_hz &&
+        avb_stream_formats_same_family(format, candidate)) {
+      memcpy(format, candidate, 8);
+      return true;
+    }
+  }
+  return false;
+}
+
 /* Milan requires SET_STREAM_FORMAT to persist across power cycles, but a
  * stream format must also stay coherent with the entity's operating
  * sampling rate — which at boot comes from config, not from the persisted

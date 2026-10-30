@@ -1538,6 +1538,11 @@ esp_err_t avb_persist_save_rate(avb_state_s *state);
 /* SR class an AAF output format's frame interval implies (250 us: Class B,
  * 125 us: Class A); false for any other format. */
 bool avb_output_format_class(const avtp_stream_format_s *fmt, bool *class_b);
+/* The supported format of a stream's format family at rate_hz, written
+ * over `format`; false when the family has none at that rate. */
+bool avb_stream_format_at_rate(avb_state_s *state, bool is_output,
+                               uint16_t index, uint8_t format[8],
+                               uint32_t rate_hz);
 /* Set an output stream's class and VLAN to the class its format implies;
  * false, changing nothing, when the format implies none. */
 bool avb_output_stream_class_from_format(avb_state_s *state, uint16_t index);

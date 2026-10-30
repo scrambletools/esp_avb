@@ -3113,6 +3113,129 @@ int avb_process_aecp_cmd_set_clock_source(avb_state_s *state,
   return ret;
 }
 
+/* Tell registered controllers, the requester too, that a stream's format
+ * changed without a SET_STREAM_FORMAT of theirs. */
+static void avb_unsol_notify_stream_format(avb_state_s *state,
+                                           const aecp_common_s *from,
+                                           bool is_output, uint16_t index) {
+  aecp_stream_format_s note;
+  memset(&note, 0, sizeof(note));
+  memcpy(&note.common, from, sizeof(note.common));
+  note.common.header.msg_type = aecp_msg_type_aem_response;
+  note.common.header.status_valtime = aecp_status_success;
+  uint16_t cdl = sizeof(note) - AVTP_CDL_PREAMBLE_LEN;
+  note.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  note.common.header.control_data_len = cdl & 0xFF;
+  note.aem.command_type = aecp_cmd_code_set_stream_format;
+  uint16_t type = is_output ? aem_desc_type_stream_output
+                            : aem_desc_type_stream_input;
+  int_to_octets(&type, note.descriptor_type, 2);
+  int_to_octets(&index, note.descriptor_index, 2);
+  memcpy(&note.stream_format,
+         is_output ? &state->output_streams[index].stream_format
+                   : &state->input_streams[index].stream_format,
+         sizeof(avtp_stream_format_s));
+  avb_unsol_notify(state, &note, sizeof(note), avb_unsol_kind_aem, NULL, NULL);
+}
+
+/* Process AECP command set/get sampling rate (IEEE 1722.1-2021 §7.4.21/22,
+ * Milan v1.3 §5.4.2.13/14) on the one AUDIO_UNIT. Both directions share
+ * one codec clock, so a SET moves every stream to its format family at
+ * the new rate, and is refused while any stream runs, as a rate change
+ * by SET_STREAM_FORMAT is. Pull 0 only. */
+int avb_process_aecp_cmd_sampling_rate(avb_state_s *state,
+                                       aecp_message_u *msg,
+                                       eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_sampling_rate_s *cmd = &msg->sampling_rate;
+  bool is_set = cmd->aem.command_type == aecp_cmd_code_set_sampling_rate;
+  uint16_t descriptor_type = octets_to_uint(cmd->descriptor_type, 2);
+  uint16_t descriptor_index = octets_to_uint(cmd->descriptor_index, 2);
+  uint32_t requested = octets_to_uint(cmd->sampling_rate, 4);
+  uint32_t current = state->config.default_sample_rate;
+
+  aecp_status_t status = aecp_status_success;
+  bool changed = false;
+  uint8_t formats_in[AVB_MAX_NUM_INPUT_STREAMS][8];
+  uint8_t formats_out[AVB_MAX_NUM_OUTPUT_STREAMS][8];
+  if (descriptor_type != aem_desc_type_audio_unit || descriptor_index != 0) {
+    status = aecp_status_no_such_descriptor;
+  } else if (is_set && requested != current) {
+    bool supported = false;
+    for (size_t i = 0; i < state->supported_sample_rates.num_rates; i++) {
+      if (state->supported_sample_rates.sample_rates[i] == requested)
+        supported = true;
+    }
+    bool any_running = false;
+    for (int i = 0; i < state->num_output_streams; i++) {
+      if (state->output_streams[i].streaming)
+        any_running = true;
+    }
+    for (int i = 0; i < state->num_input_streams; i++) {
+      if (state->input_streams[i].connected)
+        any_running = true;
+    }
+    /* Every stream must have its family at the new rate before anything
+     * changes. */
+    bool streams_follow = supported;
+    for (uint16_t i = 0; streams_follow && i < state->num_input_streams; i++) {
+      memcpy(formats_in[i], &state->input_streams[i].stream_format, 8);
+      streams_follow =
+          avb_stream_format_at_rate(state, false, i, formats_in[i], requested);
+    }
+    for (uint16_t i = 0; streams_follow && i < state->num_output_streams; i++) {
+      memcpy(formats_out[i], &state->output_streams[i].stream_format, 8);
+      streams_follow =
+          avb_stream_format_at_rate(state, true, i, formats_out[i], requested);
+    }
+    if (!supported) {
+      status = aecp_status_bad_arguments;
+    } else if (any_running) {
+      status = aecp_status_stream_is_running;
+    } else if (!streams_follow) {
+      status = aecp_status_not_supported;
+    } else if (avb_audio_set_rate(state, requested) != ESP_OK) {
+      status = aecp_status_entity_misbehaving;
+    } else {
+      changed = true;
+      avb_persist_save_rate(state);
+      for (uint16_t i = 0; i < state->num_input_streams; i++)
+        memcpy(&state->input_streams[i].stream_format, formats_in[i], 8);
+      for (uint16_t i = 0; i < state->num_output_streams; i++) {
+        memcpy(&state->output_streams[i].stream_format, formats_out[i], 8);
+        avb_output_stream_declare_now(state, i, -1);
+      }
+      avbinfo("Sampling rate changed to %lu Hz", (unsigned long)requested);
+    }
+  }
+
+  current = state->config.default_sample_rate;
+  int_to_octets(&current, cmd->sampling_rate, 4);
+  cmd->common.header.msg_type = aecp_msg_type_aem_response;
+  cmd->common.header.status_valtime = (uint8_t)status;
+  uint16_t control_data_len = sizeof(*cmd) - AVTP_CDL_PREAMBLE_LEN;
+  cmd->common.header.control_data_len_h = (control_data_len >> 8) & 0x07;
+  cmd->common.header.control_data_len = control_data_len & 0xFF;
+  int ret = avb_net_send_to(state, ethertype_avtp, cmd, sizeof(*cmd), &ts,
+                            src_addr);
+  if (ret < 0)
+    avberr("send AECP %s_SAMPLING_RATE response failed: %d",
+           is_set ? "SET" : "GET", errno);
+  if (changed) {
+    avb_unsol_notify(state, cmd, sizeof(*cmd), avb_unsol_kind_aem,
+                     cmd->common.controller_entity_id, src_addr);
+    for (uint16_t i = 0; i < state->num_input_streams; i++) {
+      avb_unsol_notify_stream_format(state, &cmd->common, false, i);
+      avb_persist_append_input_stream(state, i);
+    }
+    for (uint16_t i = 0; i < state->num_output_streams; i++) {
+      avb_unsol_notify_stream_format(state, &cmd->common, true, i);
+      avb_persist_append_output_stream(state, i);
+    }
+  }
+  return ret;
+}
+
 /* Process AECP command get/set max transit time (IEEE 1722.1 §7.4.77/78,
  * Milan v1.3 §5.4.2.30/31). Milan uses this value as the Stream Output
  * presentation-time offset. */
@@ -3476,6 +3599,7 @@ static bool avb_aem_command_changes_state(uint8_t command_type) {
   switch (command_type) {
   case aecp_cmd_code_set_stream_format:
   case aecp_cmd_code_set_clock_source:
+  case aecp_cmd_code_set_sampling_rate:
   case aecp_cmd_code_set_max_transit_time:
   case aecp_cmd_code_set_name:
   case aecp_cmd_code_set_control:
@@ -3633,6 +3757,9 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     case aecp_cmd_code_set_clock_source:
       return avb_process_aecp_cmd_set_clock_source(state, msg, src_addr);
       break;
+    case aecp_cmd_code_set_sampling_rate:
+    case aecp_cmd_code_get_sampling_rate:
+      return avb_process_aecp_cmd_sampling_rate(state, msg, src_addr);
     case aecp_cmd_code_get_stream_info:
       return avb_process_aecp_cmd_get_stream_info(state, msg, src_addr);
       break;

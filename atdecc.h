@@ -75,6 +75,8 @@ typedef enum {
   aecp_cmd_code_get_stream_info = 0x000f,
   aecp_cmd_code_set_name = 0x0010,
   aecp_cmd_code_get_name = 0x0011,
+  aecp_cmd_code_set_sampling_rate = 0x0014,
+  aecp_cmd_code_get_sampling_rate = 0x0015,
   aecp_cmd_code_set_clock_source = 0x0016,
   aecp_cmd_code_get_clock_source = 0x0017,
   aecp_cmd_code_set_control = 0x0018,
@@ -1138,6 +1140,16 @@ typedef union {
 /* AECP get counters command uses basic command format */
 typedef aecp_aem_short_s aecp_get_counters_s; // 28 bytes
 
+/* SET/GET_SAMPLING_RATE command and response (IEEE 1722.1-2021
+ * §7.4.21/22). The GET command omits sampling_rate. */
+typedef struct {
+  aecp_common_s common;
+  aecp_common_aem_s aem;
+  uint8_t descriptor_type[2];  // AUDIO_UNIT
+  uint8_t descriptor_index[2]; // audio unit index
+  uint8_t sampling_rate[4];    // 3-bit pull, 29-bit base frequency (Hz)
+} aecp_sampling_rate_s;        // 32 bytes
+
 /* SET/GET_MAX_TRANSIT_TIME command and response (IEEE 1722.1-2021 §7.4.77/78)
  * max_transit_time is a 64-bit uint in nanoseconds. GET command omits the
  * max_transit_time field (payload = 4 bytes); SET command and both responses
@@ -1628,6 +1640,7 @@ typedef union {
   aecp_get_as_path_s get_as_path;
   aecp_get_as_path_rsp_s get_as_path_rsp;
   aecp_max_transit_time_s max_transit_time;
+  aecp_sampling_rate_s sampling_rate;
   aecp_get_counters_s get_counters;
   aecp_get_counters_rsp_s get_counters_rsp;
   aecp_register_unsol_notif_s register_unsol_notif;
@@ -1867,6 +1880,9 @@ int avb_process_aecp_cmd_get_clock_source(avb_state_s *state,
 int avb_process_aecp_cmd_set_clock_source(avb_state_s *state,
                                           aecp_message_u *msg,
                                           eth_addr_t *src_addr);
+int avb_process_aecp_cmd_sampling_rate(avb_state_s *state,
+                                       aecp_message_u *msg,
+                                       eth_addr_t *src_addr);
 int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
                                               aecp_message_u *msg,
                                               eth_addr_t *src_addr);
