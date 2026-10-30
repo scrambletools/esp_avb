@@ -170,6 +170,8 @@ uint16_t avb_fill_rsp_get_stream_info(avb_state_s *state,
         memcmp(s->msrp_accumulated_latency, zero_lat, 4) != 0;
     flags.msrp_failure_valid = s->msrp_failure_code[0] != 0;
     flags.connected = s->connected;
+    flags.streaming_wait = memcmp(s->talker_id, zero_id, UNIQUE_ID_LEN) != 0 &&
+                           s->stream_flags.streaming_wait;
     memcpy(&response->stream.flags, &flags, sizeof(aem_stream_info_flags_s));
     memcpy(&response->stream.stream_format, &s->stream_format,
            sizeof(avtp_stream_format_s));

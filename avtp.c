@@ -2487,6 +2487,7 @@ static inline uint32_t ring_read(jitter_ring_t *r, uint8_t *dst, uint32_t len) {
  * only reader, and word-aligned 32-bit accesses are torn-free on RISC-V. */
 typedef struct {
   avb_state_s *state;                        /* for media_clock stats update */
+  uint16_t input_index;                      /* its STREAM_INPUT */
   i2s_chan_handle_t i2s_tx_handle;
   jitter_ring_t ring;                        /* SPSC byte ring, handler→drain */
   esp_timer_handle_t drain_timer;            /* wired: 1 ms drain wake */
@@ -5416,15 +5417,22 @@ static void avb_stream_rx_dispatcher(uint8_t *avtp_data, uint16_t len,
   (void)unused_ctx;
   if (!avtp_data || len < 12)
     return;
-  /* stream_id lives at bytes [4..11] in all AVTP stream subtypes */
-  if (s_crf_rx_ctx != NULL &&
-      memcmp(avtp_data + 4, s_crf_rx_ctx->expected_stream_id,
-             UNIQUE_ID_LEN) == 0) {
-    avb_crf_rx_handler(avtp_data, len, s_crf_rx_ctx);
+  /* stream_id lives at bytes [4..11] in all AVTP stream subtypes. A
+   * stopped Stream Input discards its stream's AVTPDUs (Milan v1.3
+   * 5.3.8.7). */
+  crf_rx_ctx_t *crf = s_crf_rx_ctx;
+  if (crf != NULL && memcmp(avtp_data + 4, crf->expected_stream_id,
+                            UNIQUE_ID_LEN) == 0) {
+    if (!crf->state->input_streams[avb_get_crf_input_index(crf->state)]
+             .stream_flags.streaming_wait)
+      avb_crf_rx_handler(avtp_data, len, crf);
     return;
   }
-  if (s_stream_rx_ctx != NULL) {
-    avb_stream_rx_handler(avtp_data, len, s_stream_rx_ctx);
+  stream_rx_ctx_t *audio = s_stream_rx_ctx;
+  if (audio != NULL &&
+      !audio->state->input_streams[audio->input_index]
+           .stream_flags.streaming_wait) {
+    avb_stream_rx_handler(avtp_data, len, audio);
   }
 }
 
@@ -5584,6 +5592,7 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   }
 #endif
 
+  ctx->input_index = index;
   s_stream_rx_ctx = ctx;
   state->stream_in_active = true;
   state->input_streams[index].connected = true;
