@@ -3335,8 +3335,9 @@ void avb_wifi_tx_bundle_stats(uint32_t *bundles, uint32_t *frames) {
 }
 #endif
 
-esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle,
-                               const void *frame, size_t frame_len) {
+AVB_TALKER_IRAM_ATTR esp_err_t
+avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
+                     size_t frame_len) {
   if (eth_handle != NULL) {
     return esp_eth_transmit(eth_handle, (void *)frame, frame_len);
   }

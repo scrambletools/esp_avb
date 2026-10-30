@@ -149,7 +149,8 @@ static inline int src_advance(avb_src_pos_s *pos, int32_t step) {
 
 void avb_src_owe(avb_src_s *src, int32_t frames) { src->pos.extra += frames; }
 
-int avb_src_inputs(const avb_src_s *src, int out_frames, int32_t rate_q32) {
+IRAM_ATTR int avb_src_inputs(const avb_src_s *src, int out_frames,
+                             int32_t rate_q32) {
   avb_src_pos_s pos = src->pos;
   int inputs = 0;
   for (int frame = 0; frame < out_frames; frame++)

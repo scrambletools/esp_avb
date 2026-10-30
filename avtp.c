@@ -678,7 +678,8 @@ static void mirror_push(const uint8_t *src, uint32_t len) {
  * to the target, or dropped whole when the listener has stopped (its
  * last 4 ms opened the next stream: plaa saw an earlier cell's tone).
  * Steady state never drops played samples. */
-static void mirror_pop(uint8_t *dst, uint32_t len, uint32_t target) {
+static AVB_TALKER_IRAM_ATTR void mirror_pop(uint8_t *dst, uint32_t len,
+                                            uint32_t target) {
   int64_t now_us = esp_timer_get_time();
   uint32_t tail = atomic_load_explicit(&s_mirror_tail, memory_order_relaxed);
   uint32_t head = atomic_load_explicit(&s_mirror_head, memory_order_acquire);
@@ -724,8 +725,10 @@ static void mirror_pop(uint8_t *dst, uint32_t len, uint32_t target) {
 
 /* Mirror frames to the wire: the playout's left and right slots, bit for
  * bit, on channels 0 and 1, silence on the rest. No mic DSP. */
-static void i2s24_to_aaf_stereo(const uint8_t *in, uint8_t *out,
-                                int num_samples, int stream_channels) {
+static AVB_TALKER_IRAM_ATTR void i2s24_to_aaf_stereo(const uint8_t *in,
+                                                     uint8_t *out,
+                                                     int num_samples,
+                                                     int stream_channels) {
   for (int s = 0; s < num_samples; s++) {
     for (int ch = 0; ch < stream_channels; ch++) {
       if (ch < 2)
@@ -739,8 +742,10 @@ static void i2s24_to_aaf_stereo(const uint8_t *in, uint8_t *out,
   }
 }
 
-static void i2s24_to_am824_stereo(const uint8_t *in, uint8_t *out,
-                                  int num_samples, int stream_channels) {
+static AVB_TALKER_IRAM_ATTR void i2s24_to_am824_stereo(const uint8_t *in,
+                                                       uint8_t *out,
+                                                       int num_samples,
+                                                       int stream_channels) {
   for (int s = 0; s < num_samples; s++) {
     for (int ch = 0; ch < stream_channels; ch++) {
       out[0] = 0x40;
@@ -838,7 +843,7 @@ static void talker_batch_timer_arm(int64_t delay_us) {
  * Class B. */
 #define TALKER_SRC_MAX_SPP 64
 
-static void avb_stream_out_task(void *task_param) {
+static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   /* Reset productive-work accumulator on every stream_out_task
    * start so each streaming session stands alone in the CPU stats. */
   atomic_store_explicit(&s_stream_out_work_us, 0, memory_order_relaxed);

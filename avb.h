@@ -21,6 +21,7 @@
 #include <esp_err.h>
 #include <esp_eth_driver.h>
 #include <esp_heap_caps.h>
+#include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_ptp.h>
 #include <esp_vfs_l2tap.h>
@@ -1161,6 +1162,17 @@ int avb_net_recv_ctrl(avb_state_s *state, int *protocol_idx, int *ingress_port,
 esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
                                size_t frame_len);
 
+/* A dual-core talker runs its send loop from IRAM. In flash, the
+ * listener's data streaming through the shared L2 cache evicted the
+ * loop's code, and refetching it (DIO flash, about 4 us a line) sent
+ * frames 25-200 us past their slots. A single-core station keeps the
+ * loop in flash for the RAM. */
+#if portNUM_PROCESSORS > 1
+#define AVB_TALKER_IRAM_ATTR IRAM_ATTR
+#else
+#define AVB_TALKER_IRAM_ATTR
+#endif
+
 /* Frames in the stream's open Wi-Fi bundle, not yet sent; 0 where
  * frames are not bundled. Only the task that sends the stream may ask. */
 int avb_net_tx_bundle_frames(const uint8_t *stream_id);
@@ -1407,8 +1419,9 @@ bool avb_persist_ingress_quiet(void);
  * Safe from the stream-out task / CRF timer while the control plane
  * updates concurrently. Returns the number of DAs copied into out[]
  * (0 → caller transmits to its multicast template DA). */
-static inline int avb_stream_tx_addrs_snapshot(const avb_talker_stream_s *stream,
-                                               eth_addr_t *out) {
+static inline AVB_TALKER_IRAM_ATTR int
+avb_stream_tx_addrs_snapshot(const avb_talker_stream_s *stream,
+                             eth_addr_t *out) {
   uint32_t s1, s2;
   int n;
   do {
