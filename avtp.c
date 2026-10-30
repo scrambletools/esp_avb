@@ -2705,6 +2705,13 @@ typedef struct {
   volatile uint32_t phase_samples;
   volatile int32_t ahead_min_us;
   volatile int32_t ahead_max_us;
+  /* Arrival per stats window: the longest gap between frames, and the
+   * least lead (presentation time less gPTP now) of every eighth one. A
+   * starvation with every frame received then reads as late frames or
+   * as the board's own stall. */
+  int64_t arrival_prev_us;
+  volatile int32_t arrival_gap_max_us;
+  volatile int32_t arrival_lead_min_us;
   /* first-packet snapshot (written by handler, printed by main loop) */
   uint8_t diag_subtype;
   uint16_t diag_sdl;
@@ -4552,6 +4559,12 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->rate_check_pending = false;
   }
 
+  int64_t arrival_us = esp_timer_get_time();
+  if (ctx->arrival_prev_us &&
+      arrival_us - ctx->arrival_prev_us > ctx->arrival_gap_max_us)
+    ctx->arrival_gap_max_us = (int32_t)(arrival_us - ctx->arrival_prev_us);
+  ctx->arrival_prev_us = arrival_us;
+
   uint8_t *pcm_data = NULL;
   int pcm_len = 0;
   int channels = 0;
@@ -4903,6 +4916,14 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->drift_latest_rx_ts_us = esp_timer_get_time();
     ctx->drift_latest_valid = true;
     ctx->last_packet_us = ctx->drift_latest_rx_ts_us;
+    struct timespec now_ts;
+    if (ptpd_now(&now_ts) == 0) {
+      uint32_t now_ns = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
+                                   (uint64_t)now_ts.tv_nsec);
+      int32_t lead_us = (int32_t)(ctx->drift_latest_avtp_ts - now_ns) / 1000;
+      if (lead_us < ctx->arrival_lead_min_us)
+        ctx->arrival_lead_min_us = lead_us;
+    }
   }
 }
 
@@ -5033,7 +5054,7 @@ void avb_stream_in_print_diag(void) {
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
           "dgap=%luus lockres=%ldus hold=%ld/%ld/%ld/%ld steps=%ldus clamps=%lu "
-          "owed=%luB",
+          "owed=%luB arrive=%ld/%ldus",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -5072,7 +5093,12 @@ void avb_stream_in_print_diag(void) {
           (long)hold_error_us, (long)hold_feed_ppm_x10,
           (long)ctx->diag_held_learned_ppm_x10,
           (long)(ctx->phase_steps_ns / 1000), (unsigned long)ctx->phase_clamps,
-          (unsigned long)ctx->src_trim_bytes);
+          (unsigned long)ctx->src_trim_bytes, (long)ctx->arrival_gap_max_us,
+          (long)(ctx->arrival_lead_min_us == INT32_MAX
+                     ? 0
+                     : ctx->arrival_lead_min_us));
+  ctx->arrival_gap_max_us = 0;
+  ctx->arrival_lead_min_us = INT32_MAX;
   if (ctx->diag_held_learns != ctx->diag_held_learns_printed) {
     ctx->diag_held_learns_printed = ctx->diag_held_learns;
     avbinfo("HOLD: learn %lu at %ld ms after the lock, %ld ticks, slope "
@@ -5510,6 +5536,7 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     return ERROR;
   }
   ctx->state = state;
+  ctx->arrival_lead_min_us = INT32_MAX;
   /* A restart's first lock waits out what the last stream left queued. */
   ctx->tx_starved_at_write = atomic_load_explicit(
       &state->media_clock.i2s_tx_starved_bytes, memory_order_relaxed);
