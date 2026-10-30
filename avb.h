@@ -1173,6 +1173,14 @@ esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
 #define AVB_TALKER_IRAM_ATTR
 #endif
 
+/* Around a send from core 0 on the talker's EMAC: it runs above the
+ * EMAC RX task and right after a talker frame (see avbnet.c). A talker
+ * on the EMAC reports its start and stop and each transmit. */
+UBaseType_t avb_net_tx_begin(void);
+void avb_net_tx_end(UBaseType_t prio);
+void avb_net_talker_tx_done(uint32_t done_us);
+void avb_net_talker_tx_wired(bool wired);
+
 /* Frames in the stream's open Wi-Fi bundle, not yet sent; 0 where
  * frames are not bundled. Only the task that sends the stream may ask. */
 int avb_net_tx_bundle_frames(const uint8_t *stream_id);

@@ -25,6 +25,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "driver/gptimer.h"
+#include <stdatomic.h>
 #include <esp_netif.h>
 #include <esp_vfs_l2tap.h>
 #include <esp_idf_version.h>
@@ -2839,6 +2840,61 @@ static esp_err_t avb_net_wifi_tx_control(int wifi_if, void *frame,
   return result;
 }
 
+/* Frames sent from core 0 share the EMAC transmit mutex with the
+ * talker on core 1. Two things kept the talker waiting on it:
+ * - A sender the EMAC RX task preempted while holding it. Priority
+ *   inheritance raises a holder that is not running but does not
+ *   switch it in, so the talker waited until the RX task idled, 70-120
+ *   us. A sender now runs above the RX task for the send.
+ * - A frame sent just before a talker slot. A timed PTP frame holds the
+ *   mutex until its timestamp is back, and talker frames behind one
+ *   went out up to 100 us late, 4 a second, which a bridge's shaper
+ *   then turned into a backlog. A sender now waits for the talker's
+ *   next frame (unless one just went), so its frame queues right
+ *   behind it and the mutex is free long before the next slot. Bounded
+ *   for a stalled or stopping talker. */
+#define AVB_NET_TX_GATE_RECENT_US 20
+#define AVB_NET_TX_GATE_MAX_US 300
+static _Atomic uint32_t s_talker_tx_done_us;
+static _Atomic int s_talkers_wired;
+
+void avb_net_talker_tx_wired(bool wired) {
+  atomic_fetch_add(&s_talkers_wired, wired ? 1 : -1);
+}
+
+void avb_net_talker_tx_done(uint32_t done_us) {
+  atomic_store_explicit(&s_talker_tx_done_us, done_us, memory_order_release);
+}
+
+#if portNUM_PROCESSORS > 1 && !defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+#define AVB_NET_TX_PRIORITY (configMAX_PRIORITIES - 2)
+UBaseType_t avb_net_tx_begin(void) {
+  UBaseType_t prio = uxTaskPriorityGet(NULL);
+  if (prio < AVB_NET_TX_PRIORITY)
+    vTaskPrioritySet(NULL, AVB_NET_TX_PRIORITY);
+  if (atomic_load(&s_talkers_wired) <= 0)
+    return prio;
+  uint32_t last =
+      atomic_load_explicit(&s_talker_tx_done_us, memory_order_acquire);
+  uint32_t now_us = (uint32_t)esp_timer_get_time();
+  if (now_us - last < AVB_NET_TX_GATE_RECENT_US)
+    return prio;
+  while (atomic_load_explicit(&s_talker_tx_done_us, memory_order_acquire) ==
+             last &&
+         (uint32_t)esp_timer_get_time() - now_us < AVB_NET_TX_GATE_MAX_US) {
+  }
+  return prio;
+}
+
+void avb_net_tx_end(UBaseType_t prio) {
+  if (prio < AVB_NET_TX_PRIORITY)
+    vTaskPrioritySet(NULL, prio);
+}
+#else
+UBaseType_t avb_net_tx_begin(void) { return 0; }
+void avb_net_tx_end(UBaseType_t prio) { (void)prio; }
+#endif
+
 /* Send an Ethernet frame */
 int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
                     uint16_t msg_len, struct timespec *ts,
@@ -2885,7 +2941,9 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
     return ERROR;
   }
 
+  UBaseType_t prio = avb_net_tx_begin();
   int ret = write(l2if, eth_frame, sizeof(eth_frame));
+  avb_net_tx_end(prio);
   return ret;
 }
 
@@ -2930,7 +2988,9 @@ int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
     return ERROR;
   }
 
+  UBaseType_t prio = avb_net_tx_begin();
   int ret = write(l2if, eth_frame, sizeof(eth_frame));
+  avb_net_tx_end(prio);
   return ret;
 }
 
@@ -3050,7 +3110,10 @@ int avb_net_send_on(avb_state_s *state, int port_index,
       avberr("avb_net_send_on: invalid ethertype %d", ethertype);
       return ERROR;
     }
-    return write(l2if, eth_frame, sizeof(eth_frame));
+    UBaseType_t prio = avb_net_tx_begin();
+    int ret = write(l2if, eth_frame, sizeof(eth_frame));
+    avb_net_tx_end(prio);
+    return ret;
   }
 
   return ERROR;

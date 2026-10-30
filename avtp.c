@@ -843,10 +843,24 @@ static void talker_batch_timer_arm(int64_t delay_us) {
  * Class B. */
 #define TALKER_SRC_MAX_SPP 64
 
+/* PTPD's transmits go out like the control plane's (avbnet.c). */
+static UBaseType_t s_ptp_tx_prio;
+static void avb_talker_ptp_tx_hook(bool before, bool timed) {
+  (void)timed;
+  if (before)
+    s_ptp_tx_prio = avb_net_tx_begin();
+  else
+    avb_net_tx_end(s_ptp_tx_prio);
+}
+
 static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   /* Reset productive-work accumulator on every stream_out_task
    * start so each streaming session stands alone in the CPU stats. */
   atomic_store_explicit(&s_stream_out_work_us, 0, memory_order_relaxed);
+  if (((struct stream_out_params_s *)task_param)->eth_handle != NULL) {
+    ptpd_set_tx_hook(avb_talker_ptp_tx_hook);
+    avb_net_talker_tx_wired(true);
+  }
 
   /* Allocate and publish the diag context — mirrors stream-in pattern.
    * Counters zeroed via calloc; active=true once populated. Freed in
@@ -2250,6 +2264,7 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
       memcpy(tx_frame, &das[copy], ETH_ADDR_LEN);
       esp_err_t sent =
           avb_net_transmit_raw(params->eth_handle, tx_frame, this_frame_len);
+      avb_net_talker_tx_done((uint32_t)esp_timer_get_time());
       if (sent != ESP_OK && params->eth_handle != NULL) {
         /* One immediate retry on Ethernet. Per-listener duplication raises
          * TX-ring pressure enough that the once-per-second control-plane
@@ -2282,6 +2297,7 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
                               memory_order_relaxed);
   }
 
+  avb_net_talker_tx_wired(false);
   /* Publish NULL first so AVB-STATS stops reading, then free. */
   if (s_stream_tx_ctx) {
     stream_tx_ctx_t *tx_to_free = s_stream_tx_ctx;
