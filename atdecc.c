@@ -2745,6 +2745,46 @@ int avb_process_aecp_cmd_get_configuration(avb_state_s *state,
   return ret;
 }
 
+/* Process AECP command set configuration (IEEE 1722.1-2021 §7.4.7, Milan
+ * v1.3 §5.4.2.5). There is one configuration, so setting it again is the
+ * only success; Milan refuses the command while a Stream Input is bound
+ * or a Stream Output streams. */
+int avb_process_aecp_cmd_set_configuration(avb_state_s *state,
+                                           aecp_message_u *msg,
+                                           eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_get_configuration_rsp_s *cmd = (aecp_get_configuration_rsp_s *)msg;
+  uint16_t requested = octets_to_uint(cmd->configuration_index, 2);
+  static const uint8_t unbound[UNIQUE_ID_LEN] = {0};
+  bool any_running = false;
+  for (int i = 0; i < state->num_output_streams; i++) {
+    if (state->output_streams[i].streaming)
+      any_running = true;
+  }
+  for (int i = 0; i < state->num_input_streams; i++) {
+    if (memcmp(state->input_streams[i].talker_id, unbound, UNIQUE_ID_LEN) != 0)
+      any_running = true;
+  }
+  aecp_status_t status = aecp_status_success;
+  if (any_running)
+    status = aecp_status_stream_is_running;
+  else if (requested != DEFAULT_CONFIG_INDEX)
+    status = aecp_status_no_such_descriptor;
+
+  uint16_t current = DEFAULT_CONFIG_INDEX;
+  int_to_octets(&current, cmd->configuration_index, 2);
+  cmd->common.header.msg_type = aecp_msg_type_aem_response;
+  cmd->common.header.status_valtime = (uint8_t)status;
+  uint16_t cdl = sizeof(*cmd) - AVTP_CDL_PREAMBLE_LEN;
+  cmd->common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  cmd->common.header.control_data_len = cdl & 0xFF;
+  int ret = avb_net_send_to(state, ethertype_avtp, cmd, sizeof(*cmd), &ts,
+                            src_addr);
+  if (ret < 0)
+    avberr("send AECP Set Configuration response failed: %d", errno);
+  return ret;
+}
+
 /* Process AECP commands start and stop streaming (IEEE 1722.1-2021
  * §7.4.35/36, Milan v1.3 §5.4.2.19/20): a bound Stream Input's started
  * or stopped state, the one BIND_STREAM sets with STREAMING_WAIT, and
@@ -3654,6 +3694,7 @@ static bool avb_aem_command_changes_state(uint8_t command_type) {
   case aecp_cmd_code_set_stream_format:
   case aecp_cmd_code_set_clock_source:
   case aecp_cmd_code_set_sampling_rate:
+  case aecp_cmd_code_set_configuration:
   case aecp_cmd_code_start_streaming:
   case aecp_cmd_code_stop_streaming:
   case aecp_cmd_code_set_max_transit_time:
@@ -3798,6 +3839,8 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     case aecp_cmd_code_get_configuration:
       return avb_process_aecp_cmd_get_configuration(state, msg, src_addr);
       break;
+    case aecp_cmd_code_set_configuration:
+      return avb_process_aecp_cmd_set_configuration(state, msg, src_addr);
     case aecp_cmd_code_start_streaming:
     case aecp_cmd_code_stop_streaming:
       return avb_process_aecp_cmd_streaming(state, msg, src_addr);
