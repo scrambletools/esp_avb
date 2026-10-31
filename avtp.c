@@ -2531,6 +2531,15 @@ typedef struct {
   volatile uint32_t loss_fill_events; /* loss-concealment silence inserts */
   volatile uint32_t loss_fill_frames; /* wire-lost frames replaced by silence */
   volatile uint32_t splice_aligned;   /* inserts sized from presentation time */
+  /* The last insert for the stats printer: how it was sized (1 from
+   * presentation time, 2 the residue, 3 the residue cut to the pause),
+   * what the sizing wanted before the depth ceiling, what went in. */
+  volatile uint8_t diag_fill_kind;
+  volatile uint32_t diag_fill_lost;
+  volatile int32_t diag_fill_pause_us;
+  volatile int32_t diag_fill_lead_us;
+  volatile uint32_t diag_fill_wanted;
+  volatile uint32_t diag_fill_bytes;
   /* Waveform-repetition concealment (stream_conceal_fill): the period
    * repeated through the last insert, and the crossfade still owed to
    * the real audio after it. */
@@ -2586,6 +2595,10 @@ typedef struct {
   volatile uint8_t diag_gate_mode;   /* 0=never locked, 1=presentation, 2=prefill */
   volatile int32_t diag_gate_err_ns; /* start lateness vs target (pt mode) */
   volatile uint32_t diag_gate_fill;  /* ring fill at playout start */
+  volatile int32_t diag_gate_wait_ms;  /* anchor armed to playout start */
+  volatile bool diag_gate_idle_gave_up; /* started without a confirmed idle DMA */
+  volatile int32_t diag_gate_learned_us; /* learned latency the lock aimed at */
+  bool gate_idle_gave_up; /* stream_in_tx_idle's last answer was its give-up */
   /* One-time re-gate: set after playout that locked on the prefill
    * fallback (gPTP not yet synced — early/superfast start) has been
    * re-armed onto presentation time. Prevents a re-gate loop for
@@ -4028,6 +4041,7 @@ static bool stream_in_tx_idle(stream_rx_ctx_t *ctx) {
       starved - ctx->tx_starved_at_write >=
           state->media_clock.i2s_tx_dma_ring_bytes) {
     ctx->gate_idle_wait_us = 0;
+    ctx->gate_idle_gave_up = false;
     return true;
   }
   if (ctx->gate_idle_wait_us == 0)
@@ -4035,6 +4049,7 @@ static bool stream_in_tx_idle(stream_rx_ctx_t *ctx) {
   if (now_us - ctx->gate_idle_wait_us < STREAM_TX_IDLE_WAIT_US)
     return false;
   ctx->gate_idle_wait_us = 0;
+  ctx->gate_idle_gave_up = true;
   return true;
 }
 
@@ -4197,6 +4212,10 @@ static void stream_in_drain_body(void *arg) {
     }
     ctx->diag_gate_err_ns = pt_err_ns;
     ctx->diag_gate_fill = fill;
+    ctx->diag_gate_wait_ms =
+        (int32_t)((esp_timer_get_time() - ctx->gate_arm_us) / 1000);
+    ctx->diag_gate_idle_gave_up = ctx->gate_idle_gave_up;
+    ctx->diag_gate_learned_us = (int32_t)(ctx->learned_latency_ns / 1000);
   }
 
   /* A media clock restart (mr toggled): what is queued belongs to the old
@@ -4819,6 +4838,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
       (lost_frames > 0 || pause_us > 10000)) {
     uint32_t fill_bytes = 0;
     bool aligned = false;
+    uint8_t fill_kind = 0;
+    int32_t fill_lead_us = 0;
     if (pause_us > 10000) {
       /* The DAC free-ran on auto_clear zeros through this pause while
        * no sequence numbers arrived to credit, and the 8-bit residue
@@ -4872,6 +4893,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
               fill_bytes = 0;
             }
             aligned = true;
+            fill_kind = 1;
+            fill_lead_us = lead / 1000;
           }
         }
       }
@@ -4890,15 +4913,19 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
        * switch queue-dump whose time must not be re-inserted). +16
        * covers the ≤1 ms staleness of the sparse last_packet_us. */
       uint32_t n_fill = lost_frames;
+      fill_kind = 2;
       if (pause_us > 0 && ctx->ring_bytes_per_sec > 0) {
         uint32_t pause_pkts = (uint32_t)(
             (pause_us * (int64_t)ctx->ring_bytes_per_sec) /
             ((int64_t)total * 1000000LL)) + 16;
-        if (n_fill > pause_pkts)
+        if (n_fill > pause_pkts) {
           n_fill = pause_pkts;
+          fill_kind = 3;
+        }
       }
       fill_bytes = n_fill * total;
     }
+    uint32_t fill_wanted = fill_bytes;
     /* A loss can take at most the ring's standing depth plus what the
      * I2S DMA played while no packet arrived, so an insert may refill
      * the ring to that, with 1 ms for the drain's own swing. A gap that
@@ -4924,6 +4951,12 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
       stream_conceal_fill(ctx, fh, fill_bytes);
       atomic_store_explicit(&ctx->ring.head, fh + fill_bytes,
                             memory_order_release);
+      ctx->diag_fill_kind = fill_kind;
+      ctx->diag_fill_lost = lost_frames;
+      ctx->diag_fill_pause_us = (int32_t)pause_us;
+      ctx->diag_fill_lead_us = fill_lead_us;
+      ctx->diag_fill_wanted = fill_wanted;
+      ctx->diag_fill_bytes = fill_bytes;
       ctx->loss_fill_events++;
       ctx->loss_fill_frames += fill_bytes / total;
       if (aligned)
@@ -5107,12 +5140,42 @@ void avb_stream_in_print_diag(void) {
    * caller (AVB-STATS). */
   static uint32_t last_pkt = 0, last_ok = 0, last_fail = 0;
   static uint32_t last_drain = 0, last_under = 0;
+  static uint32_t last_locks = 0, last_fills = 0;
   /* A new stream's counters start at zero: re-baseline, as stream-out
    * does, or the first window prints wrapped deltas. */
   static uint32_t prev_serial = 0;
   if (ctx->start_serial != prev_serial) {
     prev_serial = ctx->start_serial;
     last_pkt = last_ok = last_fail = last_drain = last_under = 0;
+    last_locks = last_fills = 0;
+  }
+
+  /* The window's last lock and last insert, each once. */
+  if (ctx->media_locked_count != last_locks) {
+    last_locks = ctx->media_locked_count;
+    avbinfo("STREAM-LOCK: n=%lu gate=%s err=%ldns fill=%luB wait=%ldms "
+            "dma=%s learned=%ldus reanchor=%lu",
+            (unsigned long)last_locks,
+            ctx->diag_gate_mode == 1   ? "pt"
+            : ctx->diag_gate_mode == 2 ? "prefill"
+                                       : "none",
+            (long)ctx->diag_gate_err_ns, (unsigned long)ctx->diag_gate_fill,
+            (long)ctx->diag_gate_wait_ms,
+            ctx->diag_gate_idle_gave_up ? "gave-up" : "idle",
+            (long)ctx->diag_gate_learned_us,
+            (unsigned long)ctx->gate_reanchors);
+  }
+  if (ctx->loss_fill_events != last_fills) {
+    last_fills = ctx->loss_fill_events;
+    avbinfo("STREAM-FILL: n=%lu sized=%s lost=%lu pause=%ldus lead=%ldus "
+            "wanted=%luB put=%luB",
+            (unsigned long)last_fills,
+            ctx->diag_fill_kind == 1   ? "pt"
+            : ctx->diag_fill_kind == 2 ? "residue"
+                                       : "residue-cut",
+            (unsigned long)ctx->diag_fill_lost, (long)ctx->diag_fill_pause_us,
+            (long)ctx->diag_fill_lead_us, (unsigned long)ctx->diag_fill_wanted,
+            (unsigned long)ctx->diag_fill_bytes);
   }
 
   uint32_t packets = ctx->pkt_count;
