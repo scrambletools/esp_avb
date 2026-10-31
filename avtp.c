@@ -773,6 +773,8 @@ static AVB_TALKER_IRAM_ATTR void i2s24_to_am824_stereo(const uint8_t *in,
 #define TALKER_SENT_LATE_US 25
 /* No ADC rate readings for this long after a talker disturbance. */
 #define TALKER_ADC_SETTLE_US (10LL * 60 * 1000000LL)
+/* Nor for this long after the backlog was last more than a packet off. */
+#define TALKER_BACKLOG_SETTLE_US (3LL * 60 * 1000000LL)
 
 #if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
 /* Batched pacing on a single-core station (see the top of the talker
@@ -1884,6 +1886,16 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
         } else if (disturbances != rate_disturbances) {
           rate_disturbances = disturbances;
           rate_quiet_until_us = rate_now_us + TALKER_ADC_SETTLE_US;
+        }
+        /* The backlog also steps by 100 to 180 B with none of those
+         * counted (an amp and a guitar, about 6 an hour, cause not yet
+         * known), and the fill PI's swing back read as 4 to 5 ppm off
+         * for two minutes. Read nothing while the backlog is more than
+         * a packet off, nor for a while after. */
+        if (err_pkts_q8 > 256 || err_pkts_q8 < -256) {
+          int64_t until = rate_now_us + TALKER_BACKLOG_SETTLE_US;
+          if (until > rate_quiet_until_us)
+            rate_quiet_until_us = until;
         }
         if (rate_window_us == 0) {
           rate_window_us = rate_now_us;
