@@ -2743,6 +2743,7 @@ typedef struct {
   uint32_t src_pending;
   uint32_t src_cycles, src_frames; /* CPU cycles, frames converted */
   uint32_t src_trim_bytes; /* latency trim still to take by walks */
+  int32_t src_extra_seen;  /* src.extra_taken already counted as trimmed */
 } stream_rx_ctx_t;
 
 static stream_rx_ctx_t *s_stream_rx_ctx = NULL;
@@ -3023,6 +3024,7 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
     ctx->src_primed = false;
     ctx->src_pending = 0;
     ctx->src_trim_bytes = 0;
+    ctx->src_extra_seen = 0;
   }
   ctx->phase_valid = true;
   atomic_fetch_add_explicit(&ctx->state->media_clock.stream_phase_epoch, 1u,
@@ -3047,11 +3049,17 @@ static void stream_in_phase_publish(stream_rx_ctx_t *ctx, int32_t phase_ns) {
     int32_t step_ns = phase_ns - ctx->phase_prev_ns;
     bool explained = starved != ctx->phase_prev_starved ||
                      ctx->loss_fill_events != ctx->phase_prev_fills ||
-                     ctx->phase_trimmed != ctx->phase_prev_trimmed ||
                      ctx->phase_clamps != ctx->phase_prev_clamps;
+    int32_t trimmed = (int32_t)(ctx->phase_trimmed - ctx->phase_prev_trimmed);
     if (explained || step_ns > STREAM_PHASE_STEP_NS ||
         step_ns < -STREAM_PHASE_STEP_NS)
       ctx->phase_steps_ns += step_ns;
+    else if (trimmed && ctx->ring_bytes_per_sec)
+      /* A trim moves the phase by what it took, no more: the rest of the
+       * tick is drift the phase loop has to see. Walking out a late lock
+       * takes minutes, with a walk's frame in about one tick in four. */
+      ctx->phase_steps_ns -= (int64_t)trimmed * 1000000000LL /
+                             ctx->ring_bytes_per_sec;
     if (starved != ctx->phase_prev_starved)
       ctx->held_starved = true;
   }
@@ -3733,23 +3741,24 @@ static bool stream_in_convert_block(stream_rx_ctx_t *ctx, uint32_t avail,
   atomic_store_explicit(&ctx->ring.tail, tail + in_bytes,
                         memory_order_release);
   /* Frames a trim's walks take count as trimmed, which the phase
-   * sensors leave out like the crossfaded trim they replace. */
+   * sensors leave out like the crossfaded trim they replace. The
+   * converter counts them apart from the rate's walks: read from the
+   * block's net intake, a rate walk's frames counted as the trim's, so a
+   * trim ran out early while its walks still ran, and those showed as
+   * drift. A guitar walking out 45 ms with its rate at +20 ppm ended
+   * 0.6 ms early and starved, and learned -89 ppm from the walks. */
   int32_t taken = (in_frames - out_frames) * STREAM_FRAME_BYTES;
-  if (taken > 0 && ctx->src_trim_bytes) {
-    uint32_t trimmed = (uint32_t)taken < ctx->src_trim_bytes
-                           ? (uint32_t)taken
-                           : ctx->src_trim_bytes;
-    ctx->src_trim_bytes -= trimmed;
-    ctx->phase_trimmed += trimmed;
-    taken -= (int32_t)trimmed;
-  }
-  /* A rate walk landing its frame in the same block as a trim walk's
-   * nets the block to none, so the trim's last bytes were never seen
-   * taken, and every later trim and residual waited on them (a listener
-   * held 0.5 ms late). The trim is done once nothing is owed and no walk
-   * runs; what the walks took is in the phase already. */
+  int32_t trimmed =
+      (ctx->src.extra_taken - ctx->src_extra_seen) * STREAM_FRAME_BYTES;
+  ctx->src_extra_seen = ctx->src.extra_taken;
+  ctx->phase_trimmed += (uint32_t)trimmed;
+  taken -= trimmed;
+  if (trimmed > 0)
+    ctx->src_trim_bytes -= (uint32_t)trimmed < ctx->src_trim_bytes
+                               ? (uint32_t)trimmed
+                               : ctx->src_trim_bytes;
   if (ctx->src_trim_bytes && ctx->src.pos.extra == 0 &&
-      ctx->src.pos.walk_left == 0)
+      !(ctx->src.pos.walk_left && ctx->src.pos.walk_extra))
     ctx->src_trim_bytes = 0;
   ctx->phase_slipped += taken;
   ctx->held_taken_q32 += (int64_t)out_frames * ctx->held_rate_q32;

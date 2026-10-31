@@ -42,6 +42,7 @@ typedef struct {
   int32_t walk_step; /* per-frame position change of the walk in progress */
   int32_t walk_left; /* its frames still to run */
   int32_t extra;     /* whole frames to take (+) or give back (-) by walks */
+  bool walk_extra;   /* the walk in progress pays one of those frames */
 } avb_src_pos_s;
 
 typedef struct {
@@ -51,6 +52,11 @@ typedef struct {
   int hist_pos;
   avb_src_pos_s pos;
   uint32_t walks; /* walks started */
+  /* Input frames the walks for avb_src_owe have taken (+) or given back
+   * (-), counted as the input count changes: a positive walk takes its
+   * frame at its last output, a negative one gives its frame back at its
+   * first. The ratio's own walks are not in it. */
+  int32_t extra_taken;
 } avb_src_s;
 
 /* Builds the shared coefficient table on first use; false if out of

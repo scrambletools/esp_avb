@@ -127,9 +127,11 @@ static inline int32_t src_next_step(avb_src_pos_s *pos, int32_t rate_q32) {
     if (pos->owed >= SRC_ONE || pos->owed <= -SRC_ONE) {
       sign = pos->owed > 0 ? 1 : -1;
       pos->owed -= sign * SRC_ONE;
+      pos->walk_extra = false;
     } else if (pos->extra) {
       sign = pos->extra > 0 ? 1 : -1;
       pos->extra -= sign;
+      pos->walk_extra = true;
     } else {
       return 0;
     }
@@ -176,6 +178,12 @@ IRAM_ATTR void avb_src_run(avb_src_s *src, const uint8_t *in, int in_frames,
     int32_t step = src_next_step(&src->pos, rate_q32);
     if (walk_was_idle && step != 0)
       src->walks++;
+    if (src->pos.walk_extra) {
+      if (step < 0 && walk_was_idle)
+        src->extra_taken--;
+      else if (step > 0 && src->pos.walk_left == 0)
+        src->extra_taken++;
+    }
     for (int push = src_advance(&src->pos, step); push > 0; push--) {
       src_push(src, used < in_frames ? in + used * frame_bytes : NULL, slots);
       used++;
