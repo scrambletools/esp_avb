@@ -405,13 +405,59 @@ esp_err_t avb_codec_validate_clock_plan(avb_state_s *state) {
   return ESP_OK;
 }
 
+/* The GDMA reports only the newest completed buffer per interrupt, so
+ * an interrupt held off for more than a buffer (24 frames, 0.5 ms at
+ * 48 kHz) leaves the one before it out of the byte counts. The ring's
+ * buffers come round in a fixed order: learn it, then count the
+ * buffers each completion passed over. */
+#define I2S_RING_ORDER_MAX 64
+typedef struct {
+  const void *bufs[I2S_RING_ORDER_MAX];
+  uint32_t count; /* buffers learned */
+  uint32_t next;  /* index expected next, once the ring came round */
+  bool ready;
+} i2s_ring_order_t;
+
+static i2s_ring_order_t s_rx_order, s_tx_order;
+
+static IRAM_ATTR uint32_t i2s_ring_skipped(i2s_ring_order_t *ring,
+                                           const void *buf) {
+  if (!ring->ready) {
+    if (ring->count > 0 && buf == ring->bufs[0]) {
+      ring->ready = true;
+      ring->next = 1 % ring->count;
+      return 0;
+    }
+    if (ring->count == I2S_RING_ORDER_MAX)
+      ring->count = 0;
+    ring->bufs[ring->count++] = buf;
+    return 0;
+  }
+  for (uint32_t skipped = 0; skipped < ring->count; skipped++) {
+    uint32_t index = (ring->next + skipped) % ring->count;
+    if (ring->bufs[index] == buf) {
+      ring->next = (index + 1) % ring->count;
+      return skipped;
+    }
+  }
+  /* Not one of the learned buffers (a skip while learning, or a new
+   * channel): learn the ring again. */
+  ring->ready = false;
+  ring->count = 0;
+  return 0;
+}
+
 /* TX DMA completion callback — accumulates DAC-consumed bytes for the
- * media-clock PLL. ISR context: one relaxed atomic add, nothing else. */
+ * media-clock PLL. ISR context: counts only, nothing else. */
 static IRAM_ATTR bool i2s_tx_on_sent_cb(i2s_chan_handle_t handle,
                                         i2s_event_data_t *event, void *arg) {
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_written,
                             (uint64_t)event->size, memory_order_relaxed);
+  uint32_t skipped = i2s_ring_skipped(&s_tx_order, event->dma_buf);
+  if (skipped)
+    atomic_fetch_add_explicit(&state->media_clock.i2s_tx_skipped, skipped,
+                              memory_order_relaxed);
 #if CONFIG_ESP_TIMER_IN_IRAM
   /* Where the DAC is inside the next buffer, for the playout phase. */
   atomic_store_explicit(&state->media_clock.i2s_tx_sent_us,
@@ -450,6 +496,10 @@ static IRAM_ATTR bool i2s_rx_on_recv_cb(i2s_chan_handle_t handle,
   avb_state_s *state = (avb_state_s *)arg;
   atomic_fetch_add_explicit(&state->media_clock.i2s_bytes_captured,
                             (uint64_t)event->size, memory_order_relaxed);
+  uint32_t skipped = i2s_ring_skipped(&s_rx_order, event->dma_buf);
+  if (skipped)
+    atomic_fetch_add_explicit(&state->media_clock.i2s_rx_skipped, skipped,
+                              memory_order_relaxed);
   /* Copy into the talker's capture ring while one is attached, so the
    * audio survives a stall of the stream task. */
   uint8_t *ring = state->media_clock.capture_ring;

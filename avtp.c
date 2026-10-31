@@ -5063,7 +5063,7 @@ void avb_stream_in_print_diag(void) {
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
           "dgap=%luus lockres=%ldus hold=%ld/%ld/%ld/%ld steps=%ldus clamps=%lu "
-          "owed=%luB arrive=%ld/%ldus",
+          "owed=%luB arrive=%ld/%ldus dma_skip=%lu/%lu",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -5105,7 +5105,11 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)ctx->src_trim_bytes, (long)ctx->arrival_gap_max_us,
           (long)(ctx->arrival_lead_min_us == INT32_MAX
                      ? 0
-                     : ctx->arrival_lead_min_us));
+                     : ctx->arrival_lead_min_us),
+          (unsigned long)atomic_load_explicit(
+              &ctx->state->media_clock.i2s_rx_skipped, memory_order_relaxed),
+          (unsigned long)atomic_load_explicit(
+              &ctx->state->media_clock.i2s_tx_skipped, memory_order_relaxed));
   ctx->arrival_gap_max_us = 0;
   ctx->arrival_lead_min_us = INT32_MAX;
   if (ctx->diag_held_learns != ctx->diag_held_learns_printed) {
