@@ -774,8 +774,12 @@ static int32_t compute_ppm_q16(avb_state_s *state, uint64_t bytes_delta,
   uint32_t byterate = state->media_clock.listener_byterate;
   if (byterate == 0)
     byterate = AVB_PLL_FALLBACK_BYTERATE;
+  /* Split the division to keep it in 64 bits: a hold's baseline ages
+   * for hours, and the plain product passed 2^63 after 6.7 h at 384 kB/s
+   * (a guitar held since boot read 14163 ppm and reset its baseline). */
   int64_t expected =
-      (int64_t)byterate * (int64_t)elapsed_ns / 1000000000LL;
+      (int64_t)(elapsed_ns / 1000000000ULL) * byterate +
+      (int64_t)((elapsed_ns % 1000000000ULL) * byterate / 1000000000ULL);
   int64_t byte_error = (int64_t)bytes_delta - expected;
   return (int32_t)((byte_error * 1000000LL * (1LL << 16)) / expected);
 }
