@@ -2560,6 +2560,10 @@ typedef struct {
    * loop from ring_write_ok / drain_underrun transitions, not hot path. */
   uint32_t media_locked_count;
   uint32_t media_unlocked_count;
+  uint32_t media_reset_count;  /* mr toggles received (MEDIA_RESET) */
+  uint8_t mr_last;             /* mr of the last frame, once mr_seen */
+  bool mr_seen;
+  volatile bool mr_relock;     /* handler -> drain: relock on the new timeline */
   bool ever_locked;
   bool drain_locked; /* playout gate passed; owned by the drain callback */
   /* Presentation-time playout gate. Producer (RX handler) anchors the
@@ -4143,6 +4147,30 @@ static void stream_in_drain_body(void *arg) {
     ctx->diag_gate_fill = fill;
   }
 
+  /* A media clock restart (mr toggled): what is queued belongs to the old
+   * timeline. Drop it and gate the next frame at its presentation time,
+   * as after an outage. */
+  if (ctx->mr_relock) {
+    ctx->mr_relock = false;
+    if (ctx->drain_locked) {
+      ctx->drain_locked = false;
+      ctx->gate_late_since_us = 0;
+      atomic_store_explicit(
+          &ctx->ring.tail,
+          atomic_load_explicit(&ctx->ring.head, memory_order_acquire),
+          memory_order_release);
+      atomic_store_explicit(&ctx->gate_armed, false, memory_order_release);
+      if (ctx->ever_locked) {
+        ctx->media_unlocked_count++;
+        ctx->ever_locked = false;
+      }
+      if (ctx->state)
+        atomic_fetch_add_explicit(&ctx->state->media_clock.stream_ref_epoch,
+                                  1u, memory_order_relaxed);
+      return;
+    }
+  }
+
   /* Re-gate onto presentation time. Playout that locked on the
    * prefill fallback (gPTP not yet sharing the talker's timeline —
    * early/superfast start, or a BTC reboot) plays arrival-relative,
@@ -4697,6 +4725,17 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * A distrusted estimate (reorder signature, absurd lead) falls
    * back to the bounded residue fill; outages beyond what the ring
    * can hold still take the starvation re-gate. */
+  /* mr toggles when the talker's media clock restarts (IEEE 1722 mr bit):
+   * its timeline jumped, so the drain relocks on presentation time. Kept
+   * as drift instead, a PC talker's step back onto gPTP after a 1.96 s
+   * transient left a listener 0.72 ms early, walking it out. */
+  uint8_t mr = avtp_data[1] & 0x08;
+  if (ctx->mr_seen && mr != ctx->mr_last) {
+    ctx->media_reset_count++;
+    ctx->mr_relock = true;
+  }
+  ctx->mr_last = mr;
+  ctx->mr_seen = true;
   /* Hot-path budget: read the clock only when a loss was seen or the
    * ring is empty (any pause that matters drains the ring first) —
    * routine packets skip both branches. */
@@ -5461,10 +5500,10 @@ void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
   int_to_octets(&counter_val, counters->late_ts, 4);
   counter_val = ctx->early_ts_count;
   int_to_octets(&counter_val, counters->early_ts, 4);
-  if (ctx->state) {
-    counter_val = ctx->state->media_clock.media_reset_count;
-    int_to_octets(&counter_val, counters->media_reset, 4);
-  }
+  /* Toggles of mr in the frames received (1722.1 MEDIA_RESET), not this
+   * board's own media clock resets. */
+  counter_val = ctx->media_reset_count;
+  int_to_octets(&counter_val, counters->media_reset, 4);
 }
 
 /* Stream RX dispatcher — registered with the net layer; routes incoming
