@@ -329,6 +329,7 @@ static struct {
   int64_t adc_last_us;         /* last tick that read the ADC error */
   int64_t adc_sum_q16;
   uint32_t adc_samples;
+  int32_t adc_prev_mean_q16; /* last window's mean past the minimum, or 0 */
   bool adc_refine_landing; /* persist the trim when that slew lands */
 } s_pll;
 
@@ -1309,7 +1310,14 @@ void avb_pll_tick(avb_state_s *state) {
    * every few minutes. The talker's ADC-following cadence measures the
    * same error exactly, so once that reading has stayed steady, move
    * the held trim by it. The APLL lands on its nearest step (about
-   * 1.5 ppm), so the remaining error is at most half a step. */
+   * 1.5 ppm), so the remaining error is at most half a step.
+   *
+   * Settled, a window reads within 0.3 ppm, but now and then one reads
+   * 4 to 5 ppm off. Moved by that, the trim hunted: the next windows
+   * read the move back, often past zero, and an amp and a guitar swung
+   * 29 <-> 34 ppm every 6 min, saving the trim each time. So two
+   * windows in a row must agree on the sign, and the trim moves by half
+   * their mean. */
   if (internal_mode && s_pll.internal_hold && s_hw.nominal_apll_hz > 0) {
     uint32_t stamp_ms = state->media_clock.talker_adc_error_stamp_ms;
     int32_t adc_q16 = state->media_clock.talker_adc_error_ppm_q8 * 256;
@@ -1322,8 +1330,10 @@ void avb_pll_tick(avb_state_s *state) {
      * 5 ppm). Such a window starts over. */
     bool resumed = now_us - s_pll.adc_last_us > AVB_PLL_ADC_STALE_MS * 1000LL;
     s_pll.adc_last_us = now_us;
-    if (!fresh || resumed)
+    if (!fresh || resumed) {
       s_pll.adc_window_start_us = 0;
+      s_pll.adc_prev_mean_q16 = 0;
+    }
     if (fresh && s_pll.adc_window_start_us == 0) {
       /* A talker start, a gap, or a landed move (the slew above
        * returns until then): skip the settling. */
@@ -1349,12 +1359,19 @@ void avb_pll_tick(avb_state_s *state) {
       s_pll.adc_window_start_us = now_us;
       s_pll.adc_sum_q16 = 0;
       s_pll.adc_samples = 0;
+      int32_t prev_q16 = s_pll.adc_prev_mean_q16;
+      bool past_min = abs_mean_q16 >= AVB_PLL_ADC_REFINE_MIN_PPM_Q16;
+      s_pll.adc_prev_mean_q16 = past_min ? mean_q16 : 0;
+      if (past_min && prev_q16 != 0 && (prev_q16 < 0) == (mean_q16 < 0))
+        mean_q16 = (int32_t)(((int64_t)mean_q16 + prev_q16) / 2);
+      else
+        abs_mean_q16 = 0;
     } else {
       abs_mean_q16 = 0;
     }
     if (abs_mean_q16 >= AVB_PLL_ADC_REFINE_MIN_PPM_Q16) {
       adc_q16 = mean_q16;
-      int32_t move_q16 = adc_q16;
+      int32_t move_q16 = adc_q16 / 2;
       if (move_q16 > AVB_PLL_ADC_REFINE_MAX_PPM_Q16)
         move_q16 = AVB_PLL_ADC_REFINE_MAX_PPM_Q16;
       if (move_q16 < -AVB_PLL_ADC_REFINE_MAX_PPM_Q16)
@@ -1372,6 +1389,7 @@ void avb_pll_tick(avb_state_s *state) {
         new_target = -AVB_PLL_MAX_APPLIED_PPM_Q16;
       state->media_clock.pll_target_ppm_q16 = new_target;
       s_pll.adc_window_start_us = 0;
+      s_pll.adc_prev_mean_q16 = 0;
       s_pll.adc_refine_landing = true;
       int32_t adc_cppm = (int32_t)(((int64_t)adc_q16 * 100) / 65536);
       int32_t abs_adc_cppm = adc_cppm < 0 ? -adc_cppm : adc_cppm;
