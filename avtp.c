@@ -2580,6 +2580,8 @@ typedef struct {
   _Atomic bool gate_armed;
   uint32_t gate_avtp_ts;  /* anchor packet's avtp_timestamp (ns, 32-bit) */
   int64_t gate_arm_us;    /* esp_timer at anchor capture (staleness guard) */
+  uint32_t gate_marker_next;       /* next marker stream_in_gate_follow checks */
+  volatile uint32_t gate_reanchors; /* anchors it moved past a break */
   /* gate diagnostics — written once per lock by drain, read by stats */
   volatile uint8_t diag_gate_mode;   /* 0=never locked, 1=presentation, 2=prefill */
   volatile int32_t diag_gate_err_ns; /* start lateness vs target (pt mode) */
@@ -3717,6 +3719,47 @@ static void stream_in_await_anchor(stream_rx_ctx_t *ctx, int64_t now_us) {
   ctx->pt_await_unarmed_base = ctx->pt_unarmed_arrivals;
 }
 
+/* The audio queued behind the anchor has to follow on from it, or the
+ * lock plays everything after a break at the anchor's time. Unlocked,
+ * the handler appends packets without filling gaps, and on a station
+ * the catch-up burst after an outage loses or resends bundles right
+ * behind the anchor: locks landed 12 to 15 ms early or 14 ms late,
+ * past the 2 ms the lock residual corrects, and stayed there, an early
+ * one with that much less cushion. Until the lock, a marker more than
+ * this off the anchor's timeline becomes the anchor, dropping the
+ * audio before it. */
+#define GATE_GAP_NS 1000000
+static void stream_in_gate_follow(stream_rx_ctx_t *ctx) {
+  if (!ctx->ring_bytes_per_sec)
+    return;
+  uint32_t count =
+      atomic_load_explicit(&ctx->pt_marker_count, memory_order_acquire);
+  /* Keep clear of the slots the handler may be overwriting. */
+  uint32_t oldest =
+      count > STREAM_PT_MARKERS - 8 ? count - (STREAM_PT_MARKERS - 8) : 0;
+  if ((int32_t)(ctx->gate_marker_next - oldest) < 0)
+    ctx->gate_marker_next = oldest;
+  uint32_t tail = atomic_load_explicit(&ctx->ring.tail, memory_order_relaxed);
+  for (; ctx->gate_marker_next != count; ctx->gate_marker_next++) {
+    uint32_t pos = ctx->pt_markers[ctx->gate_marker_next % STREAM_PT_MARKERS].pos;
+    uint32_t pt = ctx->pt_markers[ctx->gate_marker_next % STREAM_PT_MARKERS].pt;
+    if ((int32_t)(pos - tail) <= 0)
+      continue;
+    uint32_t expected =
+        ctx->gate_avtp_ts +
+        (uint32_t)(((uint64_t)(pos - tail) * 1000000000ULL) /
+                   ctx->ring_bytes_per_sec);
+    int32_t off_ns = (int32_t)(pt - expected);
+    if (off_ns <= GATE_GAP_NS && off_ns >= -GATE_GAP_NS)
+      continue;
+    tail = pos;
+    atomic_store_explicit(&ctx->ring.tail, tail, memory_order_release);
+    ctx->gate_avtp_ts = pt;
+    ctx->gate_arm_us = esp_timer_get_time();
+    ctx->gate_reanchors++;
+  }
+}
+
 /* Arrivals into the empty ring that the give-up needs before it decides
  * the stream cannot arm: a tu=1 stream supplies one per drain pass, a
  * talker's 8-packet tu hold around a BTC change at most 8. */
@@ -4036,6 +4079,8 @@ static void stream_in_drain_body(void *arg) {
         return;
       }
     }
+    if (atomic_load_explicit(&ctx->gate_armed, memory_order_acquire))
+      stream_in_gate_follow(ctx);
     uint32_t fill = ring_readable(&ctx->ring);
     if (fill == 0)
       return;
@@ -5141,7 +5186,7 @@ void avb_stream_in_print_diag(void) {
           "late=%lu split_fail=%lu phase=%ld/%ld/%ldus ahead=%ld/%ldus "
           "phase_n=%lu trims=%lu/%luB slips=%lu/%lu src=%lucyc/%lu "
           "dgap=%luus lockres=%ldus hold=%ld/%ld/%ld/%ld steps=%ldus clamps=%lu "
-          "owed=%luB arrive=%ld/%ldus dma_skip=%lu/%lu",
+          "owed=%luB arrive=%ld/%ldus dma_skip=%lu/%lu reanchor=%lu",
           (unsigned long)(packets - last_pkt),
           (unsigned long)(ok - last_ok),
           (unsigned long)(fail - last_fail),
@@ -5187,7 +5232,8 @@ void avb_stream_in_print_diag(void) {
           (unsigned long)atomic_load_explicit(
               &ctx->state->media_clock.i2s_rx_skipped, memory_order_relaxed),
           (unsigned long)atomic_load_explicit(
-              &ctx->state->media_clock.i2s_tx_skipped, memory_order_relaxed));
+              &ctx->state->media_clock.i2s_tx_skipped, memory_order_relaxed),
+          (unsigned long)ctx->gate_reanchors);
   ctx->arrival_gap_max_us = 0;
   ctx->arrival_lead_min_us = INT32_MAX;
   if (ctx->diag_held_learns != ctx->diag_held_learns_printed) {
