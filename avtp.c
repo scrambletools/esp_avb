@@ -2564,6 +2564,10 @@ typedef struct {
   uint8_t mr_last;             /* mr of the last frame, once mr_seen */
   bool mr_seen;
   volatile bool mr_relock;     /* handler -> drain: relock on the new timeline */
+  bool mr_ts_valid;            /* mr_ts and mr_seq hold the last tv=1 frame */
+  uint8_t mr_seq;
+  uint32_t mr_ts;
+  uint32_t mr_ts_step;         /* avtp_timestamp step between frames, 0 = unknown */
   bool ever_locked;
   bool drain_locked; /* playout gate passed; owned by the drain callback */
   /* Presentation-time playout gate. Producer (RX handler) anchors the
@@ -3054,6 +3058,9 @@ static void stream_in_phase_lock(stream_rx_ctx_t *ctx) {
  * clock drift (150 ppm moves 3 µs); smaller ones count as drift unless
  * an event explains them. */
 #define STREAM_PHASE_STEP_NS 500000
+/* At an mr toggle, a timestamp this far off the run of the frames before
+ * is a new timeline; nearer, the toggle is counted only. */
+#define STREAM_MR_STEP_NS 20000
 
 /* Publish the playout phase to the media-clock loop with its steps
  * taken out, see stream_phase in avb.h. */
@@ -4728,11 +4735,31 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   /* mr toggles when the talker's media clock restarts (IEEE 1722 mr bit):
    * its timeline jumped, so the drain relocks on presentation time. Kept
    * as drift instead, a PC talker's step back onto gPTP after a 1.96 s
-   * transient left a listener 0.72 ms early, walking it out. */
+   * transient left a listener 0.72 ms early, walking it out. A toggle on
+   * timestamps that run on is counted only: relocking on each, 13 such
+   * toggles in 90 s from the same talker starved 6 to 19 KB per 10 s. */
   uint8_t mr = avtp_data[1] & 0x08;
-  if (ctx->mr_seen && mr != ctx->mr_last) {
+  bool tv = avtp_data[1] & 0x01;
+  uint8_t seq = avtp_data[2];
+  uint32_t ts = ((uint32_t)avtp_data[12] << 24) |
+                ((uint32_t)avtp_data[13] << 16) |
+                ((uint32_t)avtp_data[14] << 8) | (uint32_t)avtp_data[15];
+  uint8_t frames_on = (uint8_t)(seq - ctx->mr_seq);
+  bool toggled = ctx->mr_seen && mr != ctx->mr_last;
+  if (toggled) {
     ctx->media_reset_count++;
-    ctx->mr_relock = true;
+    int64_t moved = (int64_t)(int32_t)(ts - ctx->mr_ts) -
+                    (int64_t)ctx->mr_ts_step * frames_on;
+    if (!tv || !ctx->mr_ts_valid || !ctx->mr_ts_step ||
+        moved > STREAM_MR_STEP_NS || moved < -STREAM_MR_STEP_NS)
+      ctx->mr_relock = true;
+  } else if (tv && ctx->mr_ts_valid && frames_on == 1) {
+    ctx->mr_ts_step = ts - ctx->mr_ts;
+  }
+  if (tv) {
+    ctx->mr_ts = ts;
+    ctx->mr_seq = seq;
+    ctx->mr_ts_valid = true;
   }
   ctx->mr_last = mr;
   ctx->mr_seen = true;
