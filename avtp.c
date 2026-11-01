@@ -4914,7 +4914,15 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
        * covers the ≤1 ms staleness of the sparse last_packet_us. */
       uint32_t n_fill = lost_frames;
       fill_kind = 2;
-      if (pause_us > 0 && ctx->ring_bytes_per_sec > 0) {
+      /* Not over Wi-Fi: packets released after a bundle or retransmit
+       * wait arrive back to back, so the pause says nothing about the
+       * time lost, and the cut played the rest early (a station lost
+       * 192 packets after a 4 ms pause, took 32 and played 39 ms early,
+       * then starved). A station's gaps are what the retransmission gave
+       * up on: fill them whole. */
+      bool wifi = ctx->state &&
+                  ctx->state->port[0].medium == avb_port_medium_wifi_ftm;
+      if (!wifi && pause_us > 0 && ctx->ring_bytes_per_sec > 0) {
         uint32_t pause_pkts = (uint32_t)(
             (pause_us * (int64_t)ctx->ring_bytes_per_sec) /
             ((int64_t)total * 1000000LL)) + 16;
