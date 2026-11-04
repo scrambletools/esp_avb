@@ -2540,6 +2540,7 @@ typedef struct {
   volatile int32_t diag_fill_lead_us;
   volatile uint32_t diag_fill_wanted;
   volatile uint32_t diag_fill_bytes;
+  volatile uint32_t diag_fill_cycles; /* the last insert's CPU cycles */
   /* Waveform-repetition concealment (stream_conceal_fill): the period
    * repeated through the last insert, and the crossfade still owed to
    * the real audio after it. */
@@ -4472,6 +4473,12 @@ static void avb_crf_rx_handler(uint8_t *avtp_data, uint16_t len,
 #define CONCEAL_PERIOD_MAX 480  /* 10 ms */
 #define CONCEAL_MATCH_FRAMES 128 /* compared every 4th frame */
 #define CONCEAL_LAG_STEP 4      /* 83 us at 48 kHz */
+/* The match compares every 4th frame and the lags step by 4, so every
+ * frame the search reads is 1 + 4i frames back: 32 match points plus the
+ * 120 lag steps behind them. */
+#define CONCEAL_MATCH_POINTS (CONCEAL_MATCH_FRAMES / 4)
+#define CONCEAL_HISTORY_POINTS                                                 \
+  (CONCEAL_MATCH_POINTS + CONCEAL_PERIOD_MAX / CONCEAL_LAG_STEP)
 #define CONCEAL_FADE_FRAMES 960 /* 20 ms */
 #define CONCEAL_CROSSFADE_FRAMES 48
 /* Reciprocals of the fade and crossfade lengths (Q22, Q20), so a gain
@@ -4509,28 +4516,42 @@ static inline void ring_sample_put(uint8_t *buf, uint32_t mask, uint32_t pos,
   buf[(pos + 3) & mask] = 0;
 }
 
-/* Left-channel lag, in frames, that best matches the audio before head. */
+/* Left-channel lag, in frames, that best matches the audio before head.
+ * The frames it compares are gathered once, so the search is plain
+ * multiplies: reading them out of the ring at every lag held emac_rx
+ * most of a millisecond per insert, and with the next packets waiting
+ * behind it the DAC starved (11-04, both inserts on a late talker). */
 static uint16_t stream_conceal_period(const uint8_t *buf, uint32_t mask,
                                       uint32_t head) {
+  /* 24-bit samples shifted down 8 fit 16 bits, so each product fits 32. */
+  int16_t history[CONCEAL_HISTORY_POINTS];
+  for (int i = 0; i < CONCEAL_HISTORY_POINTS; i++)
+    history[i] = (int16_t)(
+        ring_sample_get(buf, mask, head - (1 + 4 * i) * CONCEAL_FRAME_BYTES) >>
+        8);
+  /* Energy of the earlier window, slid one lag step at a time. */
+  const int first = CONCEAL_PERIOD_MIN / CONCEAL_LAG_STEP;
+  int64_t energy = 0;
+  for (int i = 0; i < CONCEAL_MATCH_POINTS; i++)
+    energy += (int32_t)history[first + i] * history[first + i];
   uint16_t best_lag = CONCEAL_PERIOD_MAX;
   float best_score = 0.0f;
-  for (int lag = CONCEAL_PERIOD_MIN; lag <= CONCEAL_PERIOD_MAX;
-       lag += CONCEAL_LAG_STEP) {
-    int64_t correlation = 0, energy = 0;
-    for (int back = 1; back <= CONCEAL_MATCH_FRAMES; back += 4) {
-      int32_t recent =
-          ring_sample_get(buf, mask, head - back * CONCEAL_FRAME_BYTES) >> 8;
-      int32_t earlier = ring_sample_get(
-          buf, mask, head - (back + lag) * CONCEAL_FRAME_BYTES) >> 8;
-      correlation += (int64_t)recent * earlier;
-      energy += (int64_t)earlier * earlier;
+  for (int shift = first; shift <= CONCEAL_PERIOD_MAX / CONCEAL_LAG_STEP;
+       shift++) {
+    if (shift > first) {
+      int32_t entering = history[shift + CONCEAL_MATCH_POINTS - 1];
+      int32_t leaving = history[shift - 1];
+      energy += entering * entering - leaving * leaving;
     }
+    int64_t correlation = 0;
+    for (int i = 0; i < CONCEAL_MATCH_POINTS; i++)
+      correlation += (int32_t)history[i] * history[i + shift];
     if (correlation <= 0 || energy == 0)
       continue;
     float score = (float)correlation * (float)correlation / (float)energy;
     if (score > best_score) {
       best_score = score;
-      best_lag = (uint16_t)lag;
+      best_lag = (uint16_t)(shift * CONCEAL_LAG_STEP);
     }
   }
   return best_lag;
@@ -4956,7 +4977,9 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     }
     if (fill_bytes > 0 && ring_writable(&ctx->ring) >= fill_bytes + total) {
       uint32_t fh = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
+      uint32_t fill_start = esp_cpu_get_cycle_count();
       stream_conceal_fill(ctx, fh, fill_bytes);
+      ctx->diag_fill_cycles = esp_cpu_get_cycle_count() - fill_start;
       atomic_store_explicit(&ctx->ring.head, fh + fill_bytes,
                             memory_order_release);
       ctx->diag_fill_kind = fill_kind;
@@ -5176,14 +5199,15 @@ void avb_stream_in_print_diag(void) {
   if (ctx->loss_fill_events != last_fills) {
     last_fills = ctx->loss_fill_events;
     avbinfo("STREAM-FILL: n=%lu sized=%s lost=%lu pause=%ldus lead=%ldus "
-            "wanted=%luB put=%luB",
+            "wanted=%luB put=%luB cost=%lucyc",
             (unsigned long)last_fills,
             ctx->diag_fill_kind == 1   ? "pt"
             : ctx->diag_fill_kind == 2 ? "residue"
                                        : "residue-cut",
             (unsigned long)ctx->diag_fill_lost, (long)ctx->diag_fill_pause_us,
             (long)ctx->diag_fill_lead_us, (unsigned long)ctx->diag_fill_wanted,
-            (unsigned long)ctx->diag_fill_bytes);
+            (unsigned long)ctx->diag_fill_bytes,
+            (unsigned long)ctx->diag_fill_cycles);
   }
 
   uint32_t packets = ctx->pkt_count;
