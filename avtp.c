@@ -4799,7 +4799,10 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
    * re-gate churns. Insert the lost duration as silence so depth and
    * presentation alignment survive. Only while playout is locked
    * (during gating the anchor logic owns ring alignment), never
-   * across a media-clock restart (mr=1).
+   * while a media-clock restart waits for its relock. mr is a toggle,
+   * not a level: a talker can send mr=1 for hours, and gating on the
+   * level left every gap unfilled (observed: each reordered or skipped
+   * frame played the rest 125 us early, 43 skipped starved 1920 B).
    *
    * Sizing, by outage class:
    * - No/short pause (pure drop clump): wire-true packet count. The
@@ -4855,7 +4858,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   if (ctx->drain_locked && ctx->last_packet_us != 0 &&
       (lost_frames > 0 || ring_readable(&ctx->ring) == 0))
     pause_us = esp_timer_get_time() - ctx->last_packet_us;
-  if (ctx->drain_locked && !(avtp_data[1] & 0x08) && total > 0 &&
+  if (ctx->drain_locked && !ctx->mr_relock && total > 0 &&
       (lost_frames > 0 || pause_us > 10000)) {
     uint32_t fill_bytes = 0;
     bool aligned = false;
