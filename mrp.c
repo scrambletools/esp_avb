@@ -257,6 +257,21 @@ void mrp_applicant_step(mrp_sm_state_t *sm, mrp_event_e ev) {
         tx = mrp_tx_join;
       }
       break;
+    /* The passive states declare too. AP does sJ on tx! and txLA!, QP
+     * on txLA! (its tx! In is optional). Treated as observers, a
+     * declaration that heard the peer's JoinIn while VP went silent:
+     * periodic! moves QP only to AP, so nothing renewed it but the
+     * Join that answers the peer's next LeaveAll. */
+    case mrp_applicant_ap:
+      next = mrp_applicant_qa;
+      tx = mrp_tx_join;
+      break;
+    case mrp_applicant_qp:
+      if (ev == mrp_event_tx_la) {
+        next = mrp_applicant_qa;
+        tx = mrp_tx_join;
+      }
+      break;
     /* Observer states: [sJ] is optional, treat as no-op on shared media. */
     default:
       break;
