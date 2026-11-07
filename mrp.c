@@ -3974,8 +3974,12 @@ void mrp_rx_mvrp(avb_state_s *state, int port, mvrp_vlan_id_message_s *msg,
   if (msg->header.attr_type != mvrp_attr_type_vlan_identifier)
     return;
 
+  /* Arm the JoinTimer as mrp_rx_msrp does. Left to the next 500 ms VLAN
+   * re-declare, the answer could take ~700 ms: past the 600 ms minimum
+   * LeaveTime, and close to a peer's 800 ms one. */
   if (msg->header.vechead_leaveall) {
     mvrp_dispatch_leaveall(port);
+    mrp_port_arm_join_timer(state, port);
   }
 
   mvrp_vlan_entry_t *e = mvrp_vlan_find_or_insert(port, msg->vlan_id);
