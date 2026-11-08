@@ -895,6 +895,7 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   uint8_t *i2s_buf = NULL;
   uint8_t *i2s_ring = NULL;
   uint8_t *tx_frame = NULL;
+  bool send_loop_entered = false;
   esp_task_wdt_user_handle_t wdt_handle = NULL;
   struct stream_out_params_s *params = (struct stream_out_params_s *)task_param;
   if (params == NULL)
@@ -1423,6 +1424,7 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   }
 #endif
 
+  send_loop_entered = true;
   while (!state->output_streams[params->stream_index].stop_streaming) {
 #if CONFIG_ESP_AVB_STATION_TALKER_BATCHED
     /* Batched pacing. With nothing due, sleep until the slot of the
@@ -2383,6 +2385,20 @@ err:
   }
   /* i2s_ring is kept for the next start. */
   free(tx_frame);
+  /* A start that failed before sending (an allocation, on a station
+   * short of heap) leaves the stream not streaming, so the next Listener
+   * Ready or Lite plan starts it again; marked streaming, it stayed
+   * silent until its listener left and came back. */
+  if (params && !send_loop_entered) {
+    avb_state_s *failed_state = (avb_state_s *)params->state;
+    avb_talker_stream_s *stream =
+        &failed_state->output_streams[params->stream_index];
+    if (!stream->stop_streaming) {
+      stream->streaming = false;
+      avbwarn("Stream out %u: start failed, left stopped for a retry",
+              (unsigned)params->stream_index);
+    }
+  }
   free(params);
   vTaskDelete(NULL);
 }
@@ -6303,6 +6319,9 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   // Clear stop flag and start the stream output task
   state->output_streams[index].stop_streaming = false;
   state->output_streams[index].streaming = true;
+  /* Read before the task starts: it owns params and frees them on exit. */
+  bool use_sine_wave = params->use_sine_wave;
+  bool am824 = params->format_subtype == avtp_subtype_61883;
   /* Pin to the last core: core 1 on the dual-core P4 (keeps AVB-OUT off
    * core 0 with the network stack), core 0 on single-core targets, a
    * hardcoded 1 asserts inside xTaskCreatePinnedToCore on the C6 the
@@ -6311,17 +6330,24 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   /* Single core: the spin-paced TX loop must sit BELOW the Wi-Fi and
    * protocol tasks or it starves them (see the yield in the pacing
    * loop). */
-  xTaskCreatePinnedToCore(avb_stream_out_task, "AVB-OUT", 8192, (void *)params,
-                          tskIDLE_PRIORITY + 2, NULL, 0);
+  BaseType_t created =
+      xTaskCreatePinnedToCore(avb_stream_out_task, "AVB-OUT", 8192,
+                              (void *)params, tskIDLE_PRIORITY + 2, NULL, 0);
 #else
-  xTaskCreatePinnedToCore(avb_stream_out_task, "AVB-OUT", 8192, (void *)params,
-                          configMAX_PRIORITIES - 1, NULL,
-                          portNUM_PROCESSORS - 1);
+  BaseType_t created = xTaskCreatePinnedToCore(
+      avb_stream_out_task, "AVB-OUT", 8192, (void *)params,
+      configMAX_PRIORITIES - 1, NULL, portNUM_PROCESSORS - 1);
 #endif
+  if (created != pdPASS) {
+    /* Left stopped, so the next Listener Ready starts it again. */
+    state->output_streams[index].streaming = false;
+    free(params);
+    avberr("Stream out %d: no memory for its task", index);
+    return ERROR;
+  }
 
   avbinfo("Stream out %d started: %s -> AVTP %s", index,
-          params->use_sine_wave ? "sine wave" : "mic input",
-          params->format_subtype == avtp_subtype_61883 ? "IEC 61883" : "AAF");
+          use_sine_wave ? "sine wave" : "mic input", am824 ? "IEC 61883" : "AAF");
   return OK;
 }
 
