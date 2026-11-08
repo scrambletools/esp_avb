@@ -4923,14 +4923,16 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
               status);
       start_stream_in = status == acmp_status_success && !was_connected;
       if (status == acmp_status_success && was_connected) {
-        if (was_provisional &&
-            memcmp(old_stream_id,
+        if (memcmp(old_stream_id,
                    state->input_streams[listener_uid].stream_id,
                    UNIQUE_ID_LEN) != 0) {
-          /* Provisional stream_id guess was wrong — restart RX on
-           * the authoritative one from the talker's response. */
-          avbwarn("ConnTX rsp: provisional stream_id mismatch; "
-                  "restarting stream-in %d", listener_uid);
+          /* A provisional stream_id guess was wrong, or the talker moved
+           * its stream to a new ID: restart RX on the one from its
+           * response, or it keeps filtering on the old ID. */
+          avbwarn("ConnTX rsp: %s; restarting stream-in %d",
+                  was_provisional ? "provisional stream_id mismatch"
+                                  : "talker moved the stream to a new ID",
+                  listener_uid);
           avb_stop_stream_in(state, listener_uid);
           start_stream_in = true;
         } else {
@@ -5465,6 +5467,13 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   memcpy(stream->talker_id, response->talker_entity_id, UNIQUE_ID_LEN);
   memcpy(stream->talker_uid, response->talker_uid, 2);
   memcpy(stream->controller_id, response->controller_entity_id, UNIQUE_ID_LEN);
+  /* A response under another stream ID (the talker moved its stream, or a
+   * provisional guess was wrong) replaces the binding. The Listener
+   * declared for the old ID would otherwise answer every LeaveAll with a
+   * Join for as long as this endpoint runs. */
+  if (memcmp(stream->stream_id, zero_sid, UNIQUE_ID_LEN) != 0 &&
+      memcmp(stream->stream_id, response->stream_id, UNIQUE_ID_LEN) != 0)
+    mrp_withdraw_listener(state, 0, &stream->stream_id);
   memcpy(stream->stream_id, response->stream_id, UNIQUE_ID_LEN);
   memcpy(stream->stream_dest_addr, response->stream_dest_addr, ETH_ADDR_LEN);
 
