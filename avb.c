@@ -841,10 +841,21 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
        * nothing reaches the air anyway. */
       static eth_addr_t s_bssid;
       static bool s_bssid_known;
-      wifi_ap_record_t ap;
-      if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        memcpy(s_bssid, ap.bssid, ETH_ADDR_LEN);
-        s_bssid_known = true;
+      /* Polled once a second, every 10 s while it fails with a BSSID
+       * already known: unassociated, each poll logs the driver's
+       * "Haven't to connect to a suitable AP now!", which every tick
+       * made about 200 lines a second. */
+      static int64_t s_bssid_next_poll_us;
+      int64_t poll_now_us = esp_timer_get_time();
+      if (poll_now_us >= s_bssid_next_poll_us) {
+        wifi_ap_record_t ap;
+        bool polled = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+        if (polled) {
+          memcpy(s_bssid, ap.bssid, ETH_ADDR_LEN);
+          s_bssid_known = true;
+        }
+        s_bssid_next_poll_us =
+            poll_now_us + (polled || !s_bssid_known ? 1000000 : 10000000);
       }
       if (s_bssid_known) {
         memcpy(&das[0], s_bssid, ETH_ADDR_LEN);
