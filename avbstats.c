@@ -272,6 +272,63 @@ static bool is_idle_task(const char *name) {
 #define cpu_table_log avbdebug
 #endif
 
+#if defined(AVB_WIFI_RX_STATS) && CONFIG_ESP_AVB_STATS_WIFI_AIR
+/* What the station's radio saw this window, for setting against an AP's
+ * retry counts. fcs and the PHY errors point at interference here,
+ * other_ucast at someone else's traffic, buf_full and fifo_ovf at a
+ * station too busy to take frames. On the transmit side rtt_max is the
+ * longest a best-effort frame took from queue to completion, so it grows
+ * while the channel is busy. The hardware counters are 16 bits wide, so
+ * they and the transmit counters are cleared every window; the receive
+ * counters are cumulative and logged as deltas. */
+static void avb_wifi_air_log(const esp_test_rx_statistics_t *rx0) {
+  static esp_test_rx_statistics_t s_prev_rx0;
+  static uint32_t s_prev_su7;
+  static bool s_tx_stats_enabled = false;
+  if (!s_tx_stats_enabled &&
+      esp_wifi_enable_tx_statistics(ESP_WIFI_ACI_BE, true) == ESP_OK) {
+    s_tx_stats_enabled = true;
+  }
+  esp_test_rx_statistics_t rx7;
+  memset(&rx7, 0, sizeof(rx7));
+  esp_wifi_get_rx_statistics(7, &rx7);
+  esp_test_hw_rx_statistics_t hw;
+  memset(&hw, 0, sizeof(hw));
+  esp_test_get_hw_rx_statistics(&hw);
+  esp_test_clr_hw_statistics();
+  /* No failure breakdown: the driver fills TEST_TX_FAIL_MAX of those
+   * (984 bytes) and skips the copy for a NULL pointer. */
+  esp_test_tx_statistics_t tx;
+  memset(&tx, 0, sizeof(tx));
+  if (s_tx_stats_enabled &&
+      esp_wifi_get_tx_statistics(ESP_WIFI_ACI_BE, &tx, NULL) == ESP_OK) {
+    esp_wifi_clr_tx_statistics(ESP_WIFI_ACI_BE);
+  }
+  avbinfo("WIFI-AIR: rx su=%u su_retry=%u su7=%u legacy=%u ht=%u isr=%u | "
+          "hw mpdu=%u datasuc=%u fcs=%u abort=%u other_ucast=%u "
+          "buf_full=%u fifo_ovf=%u btblock=%u brx_err=%u nrx_err=%u "
+          "nrx_abort=%u | tx done=%u ok=%u retry=%u coll=%u timeout=%u "
+          "rtt_max=%u seq_rtt_max=%u",
+          (unsigned)(rx0->su - s_prev_rx0.su),
+          (unsigned)(rx0->su_retry - s_prev_rx0.su_retry),
+          (unsigned)(rx7.su - s_prev_su7),
+          (unsigned)(rx0->legacy - s_prev_rx0.legacy),
+          (unsigned)(rx0->ht - s_prev_rx0.ht),
+          (unsigned)(rx0->rx_isr - s_prev_rx0.rx_isr),
+          (unsigned)hw.rx_mpdu, (unsigned)hw.rx_datasuc,
+          (unsigned)hw.rx_fcs_err, (unsigned)hw.rx_abort,
+          (unsigned)hw.rx_other_ucast, (unsigned)hw.rx_buf_fullcnt,
+          (unsigned)hw.rx_fifo_ovfcnt, (unsigned)hw.rx_btblock_err,
+          (unsigned)hw.brx_err, (unsigned)hw.nrx_err,
+          (unsigned)hw.nrx_err_abort, (unsigned)tx.tx_complete,
+          (unsigned)tx.tx_succ, (unsigned)tx.retry_edca,
+          (unsigned)tx.collision, (unsigned)tx.timeout,
+          (unsigned)tx.tx_max_rtt, (unsigned)tx.tx_seq_max_rtt);
+  s_prev_rx0 = *rx0;
+  s_prev_su7 = rx7.su;
+}
+#endif
+
 static void avb_cpu_stats_tick(void) {
   TaskStatus_t cur[AVB_STATS_MAX_TASKS];
   uint32_t cur_total = 0;
@@ -449,6 +506,9 @@ static void avb_cpu_stats_tick(void) {
             "rx_nblks=%u | L2 wifi_cb=%u",
             rxs.legacy, rxs.ht, rxs.ht_retry, rxs.rx_isr, rxs.rx_nblks,
             avb_net_wifi_rx_cb_count());
+#if CONFIG_ESP_AVB_STATS_WIFI_AIR
+    avb_wifi_air_log(&rxs);
+#endif
   } else {
     avbdebug("  ====> WIFI L1 rx stats pending/unavailable | L2 wifi_cb=%u",
             avb_net_wifi_rx_cb_count());

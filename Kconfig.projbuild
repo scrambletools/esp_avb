@@ -711,6 +711,19 @@ menu "AVB Configuration"
             scheduler for a few milliseconds, which a bridge forwarding
             a Class B stream cannot afford.
 
+    config ESP_AVB_STATS_WIFI_AIR
+        bool "Log the Wi-Fi driver's air counters every stats window"
+        default n
+        depends on ESP_AVB && IDF_TARGET_ESP32C6
+        help
+            Diagnostic builds. Every 10 s a station logs one WIFI-AIR
+            line: the frames its radio received, how many of them were
+            retransmissions, receive errors and buffer overruns, and its
+            own best-effort transmissions with their retries, collisions
+            and longest time to completion. Set against an AP's retry
+            counts, it tells interference at the station, other traffic
+            on the channel and a station too busy to receive apart.
+
     config ESP_AVB_PLL_APLL_FINE_SET
         bool "Retune the APLL by its fractional registers only"
         default y
