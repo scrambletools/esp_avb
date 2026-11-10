@@ -4678,6 +4678,16 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->stream_id_mismatch++;
     return;
   }
+  /* Only this stream's data PDUs go on. An ACMP response echoes the stream
+   * ID at the same offset, and its status byte reads as sequence 0: a
+   * bridge that bundled one into the stream made the check below count a
+   * gap both sides of it. Counted with the ID mismatches. */
+  uint8_t pdu_subtype = avtp_data[0] & 0x7F;
+  if ((avtp_data[0] & 0x80) || !(avtp_data[1] & 0x80) ||
+      (pdu_subtype != avtp_subtype_aaf && pdu_subtype != avtp_subtype_61883)) {
+    ctx->stream_id_mismatch++;
+    return;
+  }
 
   /* seq_num gap tracking (avtp_data[2]) and tu-bit (avtp_data[3] bit 0).
    * Both are just volatile counter increments — cheap. lost_frames feeds
