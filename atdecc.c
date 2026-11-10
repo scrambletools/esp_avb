@@ -5500,6 +5500,7 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   // Setting as connected will cause the stream-in handler to start
   stream->connected = true;
   stream->provisional = false; /* authoritative parameters in place */
+  avb_persist_note_stream_id(state, index);
 
   /* SM-driven listener declaration. Initial decl_event is decided by
    * the current talker state — at the moment of CONNECT_TX_RESPONSE

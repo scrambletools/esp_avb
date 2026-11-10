@@ -5915,10 +5915,11 @@ int64_t avb_stream_in_last_rx_us(avb_state_s *state, uint16_t index) {
 #ifdef CONFIG_ESP_AVB_SUPERFAST_CONNECT
 /* Superfast connect: start stream-in provisionally right after NVS
  * restores a binding — before gPTP lock, MSRP/CVU declarations, or
- * ACMP fast-connect complete. The expected stream_id is derived from
- * the persisted talker identity by this stack's MAC+uid convention
- * (a talker using a different convention just means zero matches
- * until the ACMP response corrects it). Playout opens on the prefill
+ * ACMP fast-connect complete. The expected stream_id is the one the
+ * talker last confirmed for this binding, else derived from the
+ * persisted talker identity by this stack's MAC+uid convention (a
+ * wrong guess just means zero matches until the ACMP response
+ * corrects it). Playout opens on the prefill
  * gate and moves onto presentation time once PTP locks — the same
  * gate handoff every normal start already exercises. If the talker
  * is not currently transmitting to us (e.g. gone longer than the
@@ -5931,8 +5932,10 @@ void avb_superfast_connect_start(avb_state_s *state) {
     avb_listener_stream_s *s = &state->input_streams[i];
     if (memcmp(s->talker_id, zero_id, UNIQUE_ID_LEN) == 0)
       continue;
-    stream_id_from_mac((eth_addr_t *)s->talker_id, s->stream_id,
-                       octets_to_uint(s->talker_uid, 2));
+    bool saved_id = avb_persist_saved_stream_id(state, i, s->stream_id);
+    if (!saved_id)
+      stream_id_from_mac((eth_addr_t *)s->talker_id, s->stream_id,
+                         octets_to_uint(s->talker_uid, 2));
     /* Expect our own MAC as DA (unicast transport) until the connect
      * response provides the authoritative one. Keeps GET_RX_STATE
      * honest: connected with non-zero stream_id, dest, and vlan. */
@@ -5944,10 +5947,11 @@ void avb_superfast_connect_start(avb_state_s *state) {
     s->provisional = true;
     if (avb_start_stream_in(state, i) == OK) {
       avbinfo("Superfast: provisional stream-in %u started "
-              "(stream %02x%02x%02x%02x%02x%02x%02x%02x)",
+              "(stream %02x%02x%02x%02x%02x%02x%02x%02x, %s)",
               i, s->stream_id[0], s->stream_id[1], s->stream_id[2],
               s->stream_id[3], s->stream_id[4], s->stream_id[5],
-              s->stream_id[6], s->stream_id[7]);
+              s->stream_id[6], s->stream_id[7],
+              saved_id ? "saved" : "derived");
     } else {
       s->provisional = false;
       s->connected = false;

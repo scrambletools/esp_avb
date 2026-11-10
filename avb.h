@@ -1545,6 +1545,12 @@ void avb_persist_request_save(avb_state_s *state);
  * (the media-clock trim): written with the next save or once streams
  * stop, never by a forced flush, which stalls a talker about 30 ms. */
 void avb_persist_request_lazy_save(avb_state_s *state);
+/* Record the stream ID a talker confirmed for an input binding; saved
+ * lazily. avb_persist_saved_stream_id returns it while the binding still
+ * names the same talker and talker_uid. */
+void avb_persist_note_stream_id(avb_state_s *state, uint16_t index);
+bool avb_persist_saved_stream_id(const avb_state_s *state, uint16_t index,
+                                 uint8_t *stream_id);
 /* Stream-journal persistence: append one 32-byte stream record instead of
  * rewriting the whole persistent blob. Intended for connect/disconnect hot
  * paths where a full NVS blob write is too disruptive. */

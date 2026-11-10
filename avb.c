@@ -2520,6 +2520,8 @@ static void avb_audio_test_run(avb_state_s *state) {
 /* Operating sample rate a stream format last set, as a u32 in Hz. */
 #define AVB_NVS_RATE_KEY "rate"
 #define AVB_NVS_INPUT_MAP_KEY "imap"
+/* Confirmed stream ID of each input binding (avb_persist_stream_id_s[]). */
+#define AVB_NVS_STREAM_IDS_KEY "sids"
 
 /* Helper: true if any byte in an 8-byte array is non-zero.
  * Used to distinguish "never saved" (all zero) from a valid persisted
@@ -2720,6 +2722,94 @@ _Static_assert(sizeof(avb_persist_input_stream_journal_s) == 32,
                "input stream journal record must remain 32 bytes");
 _Static_assert(sizeof(avb_persist_output_stream_journal_s) == 32,
                "output stream journal record must remain 32 bytes");
+
+/* The stream ID a talker last confirmed for each input binding, in its
+ * own key so firmware without it still reads the snapshot. Superfast
+ * connect starts the provisional stream-in on it: the MAC+uid guess
+ * misses a talker that moved its stream to a new ID or numbers its
+ * streams its own way, and RX then waits for the ACMP response. */
+typedef struct {
+  uint8_t talker_id[8];
+  uint8_t talker_uid[2];
+  uint8_t reserved[2];
+  uint8_t stream_id[8];
+} avb_persist_stream_id_s;
+
+static avb_persist_stream_id_s s_stream_ids[AVB_PERSIST_MAX_INPUT_STREAMS];
+static avb_persist_stream_id_s
+    s_stream_ids_written[AVB_PERSIST_MAX_INPUT_STREAMS];
+
+static void avb_persist_load_stream_ids(void) {
+  memset(s_stream_ids, 0, sizeof(s_stream_ids));
+  nvs_handle_t handle;
+  if (nvs_open(AVB_NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+    size_t len = sizeof(s_stream_ids);
+    if (nvs_get_blob(handle, AVB_NVS_STREAM_IDS_KEY, s_stream_ids, &len) !=
+            ESP_OK ||
+        len != sizeof(s_stream_ids))
+      memset(s_stream_ids, 0, sizeof(s_stream_ids));
+    nvs_close(handle);
+  }
+  memcpy(s_stream_ids_written, s_stream_ids, sizeof(s_stream_ids));
+}
+
+/* From the persist task, with a copy taken under the snapshot mutex.
+ * Writes only when a record changed. */
+static void
+avb_persist_write_stream_ids(const avb_persist_stream_id_s *stream_ids) {
+  if (memcmp(stream_ids, s_stream_ids_written, sizeof(s_stream_ids)) == 0)
+    return;
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (err == ESP_OK) {
+    err = nvs_set_blob(handle, AVB_NVS_STREAM_IDS_KEY, stream_ids,
+                       sizeof(s_stream_ids));
+    if (err == ESP_OK)
+      err = nvs_commit(handle);
+    nvs_close(handle);
+  }
+  if (err != ESP_OK) {
+    avberr("NVS: failed to save confirmed stream IDs: %d", err);
+    return;
+  }
+  memcpy(s_stream_ids_written, stream_ids, sizeof(s_stream_ids));
+  avbinfo("NVS: saved confirmed stream IDs");
+}
+
+void avb_persist_note_stream_id(avb_state_s *state, uint16_t index) {
+  if (index >= AVB_PERSIST_MAX_INPUT_STREAMS ||
+      index >= state->num_input_streams)
+    return;
+  const avb_listener_stream_s *stream = &state->input_streams[index];
+  avb_persist_stream_id_s record = {0};
+  memcpy(record.talker_id, stream->talker_id, 8);
+  memcpy(record.talker_uid, stream->talker_uid, 2);
+  memcpy(record.stream_id, stream->stream_id, 8);
+  if (memcmp(&record, &s_stream_ids[index], sizeof(record)) == 0)
+    return;
+  if (state->persist_mutex)
+    xSemaphoreTake(state->persist_mutex, portMAX_DELAY);
+  s_stream_ids[index] = record;
+  if (state->persist_mutex)
+    xSemaphoreGive(state->persist_mutex);
+  /* Lazy: written once no stream runs, never mid-stream. */
+  avb_persist_request_lazy_save(state);
+}
+
+bool avb_persist_saved_stream_id(const avb_state_s *state, uint16_t index,
+                                 uint8_t *stream_id) {
+  if (index >= AVB_PERSIST_MAX_INPUT_STREAMS ||
+      index >= state->num_input_streams)
+    return false;
+  const avb_listener_stream_s *stream = &state->input_streams[index];
+  const avb_persist_stream_id_s *record = &s_stream_ids[index];
+  if (!any_nonzero8(record->stream_id) ||
+      memcmp(record->talker_id, stream->talker_id, 8) != 0 ||
+      memcmp(record->talker_uid, stream->talker_uid, 2) != 0)
+    return false;
+  memcpy(stream_id, record->stream_id, 8);
+  return true;
+}
 
 static bool avb_persist_parse_stream_journal_key(const char *key, bool *input,
                                                  uint16_t *index,
@@ -3399,6 +3489,7 @@ esp_err_t avb_persist_load(avb_state_s *state) {
     nvs_flash_erase();
     err = nvs_flash_init();
   }
+  avb_persist_load_stream_ids();
   if (err != ESP_OK) {
     avberr("NVS: flash init failed: %d", err);
     return err;
@@ -3547,6 +3638,7 @@ void avb_persist_request_lazy_save(avb_state_s *state) {
 void avb_persist_task(void *arg) {
   avb_state_s *state = (avb_state_s *)arg;
   avb_persistent_data_s snapshot;
+  static avb_persist_stream_id_s stream_ids[AVB_PERSIST_MAX_INPUT_STREAMS];
   while (!state->stop) {
     vTaskDelay(pdMS_TO_TICKS(AVB_PERSIST_POLL_MSEC));
     if (!state->persist_dirty)
@@ -3601,8 +3693,10 @@ void avb_persist_task(void *arg) {
     state->persist_dirty = false;
     xSemaphoreTake(state->persist_mutex, portMAX_DELAY);
     memcpy(&snapshot, &state->persist, sizeof(snapshot));
+    memcpy(stream_ids, s_stream_ids, sizeof(stream_ids));
     xSemaphoreGive(state->persist_mutex);
     avb_persist_write_blob(&snapshot);
+    avb_persist_write_stream_ids(stream_ids);
   }
   vTaskDelete(NULL);
 }
