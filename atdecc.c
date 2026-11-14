@@ -19,6 +19,7 @@ _Static_assert(AECP_MAX_AS_PATH_COUNT >= PTP_PATH_TRACE_MAX_CLOCKS + 1,
 _Static_assert(sizeof(aem_stream_desc_s) <= AEM_MAX_DESC_LEN,
                "stream descriptor with every format must fit descriptor_data");
 #include "esp_timer.h" /* connected-listener liveness stamps */
+#include "esp_random.h" /* fast-connect discovery delay */
 #include <stddef.h>    /* offsetof */
 
 static uint16_t
@@ -1384,6 +1385,13 @@ int avb_process_adp(avb_state_s *state, adp_message_s *msg,
                   (state->num_talkers - 1) * sizeof(avb_talker_s));
           state->talkers[state->num_talkers - 1] = talker;
         }
+#ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
+        /* Milan v1.3 §5.5.3.6.9: a listener whose bound talker has just
+         * been discovered probes after a random 0-1 s delay, not on its
+         * next retry, which could be up to 4 s away. */
+        if (state->config.listener)
+          avb_fast_connect_talker_discovered(state, &msg->entity.entity_id);
+#endif
       }
       // if it is already known, then update the mac address and model id if
       // changed
@@ -5636,6 +5644,34 @@ static bool avb_fast_connect_listener(avb_state_s *state, uint16_t index) {
 /* Periodically attempt fast-connect for any listener stream with a
  * saved binding that isn't currently connected. Throttled per-stream
  * by AVB_FAST_CONNECT_RETRY_MSEC. Called from avb_periodic_send. */
+/* A talker just entered the discovery table: schedule each sink bound to
+ * it that still needs confirming to probe within a random 0-1 s
+ * (TMR_DELAY), so not every listener of a returning talker probes at
+ * once. */
+void avb_fast_connect_talker_discovered(avb_state_s *state,
+                                        unique_id_t *talker_id) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    avb_listener_stream_s *stream = &state->input_streams[i];
+    if ((stream->connected && !stream->provisional) ||
+        stream->pending_connection ||
+        memcmp(stream->talker_id, talker_id, UNIQUE_ID_LEN) != 0)
+      continue;
+    uint32_t delay_ms = esp_random() % 1000;
+    struct timespec due = now;
+    due.tv_sec += delay_ms / 1000;
+    due.tv_nsec += (long)(delay_ms % 1000) * 1000000L;
+    if (due.tv_nsec >= 1000000000L) {
+      due.tv_sec++;
+      due.tv_nsec -= 1000000000L;
+    }
+    stream->fast_connect_due = due;
+    avbinfo("ACMP: bound talker discovered, stream_input %u probes in %u ms",
+            i, (unsigned)delay_ms);
+  }
+}
+
 void avb_periodic_fast_connect(avb_state_s *state) {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -5653,15 +5689,21 @@ void avb_periodic_fast_connect(avb_state_s *state) {
     if (memcmp(stream->talker_id, zero_id, UNIQUE_ID_LEN) == 0)
       continue;
 
-    /* Throttle retries. zero-initialized timestamp on boot means the
-     * first attempt fires immediately. */
+    /* A probe due after the talker's discovery goes at its time;
+     * otherwise retries are throttled. A zero-initialized timestamp on
+     * boot means the first attempt fires immediately. */
+    bool due = stream->fast_connect_due.tv_sec != 0 &&
+               (now.tv_sec > stream->fast_connect_due.tv_sec ||
+                (now.tv_sec == stream->fast_connect_due.tv_sec &&
+                 now.tv_nsec >= stream->fast_connect_due.tv_nsec));
     struct timespec delta;
     timespecsub(&now, &stream->last_fast_connect_attempt, &delta);
-    if (stream->last_fast_connect_attempt.tv_sec != 0 &&
+    if (!due && stream->last_fast_connect_attempt.tv_sec != 0 &&
         timespec_to_ms(&delta) < AVB_FAST_CONNECT_RETRY_MSEC)
       continue;
 
     stream->last_fast_connect_attempt = now;
+    stream->fast_connect_due = (struct timespec){0};
     avb_fast_connect_listener(state, i);
   }
 }

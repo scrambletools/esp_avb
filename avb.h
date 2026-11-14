@@ -610,6 +610,10 @@ typedef struct {
    * not persisted. Used by avb_periodic_send to throttle retries when
    * a saved binding is waiting for its talker to come back. */
   struct timespec last_fast_connect_attempt;
+  /* When the bound talker was just discovered: probe at this time
+   * (CLOCK_MONOTONIC), Milan v1.3 §5.5.3.6.9's random 0-1 s TMR_DELAY,
+   * instead of waiting for the retry cadence. Zero when none is due. */
+  struct timespec fast_connect_due;
   /* Superfast connect (Kconfig): stream-in was started provisionally
    * at boot from the NVS binding with a derived stream_id, before
    * ACMP/MSRP completed. Fast-connect keeps probing while set (its
