@@ -4744,6 +4744,34 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
         find_talker_listener_by_entity(stream, msg->listener_entity_id);
   }
 
+  if (disconnect && state->config.milan_compliant) {
+    /* Milan v1.3 §5.5.4.2: a talker only answers DISCONNECT_TX, with the
+     * Table 5.50 fields; whether it streams follows the SRP reservation
+     * (§5.5.4.1). Behind a bridge every downstream listener is merged into
+     * one MSRP row, which an ACMP connect also lands on, so removing the
+     * matched row here could stop the stream for listeners still behind
+     * it. Only the ACMP mark is cleared, and a row ACMP alone created is
+     * dropped. */
+    if (listener_idx != NOT_FOUND) {
+      if (stream->connected_listeners[listener_idx].msrp_ready) {
+        stream->connected_listeners[listener_idx].acmp_connected = false;
+      } else {
+        avb_remove_talker_listener_by_index(stream, listener_idx);
+      }
+      avbinfo("ACMP: listener released stream %d by DISCONNECT_TX "
+              "(count=%u, streaming unchanged)",
+              talker_uid,
+              (unsigned)octets_to_uint(stream->connection_count, 2));
+    }
+    memset(msg->connection_count, 0, 2);
+    memset(msg->flags, 0, 2);
+    memset(msg->stream_id, 0, UNIQUE_ID_LEN);
+    memset(msg->stream_dest_addr, 0, ETH_ADDR_LEN);
+    memset(msg->stream_vlan_id, 0, 2);
+    avb_send_acmp_response(state, tx_response_type, msg, acmp_status_success);
+    return ret;
+  }
+
   if (disconnect) {
     /* ACMP disconnect is authoritative. Remove this listener's ACMP/MSRP state
      * immediately so stale periodic MSRP Ready declarations cannot restart the
@@ -4870,8 +4898,15 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
    * merged Listener) made a DISCONNECT_TX answer 1 with none left, and
    * GET_TX_STATE disagree with CONNECT_TX. */
   uint16_t acmp_count = count_acmp_connected_talker_listeners(stream);
+  /* Milan v1.3 Table 5.48: a PROBE_TX_RESPONSE carries connection_count 0
+   * and REGISTERING_FAILED 0; FAST_CONNECT and STREAMING_WAIT echo the
+   * command. */
+  if (state->config.milan_compliant)
+    acmp_count = 0;
   int_to_octets(&acmp_count, msg->connection_count, 2);
   uint16_t rsp_flags = octets_to_uint(msg->flags, 2);
+  if (state->config.milan_compliant)
+    rsp_flags &= ~0x0040u; /* REGISTERING_FAILED */
   if (stream->stream_info_flags.class_b)
     rsp_flags |= 0x0001u;
   else
