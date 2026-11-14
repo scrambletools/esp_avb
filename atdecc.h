@@ -2061,6 +2061,8 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
 void avb_periodic_fast_connect(avb_state_s *state);
 void avb_fast_connect_talker_discovered(avb_state_s *state,
                                         unique_id_t *talker_id);
+bool avb_playout_delay_control_published(avb_state_s *state);
+void avb_periodic_playout_delay_notify(avb_state_s *state);
 acmp_status_t avb_disconnect_listener(avb_state_s *state,
                                       acmp_message_s *response);
 int avb_get_acmp_timeout_ms(acmp_msg_type_t msg_type);

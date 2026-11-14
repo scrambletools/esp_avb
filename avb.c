@@ -1820,6 +1820,7 @@ static int avb_periodic_send(avb_state_s *state) {
    * under CONFIG_ESP_AVB_DISABLE_FAST_CONNECT for class-selection
    * testing — the auto-rebind otherwise masks controller-driven
    * Class B connections within milliseconds. */
+  avb_periodic_playout_delay_notify(state);
 #ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
   if (state->config.listener) {
     avb_periodic_fast_connect(state);

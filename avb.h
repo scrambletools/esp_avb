@@ -232,6 +232,9 @@ static inline void avb_crf_format_for_rate(uint32_t rate, uint8_t out[8]) {
 #define AEM_MAX_DESC_COUNT 1        // max count of each descriptor in a config
 #define AEM_NUM_CONTROLS 4          // IDENTIFY, Speaker Volume, Mic Gain, Test Tone
 #define AEM_CONTROL_TEST_TONE 3     // control index of the talker's test tone
+/* A listener built with CONFIG_ESP_AVB_PLAYOUT_DELAY_CONTROL publishes one
+ * more CONTROL after these: the audio stream input's playout delay. */
+#define AEM_CONTROL_PLAYOUT_DELAY 4
 #define AEM_MAX_NUM_SAMPLE_RATES 10 // max number of sample rates
 #define AEM_MAX_NUM_FORMATS 35      // 8 ch at 5 rates: AM824 + AAF 32/24 at two cadences and 8/2 channels
 /* The listener's one audio cluster: the two I2S slots it plays, each
@@ -1298,6 +1301,9 @@ void avb_wifi_retx_detail(uint32_t *skipped);
 /* Audio the listener of stream_id holds ahead of its playout, in us;
  * false unless that listener is playing. */
 bool avb_stream_in_buffered_us(const uint8_t *stream_id, int32_t *buffered_us);
+/* How long after presentation time the audio stream input plays at the
+ * codec's analog output, in us; false unless that input is playing. */
+bool avb_stream_in_playout_delay_us(int32_t *delay_us);
 /* Wi-Fi hop retransmission, bridge side: NACKs received, bundles resent,
  * requests too old to resend. */
 void avb_bridge_retx_stats(uint32_t *nacks, uint32_t *retx, uint32_t *stale);

@@ -5165,6 +5165,22 @@ bool avb_stream_in_buffered_us(const uint8_t *stream_id, int32_t *buffered_us) {
   return true;
 }
 
+/* How long after presentation time the audio stream input plays at the
+ * codec's analog output, in us: the configured extra latency (with the
+ * Wi-Fi cushion on a station) plus the latency the lock learned. The
+ * codec's output delay is inside it, since playout aims the analog
+ * output, not the DAC input, at that time. False unless the input is
+ * playing. */
+bool avb_stream_in_playout_delay_us(int32_t *delay_us) {
+  stream_rx_ctx_t *ctx = s_stream_rx_ctx;
+  if (!ctx || !ctx->phase_valid)
+    return false;
+  int64_t delay_ns =
+      (int64_t)stream_in_extra_latency_ns(ctx) + ctx->learned_latency_ns;
+  *delay_us = (int32_t)(delay_ns / 1000);
+  return true;
+}
+
 /* One-shot "first packet received" line: the handler captured the
  * details silently into ctx fields and AVB-STATS prints them within a
  * few hundred ms, so the line's time stamp marks when audio arrived and

@@ -574,6 +574,31 @@ menu "AVB Configuration"
             16 ms. A station then plays this much after wired listeners
             of the same stream.
 
+    config ESP_AVB_PLAYOUT_DELAY_CONTROL
+        bool "Publish the listener's playout delay as a CONTROL"
+        default n
+        depends on ESP_AVB
+        help
+            Adds a read-only CONTROL descriptor (CONTROL_LINEAR_INT32,
+            µs) on a listener: how long after presentation time the
+            audio stream input plays at the codec's analog output.
+            That is the extra latency above, the Wi-Fi cushion on a
+            station and the latency the playout lock learned; the
+            codec's own output delay is already inside it. Controllers
+            registered for unsolicited notifications hear a step of
+            5 ms or more at once, and other changes of 1 ms or more at
+            most once a second. It adds a descriptor, so the entity
+            model ID has to move to its next AEM revision.
+
+    config ESP_AVB_PLAYOUT_DELAY_CONTROL_TYPE
+        string "control_type of the playout delay CONTROL (EUI-64)"
+        default ""
+        depends on ESP_AVB_PLAYOUT_DELAY_CONTROL
+        help
+            The registered EUI-64 that names this control type, as 16
+            hex digits (e.g. 8C1F6436C0xxxxxx). Left empty, the control
+            is not published.
+
     config ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW
         bool "Give a grown Stream Output a new stream ID"
         default y

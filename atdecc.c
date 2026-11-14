@@ -329,6 +329,8 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
     switch (descriptors[i]) {
     case aem_desc_type_control:
       count = AEM_NUM_CONTROLS;
+      if (avb_playout_delay_control_published(state))
+        count++;
       break;
     case aem_desc_type_stream_input:
       /* With listener enabled: AAF/61883 audio input plus CRF input.
@@ -903,9 +905,14 @@ int avb_send_aecp_rsp_read_descr_audio_map(avb_state_s *state,
   return ret;
 }
 
+/* The playout delay CONTROL's control_type and value type, set up with
+ * avb_playout_delay_control_published() below. */
+static uint8_t s_playout_control_type[8];
+static uint16_t playout_delay_value_type(bool known);
+
 /* Send AECP response get descriptor for control message
  * Supports: 0=IDENTIFY, 1=Speaker Volume (listener), 2=Mic Gain (talker),
- * 3=Test Tone (talker)
+ * 3=Test Tone (talker), 4=Playout Delay (listener, when published)
  */
 int avb_send_aecp_rsp_read_descr_control(avb_state_s *state,
                                          aecp_read_descriptor_rsp_s *msg,
@@ -1027,6 +1034,39 @@ int avb_send_aecp_rsp_read_descr_control(avb_state_s *state,
            sizeof(aem_identify_control_value_s));
     break;
   }
+  case AEM_CONTROL_PLAYOUT_DELAY: { /* Playout delay of the audio input */
+    if (!avb_playout_delay_control_published(state)) {
+      avbwarn("Unsupported control descriptor index: %d", index);
+      return OK;
+    }
+    static const char name[] = "Playout Delay";
+    memcpy(descriptor.object_name, name, sizeof(name) - 1);
+    uint16_t no_string = 0xFFFF;
+    int_to_octets(&no_string, descriptor.localized_description, 2);
+    int32_t current = 0;
+    bool known = avb_stream_in_playout_delay_us(&current);
+    uint16_t control_value_type = playout_delay_value_type(known);
+    int_to_octets(&control_value_type, descriptor.control_value_type, 2);
+    memcpy(descriptor.control_type, s_playout_control_type, 8);
+    /* The audio stream input, STREAM_INPUT 0, is what it describes. */
+    uint16_t signal = aem_desc_type_stream_input;
+    int_to_octets(&signal, &descriptor.signal_type, 2);
+    /* value_details for CONTROL_LINEAR_INT32 (§7.3.6.2): minimum,
+     * maximum, step, default and current, 4 octets each, then units and
+     * string_ref. */
+    int32_t minimum = 0, maximum = 1000000, step = 1, preset = 0;
+    uint8_t *v = descriptor.value_details;
+    int_to_octets(&minimum, v + 0, 4);
+    int_to_octets(&maximum, v + 4, 4);
+    int_to_octets(&step, v + 8, 4);
+    int_to_octets(&preset, v + 12, 4);
+    int_to_octets(&current, v + 16, 4);
+    v[20] = 0xFA; /* multiplier -6 */
+    v[21] = 0x08; /* code: SECONDS, so µs */
+    uint16_t value_string_ref = 0xFFFF;
+    int_to_octets(&value_string_ref, v + 22, 2);
+    break;
+  }
   default:
     avbwarn("Unsupported control descriptor index: %d", index);
     return OK;
@@ -1115,6 +1155,11 @@ int avb_process_aecp_cmd_set_control(avb_state_s *state, aecp_message_u *msg,
             values[0] != 0 && !on ? " (talker not streaming)" : "");
     break;
   }
+  case AEM_CONTROL_PLAYOUT_DELAY: /* read only */
+    status = avb_playout_delay_control_published(state)
+                 ? aecp_status_not_supported
+                 : aecp_status_no_such_descriptor;
+    break;
   default:
     status = aecp_status_no_such_descriptor;
     break;
@@ -1195,6 +1240,100 @@ void avb_send_aecp_unsol_control(avb_state_s *state, uint16_t index,
   avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_aem, NULL, NULL);
 }
 
+/* Whether this listener publishes the playout delay CONTROL: built with
+ * it, and given a control_type in Kconfig (parsed once into
+ * s_playout_control_type). */
+bool avb_playout_delay_control_published(avb_state_s *state) {
+#if CONFIG_ESP_AVB_PLAYOUT_DELAY_CONTROL
+  static int parsed = -1; /* -1 unparsed, 0 no type, 1 type set */
+  if (parsed < 0) {
+    const char *hex = CONFIG_ESP_AVB_PLAYOUT_DELAY_CONTROL_TYPE;
+    parsed = 0;
+    if (strlen(hex) == 16) {
+      char *end = NULL;
+      uint64_t type = strtoull(hex, &end, 16);
+      if (end && *end == '\0' && type != 0) {
+        int_to_octets(&type, s_playout_control_type, 8);
+        parsed = 1;
+      }
+    }
+    if (!parsed)
+      avbwarn("Playout delay CONTROL off: control_type '%s' is not 16 hex "
+              "digits",
+              hex);
+  }
+  return parsed == 1 && state->config.listener;
+#else
+  (void)state;
+  return false;
+#endif
+}
+
+/* control_value_type of the playout delay CONTROL (1722.1-2021 §7.3.6.1):
+ * r, read only, is the top bit and u, value unknown, the next; the value
+ * type is CONTROL_LINEAR_INT32 (4). */
+static uint16_t playout_delay_value_type(bool known) {
+  return 0x8000u | (known ? 0 : 0x4000u) | 0x0004u;
+}
+
+/* The playout delay CONTROL's value, reported as an unsolicited
+ * GET_CONTROL response (§7.5.2) to registered controllers. */
+static void send_unsol_playout_delay(avb_state_s *state, int32_t delay_us) {
+  struct __attribute__((packed)) {
+    aecp_aem_short_s aem;
+    uint8_t value[4];
+  } rsp;
+  memset(&rsp, 0, sizeof(rsp));
+  rsp.aem.common.header.subtype = avtp_subtype_aecp;
+  rsp.aem.common.header.msg_type = aecp_msg_type_aem_response;
+  rsp.aem.common.header.status_valtime = aecp_status_success;
+  uint16_t cdl = sizeof(rsp) - AVTP_CDL_PREAMBLE_LEN;
+  rsp.aem.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  rsp.aem.common.header.control_data_len = cdl & 0xFF;
+  memcpy(rsp.aem.common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  rsp.aem.aem.command_type = aecp_cmd_code_get_control;
+  uint16_t descriptor_type = aem_desc_type_control;
+  uint16_t index = AEM_CONTROL_PLAYOUT_DELAY;
+  int_to_octets(&descriptor_type, rsp.aem.descriptor_type, 2);
+  int_to_octets(&index, rsp.aem.descriptor_index, 2);
+  int_to_octets(&delay_us, rsp.value, 4);
+  avb_unsol_notify(state, &rsp, sizeof(rsp), avb_unsol_kind_aem, NULL, NULL);
+}
+
+/* Tell registered controllers when the playout delay moves: a step of
+ * 5 ms or more (an outage moved playout) at once, smaller drift once it
+ * reaches 1 ms, at most once a second. A server cancelling echo follows
+ * the drift itself; it needs to hear about the steps. */
+#define PLAYOUT_NOTIFY_STEP_US 5000
+#define PLAYOUT_NOTIFY_DRIFT_US 1000
+#define PLAYOUT_NOTIFY_MIN_GAP_US 1000000
+void avb_periodic_playout_delay_notify(avb_state_s *state) {
+  static bool reported = false;
+  static int32_t last_us = 0;
+  static int64_t last_sent_us = 0;
+  if (!avb_playout_delay_control_published(state))
+    return;
+  int32_t delay_us = 0;
+  if (!avb_stream_in_playout_delay_us(&delay_us)) {
+    reported = false; /* report afresh once playing again */
+    return;
+  }
+  int64_t now = esp_timer_get_time();
+  int32_t moved = delay_us - last_us;
+  if (moved < 0)
+    moved = -moved;
+  bool send = !reported || moved >= PLAYOUT_NOTIFY_STEP_US ||
+              (moved >= PLAYOUT_NOTIFY_DRIFT_US &&
+               now - last_sent_us >= PLAYOUT_NOTIFY_MIN_GAP_US);
+  if (!send)
+    return;
+  send_unsol_playout_delay(state, delay_us);
+  reported = true;
+  last_us = delay_us;
+  last_sent_us = now;
+}
+
 /* Process AECP GET_CONTROL command (IEEE 1722.1 §7.4.26) */
 int avb_process_aecp_cmd_get_control(avb_state_s *state, aecp_message_u *msg,
                                      eth_addr_t *src_addr) {
@@ -1235,6 +1374,16 @@ int avb_process_aecp_cmd_get_control(avb_state_s *state, aecp_message_u *msg,
     }
     values[0] = state->ctrl_test_tone;
     break;
+  case AEM_CONTROL_PLAYOUT_DELAY: { /* Playout delay, µs */
+    if (!avb_playout_delay_control_published(state)) {
+      status = aecp_status_no_such_descriptor;
+      break;
+    }
+    int32_t delay_us = 0;
+    avb_stream_in_playout_delay_us(&delay_us);
+    int_to_octets(&delay_us, values, 4);
+    break;
+  }
   default:
     status = aecp_status_no_such_descriptor;
     break;
@@ -1246,6 +1395,8 @@ int avb_process_aecp_cmd_get_control(avb_state_s *state, aecp_message_u *msg,
   /* Set control_data_len to include the values field */
   uint16_t values_len =
       (desc_index == 0 || desc_index == AEM_CONTROL_TEST_TONE) ? 1 : 2;
+  if (desc_index == AEM_CONTROL_PLAYOUT_DELAY)
+    values_len = 4;
   uint16_t control_data_len = sizeof(aecp_common_s) +
                               sizeof(aecp_common_aem_s) + 4 + values_len -
                               AVTP_CDL_PREAMBLE_LEN;
