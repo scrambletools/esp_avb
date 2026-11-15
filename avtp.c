@@ -727,6 +727,16 @@ static AVB_TALKER_IRAM_ATTR void mirror_pop(uint8_t *dst, uint32_t len,
   atomic_store_explicit(&s_mirror_tail, tail + take, memory_order_release);
 }
 
+#if CONFIG_ESP_AVB_TALKER_CAPTURE_HOOK
+__attribute__((weak)) void avb_talker_capture_hook(uint8_t *capture,
+                                                   const uint8_t *playout,
+                                                   int frames) {
+  (void)capture;
+  (void)playout;
+  (void)frames;
+}
+#endif
+
 /* Mirror frames to the wire: the playout's left and right slots, bit for
  * bit, on channels 0 and 1, silence on the rest. No mic DSP. */
 static AVB_TALKER_IRAM_ATTR void i2s24_to_aaf_stereo(const uint8_t *in,
@@ -1210,6 +1220,9 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   static avb_src_s s_talker_src;
   /* Codec frames for one packet: one or two more than it carries. */
   static uint8_t src_in_buf[(TALKER_SRC_MAX_SPP + 2) * 8];
+#if CONFIG_ESP_AVB_TALKER_CAPTURE_HOOK
+  static uint8_t capture_ref_buf[(TALKER_SRC_MAX_SPP + 2) * 8];
+#endif
 #if CONFIG_ESP_AVB_TALKER_RESAMPLE
   bool resample = false;
   if (!params->use_sine_wave && spp_max <= TALKER_SRC_MAX_SPP &&
@@ -2140,7 +2153,15 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
 #if CONFIG_ESP_AVB_LISTENER_MIRROR
         /* The playout runs on the codec clock too: it replaces the
          * capture before the conversion. */
+#if CONFIG_ESP_AVB_TALKER_CAPTURE_HOOK
+        /* Echo-cancellation tests: the application gets the capture and
+         * the playout side by side and decides what goes out. */
+        mirror_pop(capture_ref_buf, (uint32_t)this_in_read, mirror_target);
+        avb_talker_capture_hook(src_in_buf, capture_ref_buf,
+                                this_in_read / i2s_frame_bytes_pkt);
+#else
         mirror_pop(src_in_buf, (uint32_t)this_in_read, mirror_target);
+#endif
 #endif
         uint32_t src_start = esp_cpu_get_cycle_count();
         avb_src_run(&s_talker_src, src_in_buf,

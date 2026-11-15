@@ -402,6 +402,20 @@ menu "AVB Configuration"
             replaces it, and codec volume applies after these samples.
             The codec input is not streamed in this build.
 
+    config ESP_AVB_TALKER_CAPTURE_HOOK
+        bool "Talker capture hook with the playout reference (test builds)"
+        default n
+        depends on ESP_AVB_LISTENER_MIRROR && ESP_AVB_TALKER_RESAMPLE
+        help
+            For echo-cancellation tests. Instead of replacing the codec
+            input with the listener's playout, the talker hands the
+            application both, one packet at a time, through
+            avb_talker_capture_hook(): the capture frames (stereo
+            24-in-32, MSB first, codec clock) and the same number of
+            playout frames. The hook may rewrite the capture in place;
+            its left and right slots go out on stream channels 0 and 1.
+            The default hook leaves the capture untouched.
+
     config ESP_AVB_DEFAULT_FORMAT_AM824
         bool "Default stream format AM824 (IEC 61883-6) instead of AAF"
         default n

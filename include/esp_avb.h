@@ -217,6 +217,20 @@ int avb_status(avb_status_s *status);
 int avb_stop();
 
 #undef EXTERN
+#if CONFIG_ESP_AVB_TALKER_CAPTURE_HOOK
+/**
+ * Talker capture hook (CONFIG_ESP_AVB_TALKER_CAPTURE_HOOK, test builds).
+ * Called from the talker task once per packet, before the conversion to
+ * the stream rate, with `frames` capture frames and as many playout
+ * frames from the listener (stereo 24-in-32, MSB first, codec clock;
+ * zeros while the listener is idle). It may rewrite `capture` in place:
+ * its left and right slots go out on stream channels 0 and 1. It must
+ * not block. The default (weak) hook leaves the capture untouched.
+ */
+void avb_talker_capture_hook(uint8_t *capture, const uint8_t *playout,
+                             int frames);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
