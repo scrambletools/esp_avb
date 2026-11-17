@@ -183,6 +183,10 @@ is transparent at L2 and exposes no ATDECC entity of its own.
     - Register Unsolicited Notification
     - Deregister Unsolicited Notification
     - Get Counters
+    - Get Memory Object Length
+    - Start Operation / Abort Operation (memory objects: erase the crash
+      dump; upload, store and store-and-reboot the firmware image)
+  - Address Access (read the memory objects; write the firmware image)
 - Connection Management
   - Connect TX
   - Disconnect TX
@@ -206,3 +210,31 @@ is transparent at L2 and exposes no ATDECC entity of its own.
   - Talker Advertise
   - Talker Failed
   - Listener (Asking Failed / Ready / Ready Failed / Ignore)
+
+### Memory objects
+
+Besides the entity logo, an endpoint serves:
+
+- the console log (`LOG_OBJECT`, `ESP_AVB_LOG_OBJECT`): a 128-byte ASCII
+  header (`AVBLOG1 total= drop= boot= ring= ptp= ms= rst= resets=`), then
+  a RAM ring of the newest log lines, read with Address Access;
+- the last crash's core dump (`CRASH_DUMP`, `ESP_AVB_CRASH_OBJECT`, with
+  ESP-IDF core dumps to flash): the raw image, cleared with Start
+  Operation ERASE;
+- the firmware image (`FIRMWARE_IMAGE`, `ESP_AVB_FIRMWARE_OBJECT`, with
+  two OTA slots): updated the IEEE 1722.1-2021 Annex D way. New firmware
+  keeps itself once gPTP is valid and otherwise rolls back.
+
+### Notes for controllers
+
+- A talker refuses Set Stream Format while its stream is still sent
+  (STREAM_IS_RUNNING). After a Disconnect, its listeners' MSRP
+  declarations take a few seconds to go: wait for "Stream out N stopped"
+  in its log (2 to 5 s) before changing its format.
+- A format change that grows a talker's reservation moves its stream to
+  a new stream ID (`ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW`), so no bridge
+  applies the old, smaller reservation to it. The ID is kept across a
+  reboot.
+- A firmware upload while a stream runs gets STREAM_IS_RUNNING unless
+  the controller holds the entity (Lock or Acquire); the endpoint then
+  stops its streams for the upload.

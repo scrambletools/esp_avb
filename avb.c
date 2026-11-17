@@ -361,6 +361,8 @@ static const eth_addr_t *avb_declared_dest_addr(avb_state_s *state,
  * audio after a reboot reset a Class A stream to the Class B of its
  * frame interval). */
 static uint8_t s_output_class_journaled[AVB_PERSIST_MAX_OUTPUT_STREAMS];
+/* Each output stream's journaled stream ID generation + 1; 0 for none. */
+static uint8_t s_output_gen_journaled[AVB_PERSIST_MAX_OUTPUT_STREAMS];
 
 /* An AAF output's frame interval is its SR class: 250 us of samples per
  * frame is Class B, 125 us is Class A. Talkers advertise from boot,
@@ -488,12 +490,32 @@ static bool avb_output_stream_renew_id(avb_state_s *state, uint16_t index,
             "%02x%02x%02x%02x%02x%02x%02x%02x",
             index, next[0], next[1], next[2], next[3], next[4], next[5],
             next[6], next[7]);
+    /* Kept across a reboot: back on the old ID, the grown stream would
+     * meet the old ID's smaller reservation a bridge still holds. */
+    avb_persist_append_output_stream(state, index);
     return true;
   }
   avbinfo("Stream out %u: reservation grows, no stream ID free yet; "
           "keeping this one",
           index);
   return false;
+}
+
+/* At start: each output stream takes the stream ID generation it last
+ * saved, so a stream that grew comes back on the ID of its grown
+ * reservation, not on one a bridge may still hold a smaller TSpec for. */
+static void avb_output_streams_restore_id_gen(avb_state_s *state) {
+  for (uint16_t i = 0; i < state->num_output_streams; i++) {
+    if (i >= AVB_PERSIST_MAX_OUTPUT_STREAMS || !s_output_gen_journaled[i])
+      continue;
+    avb_talker_stream_s *stream = &state->output_streams[i];
+    uint8_t gen = (uint8_t)((s_output_gen_journaled[i] - 1) %
+                            AVB_STREAM_ID_GENERATIONS);
+    stream->stream_id_gen = gen;
+    stream_id_set_generation(stream->stream_id, gen);
+    if (gen != 0)
+      avbinfo("Stream out %u: stream ID generation %u as last saved", i, gen);
+  }
 }
 #endif
 
@@ -2046,6 +2068,9 @@ static void avb_task(void *task_param) {
   /* A bridge has no stream formats, bindings or levels to keep. */
   avb_persist_load(state);
   avb_output_streams_class_from_format(state);
+#if defined(CONFIG_ESP_AVB_TALKER_NEW_STREAM_ID_ON_GROW)
+  avb_output_streams_restore_id_gen(state);
+#endif
 #endif
 
   /* Codec clock-plan check: arithmetic plus one log line per candidate,
@@ -2725,7 +2750,11 @@ typedef struct {
    * and take the class of the stream's frame interval. */
   uint8_t class_valid;
   uint8_t class_b;
-  uint8_t reserved[18];
+  /* Stream ID generation (avb_talker_stream_s.stream_id_gen); records
+   * written before it existed read id_gen_valid 0, generation 0. */
+  uint8_t id_gen_valid;
+  uint8_t id_gen;
+  uint8_t reserved[16];
 } avb_persist_output_stream_journal_s;
 
 _Static_assert(sizeof(avb_persist_input_stream_journal_s) == 32,
@@ -2867,6 +2896,8 @@ static void avb_persist_fill_output_stream_record(
   dst->stream.presentation_time_offset_ns = src->presentation_time_offset_ns;
   dst->class_valid = 1;
   dst->class_b = src->stream_info_flags.class_b ? 1 : 0;
+  dst->id_gen_valid = 1;
+  dst->id_gen = src->stream_id_gen;
 }
 
 /* Rewrite the stream journal as one latest record per stream and erase
@@ -3257,6 +3288,8 @@ static void avb_persist_replay_stream_journal(avb_state_s *state) {
     state->persist.output_streams[i] = out_rec[i].stream;
     s_output_class_journaled[i] =
         out_rec[i].class_valid ? (out_rec[i].class_b ? 2 : 1) : 0;
+    s_output_gen_journaled[i] =
+        out_rec[i].id_gen_valid ? out_rec[i].id_gen + 1 : 0;
   }
 
   if (replayed || s_persist_journal_seq) {
