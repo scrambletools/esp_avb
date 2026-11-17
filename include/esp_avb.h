@@ -183,6 +183,22 @@ extern "C" {
  */
 int avb_start(avb_config_s *config);
 
+/* Start keeping the console log for ATDECC (CONFIG_ESP_AVB_LOG_OBJECT):
+ * every ESP_LOGx line also goes into a RAM ring that controllers read
+ * as a LOG_OBJECT memory object. Call first thing in app_main so boot
+ * logs are kept; avb_start calls it too. Does nothing when the option
+ * is off. */
+void esp_avb_log_capture_start(void);
+
+/* An app that writes log lines to its console itself (instead of through
+ * stdio) gives esp_avb its writer here, after esp_avb_log_capture_start:
+ * each line is then formatted once, for the log ring and the console.
+ * The writer gets a whole line, ending in '\n'. Lines it can't be given
+ * whole still reach the vprintf that was installed before the capture
+ * started. */
+typedef void (*esp_avb_log_line_writer_t)(const char *line, int length);
+void esp_avb_log_set_line_writer(esp_avb_log_line_writer_t writer);
+
 /* Endpoint link policy (AVB Lite §6 item 9): advertise neither EEE nor
  * PAUSE, and do not act on PAUSE. Call between esp_eth_driver_install
  * and esp_eth_start; restart renegotiates at once if the advertisement

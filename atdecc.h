@@ -92,6 +92,7 @@ typedef enum {
   aecp_cmd_code_get_audio_map = 0x002b,
   aecp_cmd_code_add_audio_mappings = 0x002c,
   aecp_cmd_code_remove_audio_mappings = 0x002d,
+  aecp_cmd_code_get_memory_object_length = 0x0048,
   aecp_cmd_code_get_dynamic_info = 0x004b,
   aecp_cmd_code_set_max_transit_time = 0x004c,
   aecp_cmd_code_get_max_transit_time = 0x004d,
@@ -1167,6 +1168,16 @@ typedef struct {
   uint8_t max_transit_time[8]; // max transit time in nanoseconds (uint64)
 } aecp_max_transit_time_s;     // 36 bytes
 
+/* AECP GET_MEMORY_OBJECT_LENGTH (IEEE 1722.1-2021 command 0x0048)
+ * command and response; the command leaves length zero. */
+typedef struct {
+  aecp_common_s common;
+  aecp_common_aem_s aem;
+  uint8_t configuration_index[2];
+  uint8_t memory_object_index[2];
+  uint8_t length[8];
+} aecp_memory_object_length_s; // 36 bytes
+
 /* AECP get counters response */
 typedef struct {
   aecp_common_s common;
@@ -1467,6 +1478,9 @@ typedef struct {
       clock_sources[AEM_MAX_NUM_CLOCK_SOURCES]; // 2 bytes per clock source
 } aem_clock_domain_desc_s;                      // 92 bytes
 
+/* Largest AECPDU control_data_length (IEEE 1722.1-2021 §9.2.1.1.7). */
+#define AECP_MAX_CONTROL_DATA_LEN 524
+
 /* AECP address access command and response */
 typedef struct {
   aecp_common_s common;
@@ -1672,6 +1686,7 @@ typedef union {
   aecp_get_as_path_s get_as_path;
   aecp_get_as_path_rsp_s get_as_path_rsp;
   aecp_max_transit_time_s max_transit_time;
+  aecp_memory_object_length_s memory_object_length;
   aecp_sampling_rate_s sampling_rate;
   aecp_get_audio_map_s get_audio_map;
   aecp_audio_mappings_s audio_mappings;
@@ -1933,6 +1948,9 @@ int avb_process_aecp_cmd_audio_mappings(avb_state_s *state,
 int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
                                               aecp_message_u *msg,
                                               eth_addr_t *src_addr);
+int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
+                                                  aecp_message_u *msg,
+                                                  eth_addr_t *src_addr);
 int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr);

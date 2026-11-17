@@ -1602,4 +1602,46 @@ void stream_id_from_mac(eth_addr_t *mac_addr, uint8_t *stream_id, size_t uid);
  * in place; false when not one (avbregistry.c). */
 bool avb_registry_translate_entity_id(uint8_t entity_id[8]);
 
+/* avblog.c: the console log as MEMORY_OBJECT 1, type LOG_OBJECT. The
+ * object's addresses start at AVB_LOG_OBJECT_BASE (above the 32-bit
+ * space, so it can't overlap the logo's real address): a 128-byte ASCII
+ * header, then the ring. */
+#define AVB_LOG_OBJECT_INDEX 1
+#define AVB_LOG_OBJECT_BASE 0x100000000ULL
+#define AVB_LOG_HEADER_LEN 128
+#define AVB_LOG_READ_OK 0
+#define AVB_LOG_READ_TOO_HIGH 1
+/* One ADDRESS_ACCESS READ: offset from AVB_LOG_OBJECT_BASE, length, and
+ * where the bytes go. */
+typedef struct {
+  uint64_t offset;
+  uint32_t length;
+  uint8_t *data;
+} avb_log_read_s;
+#if CONFIG_ESP_AVB_LOG_OBJECT
+bool avb_log_object_enabled(void);
+/* Header plus the bytes held: 128 + min(total, ring). */
+uint64_t avb_log_object_length(void);
+uint64_t avb_log_object_max_length(void);
+/* Answers all READs of one command under one lock; ptp_ns is the gPTP
+ * time for the header, 0 while unsynced. AVB_LOG_READ_TOO_HIGH when any
+ * read runs past the object, and then nothing is read. */
+int avb_log_object_read(avb_log_read_s *reads, int count, uint64_t ptp_ns);
+/* Counts one ADDRESS_ACCESS command's cost (cycles, response sent) for
+ * the summary. */
+void avb_log_object_note_command(uint32_t cycles);
+/* Logs a summary of the log object's own cost every 60 s. */
+void avb_log_object_tick(void);
+#else
+static inline bool avb_log_object_enabled(void) { return false; }
+static inline uint64_t avb_log_object_length(void) { return 0; }
+static inline uint64_t avb_log_object_max_length(void) { return 0; }
+static inline int avb_log_object_read(avb_log_read_s *reads, int count,
+                                      uint64_t ptp_ns) {
+  return AVB_LOG_READ_TOO_HIGH;
+}
+static inline void avb_log_object_note_command(uint32_t cycles) {}
+static inline void avb_log_object_tick(void) {}
+#endif
+
 #endif /* _ESP_AVB_AVB_H_ */

@@ -2176,6 +2176,9 @@ static void avb_task(void *task_param) {
     avb_pll_tick(state);
 
 
+    // The console log object's 60 s cost summary.
+    avb_log_object_tick();
+
     // Process status requests
     avb_process_statusreq(state);
   } // while (!state->stop)
@@ -2190,6 +2193,7 @@ err:
 
 /* Start the AVB task */
 int avb_start(avb_config_s *config) {
+  esp_avb_log_capture_start(); /* no-op if the app already started it */
   if (!config->talker && !config->listener) {
     avberr("No talker or listener enabled");
     return ERROR;

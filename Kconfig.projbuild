@@ -116,6 +116,32 @@ menu "AVB Configuration"
             Default off for bridge builds (transparent L2 forwarder has no
             ATDECC entity); default on for endpoints.
 
+    config ESP_AVB_LOG_OBJECT
+        bool "Serve the console log to ATDECC controllers"
+        depends on ESP_AVB_ATDECC
+        default y if IDF_TARGET_ESP32P4
+        default n
+        help
+            Keeps the newest console log lines in a RAM ring and serves
+            them as MEMORY_OBJECT 1 of type LOG_OBJECT (IEEE 1722.1-2021
+            Table 7-19), which a controller reads with ADDRESS_ACCESS, so
+            boards can be followed without a USB console. The object
+            starts with a 128-byte ASCII header ("AVBLOG1 total= drop=
+            boot= ring= ptp= ms="); byte n of the log follows at
+            128 + (n % ring). Nothing is sent unless a controller reads
+            it, and the UART output is unchanged. A LOG-OBJECT line gives
+            its own cost every 60 s.
+
+    config ESP_AVB_LOG_RING_KB
+        int "Console log ring (KB)"
+        depends on ESP_AVB_LOG_OBJECT
+        default 32 if IDF_TARGET_ESP32P4
+        default 12
+        range 4 256
+        help
+            RAM for the newest log lines. At the bench boards' 50-220
+            bytes a second, 32 KB holds several minutes plus a boot.
+
     config ESP_AVB_WIFI_UNICAST_STREAMS
         bool "Deliver AVTP streams over Wi-Fi as unicast"
         default y
