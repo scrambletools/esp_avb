@@ -26,7 +26,9 @@
  * unless the controller holds the entity (LOCK_ENTITY or ACQUIRE_ENTITY):
  * then the board stops its streams itself, in RAM only, and starts them
  * again if the lock goes with no reboot pending.
- * CONFIG_ESP_AVB_FW_UPLOAD_WHILE_STREAMING keeps them running instead.
+ * CONFIG_ESP_AVB_FW_UPLOAD_WHILE_STREAMING keeps them running instead,
+ * unless the app called esp_avb_fw_keep_streams_paused() because its
+ * stream path can't run while the flash is written (it touches PSRAM).
  *
  * New firmware keeps itself once gPTP is valid; if not within 60 s of boot
  * it restarts and the bootloader goes back to the old one.
@@ -53,6 +55,11 @@
 #define FW_WRITE_WAIT_MS 2000   /* a write waiting for the eraser */
 #define FW_VALID_DEADLINE_US (60 * 1000 * 1000LL)
 #define FW_VALID_MIN_US (5 * 1000 * 1000LL)
+#if CONFIG_ESP_AVB_FW_UPLOAD_WHILE_STREAMING
+#define FW_UPLOAD_WHILE_STREAMING true
+#else
+#define FW_UPLOAD_WHILE_STREAMING false
+#endif
 #if CONFIG_SECURE_SIGNED_ON_UPDATE
 #define FW_SIGNATURE_NOTE " or signature"
 #else
@@ -81,6 +88,8 @@ static struct {
   bool reboot_after_store;
   volatile int store_result; /* -1 running, 0 failed, 1 passed */
   bool paused;               /* streams stopped for the upload */
+  bool keep_paused;          /* the app's stream path can't take flash
+                                writes (esp_avb_fw_keep_streams_paused) */
   bool paused_input[AVB_MAX_NUM_INPUT_STREAMS];
   bool pending_verify;       /* this boot runs an image not yet kept */
   int64_t reboot_at_us;
@@ -171,6 +180,12 @@ static void resume_streams(avb_state_s *state) {
 
 bool avb_fw_streams_paused(void) { return s_fw.paused; }
 
+void esp_avb_fw_keep_streams_paused(void) {
+  if (!s_fw.keep_paused)
+    avbinfo("Firmware: uploads pause the streams (the app asked)");
+  s_fw.keep_paused = true;
+}
+
 static void eraser_task(void *arg) {
   /* One sector past the image too: no stale signature sector from the
    * slot's last image may follow the new one. */
@@ -209,13 +224,12 @@ aecp_status_t avb_fw_start_upload(avb_state_s *state, uint64_t length,
     return aecp_status_in_progress;
   if (length < sizeof(esp_image_header_t) || length > s_fw.slot->size)
     return aecp_status_bad_arguments;
-#if !CONFIG_ESP_AVB_FW_UPLOAD_WHILE_STREAMING
-  if (!s_fw.paused && streams_running(state)) {
+  bool pause = !FW_UPLOAD_WHILE_STREAMING || s_fw.keep_paused;
+  if (pause && !s_fw.paused && streams_running(state)) {
     if (!state->locked && !state->acquired)
       return aecp_status_stream_is_running;
     pause_streams(state);
   }
-#endif
   if (s_fw.phase != fw_idle)
     stop_upload(state, "replaced by a new upload");
   s_fw.image_length = (uint32_t)length;
@@ -389,5 +403,9 @@ void avb_fw_tick(avb_state_s *state) {
     resume_streams(state);
   }
 }
+
+#else /* !CONFIG_ESP_AVB_FIRMWARE_OBJECT */
+
+void esp_avb_fw_keep_streams_paused(void) {}
 
 #endif /* CONFIG_ESP_AVB_FIRMWARE_OBJECT */

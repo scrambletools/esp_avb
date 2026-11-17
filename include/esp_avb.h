@@ -199,6 +199,13 @@ void esp_avb_log_capture_start(void);
 typedef void (*esp_avb_log_line_writer_t)(const char *line, int length);
 void esp_avb_log_set_line_writer(esp_avb_log_line_writer_t writer);
 
+/* Firmware updates over ATDECC (CONFIG_ESP_AVB_FIRMWARE_OBJECT): an app
+ * whose stream path can't run while the flash is erased or written (it
+ * touches PSRAM, which faults then) calls this, so an upload always
+ * pauses the streams, whatever CONFIG_ESP_AVB_FW_UPLOAD_WHILE_STREAMING
+ * says. */
+void esp_avb_fw_keep_streams_paused(void);
+
 /* Endpoint link policy (AVB Lite §6 item 9): advertise neither EEE nor
  * PAUSE, and do not act on PAUSE. Call between esp_eth_driver_install
  * and esp_eth_start; restart renegotiates at once if the advertisement

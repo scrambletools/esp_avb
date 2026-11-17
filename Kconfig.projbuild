@@ -189,8 +189,12 @@ menu "AVB Configuration"
             holds the entity (LOCK or ACQUIRE); the board then stops its
             streams for the upload and starts them again if no reboot
             follows. With this, streams keep running while the slot is
-            erased and written, which needs flash auto-suspend to keep
-            the caches on.
+            erased and written. Not safe where the stream path touches
+            PSRAM, which faults while the flash is erased, even with
+            flash auto-suspend on (on esp-mic's AEC build the talker's
+            capture hook did at the first erase). Such an app calls
+            esp_avb_fw_keep_streams_paused(), and its uploads still
+            pause the streams.
 
     config ESP_AVB_WIFI_UNICAST_STREAMS
         bool "Deliver AVTP streams over Wi-Fi as unicast"
