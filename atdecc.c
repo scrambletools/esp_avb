@@ -349,7 +349,7 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
       count = AVB_LOCALIZED_LOCALE_COUNT;
       break;
     case aem_desc_type_memory_object:
-      count = avb_log_object_enabled() ? 2 : 1; /* logo, console log */
+      count = avb_memory_object_count(); /* logo, console log, crash dump */
       break;
     default:
       count = AEM_MAX_DESC_COUNT;
@@ -651,8 +651,8 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   struct timespec ts;
 
   uint16_t index = octets_to_uint(msg->descriptor_index, 2);
-  bool is_log = index == AVB_LOG_OBJECT_INDEX && avb_log_object_enabled();
-  if (index != 0 && !is_log) {
+  avb_memory_object_kind_t kind = avb_memory_object_kind(index);
+  if (kind == avb_memory_object_none) {
     msg->common.header.status_valtime = aecp_status_no_such_descriptor;
     uint16_t cdl = sizeof(aecp_read_descriptor_s) - AVTP_CDL_PREAMBLE_LEN;
     msg->common.header.control_data_len_h = (cdl >> 8) & 0x07;
@@ -664,15 +664,19 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   aem_memory_object_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_memory_object_desc_s));
 
-  if (is_log) {
-    /* Memory object 1: the console log (avblog.c). */
-    static const char name[] = "Console log";
-    memcpy(descriptor.object_name, name, sizeof(name) - 1);
+  if (kind == avb_memory_object_log || kind == avb_memory_object_crash) {
+    /* The console log (avblog.c) or the crash dump (avbcrash.c). */
+    bool is_log = kind == avb_memory_object_log;
+    const char *name = is_log ? "Console log" : "Crash dump";
+    memcpy(descriptor.object_name, name, strlen(name));
     uint16_t no_string = 0xFFFF;
-    uint16_t object_type = aem_memory_obj_type_log_object;
-    uint64_t base = AVB_LOG_OBJECT_BASE;
-    uint64_t length = avb_log_object_length();
-    uint64_t max_length = avb_log_object_max_length();
+    uint16_t object_type = is_log ? aem_memory_obj_type_log_object
+                                  : aem_memory_obj_type_crash_dump;
+    uint64_t base = is_log ? AVB_LOG_OBJECT_BASE : AVB_CRASH_OBJECT_BASE;
+    uint64_t length =
+        is_log ? avb_log_object_length() : avb_crash_object_length();
+    uint64_t max_length =
+        is_log ? avb_log_object_max_length() : avb_crash_object_max_length();
     int_to_octets(&no_string, descriptor.localized_description, 2);
     int_to_octets(&object_type, &descriptor.memory_object_type, 2);
     int_to_octets(&base, descriptor.start_address, 8);
@@ -1805,6 +1809,7 @@ int avb_process_aecp_cmd_get_name(avb_state_s *state, aecp_message_u *msg,
 #define AA_TLV_HEADER_LEN 10
 #define AA_MAX_TLVS 8
 #define AA_MODE_READ 0
+#define AA_MODE_EXECUTE 2
 /* After target_entity_id, before the TLVs: controller_entity_id,
  * sequence_id and tlv_count. */
 #define AA_PREAMBLE_LEN 12
@@ -1817,8 +1822,10 @@ typedef enum {
 } aa_status_t;
 
 /* Process AECP ADDRESS_ACCESS commands: READs of the memory objects, the
- * entity logo (at its real address) and the console log (from
- * AVB_LOG_OBJECT_BASE). A READ TLV may carry no data octets or as many
+ * entity logo (at its real address), the console log (from
+ * AVB_LOG_OBJECT_BASE) and the crash dump (from AVB_CRASH_OBJECT_BASE).
+ * In CONFIG_ESP_AVB_CRASH_TEST builds, a lone EXECUTE TLV at the crash
+ * dump's base address is answered and then aborts the board. A READ TLV may carry no data octets or as many
  * as it asks for (la_avdecc sends zeros); the response carries the data.
  * The log's READs in one command are answered under one lock, so its
  * header and data agree. A failed command comes back as sent, with the
@@ -1867,16 +1874,34 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
   int out_len = 0;
   uintptr_t logo_base = (uintptr_t)state->logo_start;
   uint32_t logo_len = state->logo_length;
+  bool test_crash = false;
   for (int i = 0; i < tlv_count && status == aa_status_success; i++) {
+    uint16_t length = tlvs[i].length;
+    uint64_t address = tlvs[i].address;
+    bool is_crash =
+        avb_crash_object_enabled() && address >= AVB_CRASH_OBJECT_BASE;
+    bool is_log = !is_crash && avb_log_object_enabled() &&
+                  address >= AVB_LOG_OBJECT_BASE;
+#if CONFIG_ESP_AVB_CRASH_TEST
+    if (tlvs[i].mode == AA_MODE_EXECUTE && is_crash &&
+        address == AVB_CRASH_OBJECT_BASE && tlv_count == 1) {
+      test_crash = true; /* answered first, then the abort */
+      memcpy(out, cmd->tlv_data, AA_TLV_HEADER_LEN);
+      out_len = AA_TLV_HEADER_LEN;
+      break;
+    }
+#endif
     if (tlvs[i].mode != AA_MODE_READ) {
       status = aa_status_not_implemented; /* no WRITE or EXECUTE yet */
       break;
     }
-    uint16_t length = tlvs[i].length;
-    uint64_t address = tlvs[i].address;
-    bool is_log =
-        avb_log_object_enabled() && address >= AVB_LOG_OBJECT_BASE;
-    if (!is_log) {
+    if (is_crash) {
+      if (address - AVB_CRASH_OBJECT_BASE + length >
+          avb_crash_object_length()) {
+        status = aa_status_address_too_high;
+        break;
+      }
+    } else if (!is_log) {
       if (address < logo_base) {
         status = aa_status_address_too_low;
         break;
@@ -1898,7 +1923,13 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
     tlv[1] = length & 0xFF;
     int_to_octets(&address, tlv + 2, 8);
     uint8_t *data = tlv + AA_TLV_HEADER_LEN;
-    if (is_log) {
+    if (is_crash) {
+      if (avb_crash_object_read(address - AVB_CRASH_OBJECT_BASE, length,
+                                data) != AVB_LOG_READ_OK) {
+        status = aa_status_address_too_high;
+        break;
+      }
+    } else if (is_log) {
       log_reads[log_count].offset = address - AVB_LOG_OBJECT_BASE;
       log_reads[log_count].length = length;
       log_reads[log_count].data = data;
@@ -1933,6 +1964,14 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
     avberr("send AECP ADDRESS_ACCESS response failed: %d", errno);
   }
   avb_log_object_note_command(esp_cpu_get_cycle_count() - start);
+#if CONFIG_ESP_AVB_CRASH_TEST
+  if (test_crash && status == aa_status_success) {
+    vTaskDelay(pdMS_TO_TICKS(100)); /* let the response go out */
+    avb_crash_object_test_crash();
+  }
+#else
+  (void)test_crash;
+#endif
   return ret;
 }
 
@@ -3992,8 +4031,8 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP GET_MEMORY_OBJECT_LENGTH: the logo's size for memory
- * object 0, the console log's header plus held bytes for object 1. */
+/* Process AECP GET_MEMORY_OBJECT_LENGTH: the logo's size, the console
+ * log's header plus held bytes, or the stored crash dump's size. */
 int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
                                                   aecp_message_u *msg,
                                                   eth_addr_t *src_addr) {
@@ -4002,11 +4041,17 @@ int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
   uint16_t index = octets_to_uint(rsp->memory_object_index, 2);
   aecp_status_t status = aecp_status_success;
   uint64_t length = 0;
-  if (index == 0) {
+  switch (avb_memory_object_kind(index)) {
+  case avb_memory_object_logo:
     length = state->logo_length;
-  } else if (index == AVB_LOG_OBJECT_INDEX && avb_log_object_enabled()) {
+    break;
+  case avb_memory_object_log:
     length = avb_log_object_length();
-  } else {
+    break;
+  case avb_memory_object_crash:
+    length = avb_crash_object_length();
+    break;
+  default:
     status = aecp_status_no_such_descriptor;
   }
   int_to_octets(&length, rsp->length, 8);
@@ -4020,6 +4065,68 @@ int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
                             sizeof(aecp_memory_object_length_s), &ts, src_addr);
   if (ret < 0) {
     avberr("send AECP GET_MEMORY_OBJECT_LENGTH response failed: %d", errno);
+  }
+  return ret;
+}
+
+/* Process AECP START_OPERATION on a memory object. Only ERASE of the crash
+ * dump so far: it is done before the response (one flash sector, ~45 ms),
+ * then OPERATION_STATUS 1000 goes to the registered controllers. */
+int avb_process_aecp_cmd_start_operation(avb_state_s *state,
+                                         aecp_message_u *msg,
+                                         eth_addr_t *src_addr) {
+  static uint16_t s_operation_id;
+  struct timespec ts;
+  aecp_start_operation_s *rsp = &msg->start_operation;
+  uint16_t descriptor_type = octets_to_uint(rsp->descriptor_type, 2);
+  uint16_t index = octets_to_uint(rsp->descriptor_index, 2);
+  uint16_t operation = octets_to_uint(rsp->operation_type, 2);
+  avb_memory_object_kind_t kind = avb_memory_object_kind(index);
+
+  aecp_status_t status = aecp_status_success;
+  if (descriptor_type != aem_desc_type_memory_object ||
+      kind == avb_memory_object_none) {
+    status = aecp_status_no_such_descriptor;
+  } else if (kind != avb_memory_object_crash ||
+             operation != aem_memory_obj_op_type_erase) {
+    status = aecp_status_not_supported;
+  } else if (avb_crash_object_erase() != ESP_OK) {
+    status = aecp_status_entity_misbehaving;
+  }
+  uint16_t operation_id = 0;
+  if (status == aecp_status_success) {
+    if (++s_operation_id == 0)
+      s_operation_id = 1;
+    operation_id = s_operation_id;
+  }
+  int_to_octets(&operation_id, rsp->operation_id, 2);
+  rsp->common.header.msg_type = aecp_msg_type_aem_response;
+  rsp->common.header.status_valtime = (uint8_t)status;
+  int ret = avb_net_send_to(state, ethertype_avtp, rsp, avb_aecp_msg_len(msg),
+                            &ts, src_addr);
+  if (ret < 0) {
+    avberr("send AECP START_OPERATION response failed: %d", errno);
+  }
+
+  if (status == aecp_status_success) {
+    aecp_operation_status_s done;
+    memset(&done, 0, sizeof(done));
+    done.common.header.subtype = avtp_subtype_aecp;
+    done.common.header.msg_type = aecp_msg_type_aem_response;
+    done.common.header.status_valtime = aecp_status_success;
+    uint16_t cdl = sizeof(done) - AVTP_CDL_PREAMBLE_LEN;
+    done.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+    done.common.header.control_data_len = cdl & 0xFF;
+    memcpy(done.common.target_entity_id, state->own_entity.summary.entity_id,
+           UNIQUE_ID_LEN);
+    done.aem.command_type = aecp_cmd_code_operation_status;
+    memcpy(done.descriptor_type, rsp->descriptor_type, 2);
+    memcpy(done.descriptor_index, rsp->descriptor_index, 2);
+    int_to_octets(&operation_id, done.operation_id, 2);
+    uint16_t percent = 1000;
+    int_to_octets(&percent, done.percent_complete, 2);
+    avb_unsol_notify(state, &done, sizeof(done), avb_unsol_kind_aem, NULL,
+                     NULL);
   }
   return ret;
 }
@@ -4332,6 +4439,7 @@ static bool avb_aem_command_changes_state(uint8_t command_type) {
   case aecp_cmd_code_set_max_transit_time:
   case aecp_cmd_code_set_name:
   case aecp_cmd_code_set_control:
+  case aecp_cmd_code_start_operation:
     return true;
   default:
     return false;
@@ -4520,6 +4628,8 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     case aecp_cmd_code_get_memory_object_length:
       return avb_process_aecp_cmd_get_memory_object_length(state, msg,
                                                            src_addr);
+    case aecp_cmd_code_start_operation:
+      return avb_process_aecp_cmd_start_operation(state, msg, src_addr);
     case aecp_cmd_code_set_name:
       return avb_process_aecp_cmd_set_name(state, msg, src_addr);
       break;

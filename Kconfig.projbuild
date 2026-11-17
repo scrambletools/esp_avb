@@ -142,6 +142,28 @@ menu "AVB Configuration"
             RAM for the newest log lines. At the bench boards' 50-220
             bytes a second, 32 KB holds several minutes plus a boot.
 
+    config ESP_AVB_CRASH_OBJECT
+        bool "Serve the last crash dump to ATDECC controllers"
+        depends on ESP_AVB_ATDECC && ESP_COREDUMP_ENABLE_TO_FLASH
+        default y
+        help
+            Serves the ESP-IDF core dump stored in the coredump partition
+            as a CRASH_DUMP memory object (IEEE 1722.1-2021 Table 7-19),
+            read with ADDRESS_ACCESS, so a crash can be examined without a
+            USB console. The bytes are the raw image ESP-IDF stores
+            (esp-coredump info_corefile --core-format raw). Its length is
+            0 when no dump is stored. START_OPERATION ERASE clears it.
+
+    config ESP_AVB_CRASH_TEST
+        bool "Let a controller crash the board (test builds only)"
+        depends on ESP_AVB_CRASH_OBJECT
+        default n
+        help
+            An ADDRESS_ACCESS EXECUTE at the crash dump's base address
+            aborts the board, to try the crash dump path without a USB
+            cable. Anyone on the AVB network could crash it, so leave this
+            off outside the bench.
+
     config ESP_AVB_WIFI_UNICAST_STREAMS
         bool "Deliver AVTP streams over Wi-Fi as unicast"
         default y

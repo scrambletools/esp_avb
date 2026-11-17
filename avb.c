@@ -2194,6 +2194,7 @@ err:
 /* Start the AVB task */
 int avb_start(avb_config_s *config) {
   esp_avb_log_capture_start(); /* no-op if the app already started it */
+  avb_crash_object_init();
   if (!config->talker && !config->listener) {
     avberr("No talker or listener enabled");
     return ERROR;

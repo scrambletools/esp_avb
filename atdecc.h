@@ -92,6 +92,9 @@ typedef enum {
   aecp_cmd_code_get_audio_map = 0x002b,
   aecp_cmd_code_add_audio_mappings = 0x002c,
   aecp_cmd_code_remove_audio_mappings = 0x002d,
+  aecp_cmd_code_start_operation = 0x0034,
+  aecp_cmd_code_abort_operation = 0x0035,
+  aecp_cmd_code_operation_status = 0x0036,
   aecp_cmd_code_get_memory_object_length = 0x0048,
   aecp_cmd_code_get_dynamic_info = 0x004b,
   aecp_cmd_code_set_max_transit_time = 0x004c,
@@ -1178,6 +1181,29 @@ typedef struct {
   uint8_t length[8];
 } aecp_memory_object_length_s; // 36 bytes
 
+/* AECP START_OPERATION command and response (IEEE 1722.1-2021 command
+ * 0x0034); values, which depend on the operation, follow. The response
+ * carries the operation_id the entity gave the operation. */
+typedef struct {
+  aecp_common_s common;
+  aecp_common_aem_s aem;
+  uint8_t descriptor_type[2];
+  uint8_t descriptor_index[2];
+  uint8_t operation_id[2];
+  uint8_t operation_type[2]; // aem_memory_obj_op_type_t for memory objects
+} aecp_start_operation_s;    // 32 bytes
+
+/* AECP OPERATION_STATUS (command 0x0036), an unsolicited response giving
+ * an operation's progress in tenths of a percent (1000: done). */
+typedef struct {
+  aecp_common_s common;
+  aecp_common_aem_s aem;
+  uint8_t descriptor_type[2];
+  uint8_t descriptor_index[2];
+  uint8_t operation_id[2];
+  uint8_t percent_complete[2];
+} aecp_operation_status_s; // 32 bytes
+
 /* AECP get counters response */
 typedef struct {
   aecp_common_s common;
@@ -1687,6 +1713,7 @@ typedef union {
   aecp_get_as_path_rsp_s get_as_path_rsp;
   aecp_max_transit_time_s max_transit_time;
   aecp_memory_object_length_s memory_object_length;
+  aecp_start_operation_s start_operation;
   aecp_sampling_rate_s sampling_rate;
   aecp_get_audio_map_s get_audio_map;
   aecp_audio_mappings_s audio_mappings;
@@ -1951,6 +1978,9 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
 int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
                                                   aecp_message_u *msg,
                                                   eth_addr_t *src_addr);
+int avb_process_aecp_cmd_start_operation(avb_state_s *state,
+                                         aecp_message_u *msg,
+                                         eth_addr_t *src_addr);
 int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr);

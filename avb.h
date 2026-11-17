@@ -1606,7 +1606,6 @@ bool avb_registry_translate_entity_id(uint8_t entity_id[8]);
  * object's addresses start at AVB_LOG_OBJECT_BASE (above the 32-bit
  * space, so it can't overlap the logo's real address): a 128-byte ASCII
  * header, then the ring. */
-#define AVB_LOG_OBJECT_INDEX 1
 #define AVB_LOG_OBJECT_BASE 0x100000000ULL
 #define AVB_LOG_HEADER_LEN 128
 #define AVB_LOG_READ_OK 0
@@ -1643,5 +1642,67 @@ static inline int avb_log_object_read(avb_log_read_s *reads, int count,
 static inline void avb_log_object_note_command(uint32_t cycles) {}
 static inline void avb_log_object_tick(void) {}
 #endif
+
+/* avbcrash.c: the last crash's core dump as a CRASH_DUMP memory object,
+ * from AVB_CRASH_OBJECT_BASE (the raw ESP-IDF core dump image). */
+#define AVB_CRASH_OBJECT_BASE 0x200000000ULL
+#if CONFIG_ESP_AVB_CRASH_OBJECT
+/* Finds the coredump partition and checks for a stored dump; at start. */
+void avb_crash_object_init(void);
+bool avb_crash_object_enabled(void);
+/* The stored dump's size, 0 when there is none. */
+uint64_t avb_crash_object_length(void);
+/* The coredump partition's size. */
+uint64_t avb_crash_object_max_length(void);
+/* AVB_LOG_READ_TOO_HIGH past the stored dump. */
+int avb_crash_object_read(uint64_t offset, uint32_t length, uint8_t *data);
+/* Invalidates the stored dump (START_OPERATION ERASE). */
+esp_err_t avb_crash_object_erase(void);
+#else
+static inline void avb_crash_object_init(void) {}
+static inline bool avb_crash_object_enabled(void) { return false; }
+static inline uint64_t avb_crash_object_length(void) { return 0; }
+static inline uint64_t avb_crash_object_max_length(void) { return 0; }
+static inline int avb_crash_object_read(uint64_t offset, uint32_t length,
+                                        uint8_t *data) {
+  return AVB_LOG_READ_TOO_HIGH;
+}
+static inline esp_err_t avb_crash_object_erase(void) {
+  return ESP_ERR_NOT_SUPPORTED;
+}
+#endif
+#if CONFIG_ESP_AVB_CRASH_TEST
+/* Test builds: an ADDRESS_ACCESS EXECUTE at AVB_CRASH_OBJECT_BASE aborts
+ * the board, so the crash dump path can be tried without a USB cable. */
+void avb_crash_object_test_crash(void);
+#endif
+
+/* Memory objects by descriptor index: 0 is the logo, then the console log
+ * and the crash dump when they are on, in that order. Controllers find
+ * them by memory_object_type. */
+typedef enum {
+  avb_memory_object_none,
+  avb_memory_object_logo,
+  avb_memory_object_log,
+  avb_memory_object_crash,
+} avb_memory_object_kind_t;
+static inline int avb_memory_object_count(void) {
+  return 1 + (avb_log_object_enabled() ? 1 : 0) +
+         (avb_crash_object_enabled() ? 1 : 0);
+}
+static inline avb_memory_object_kind_t
+avb_memory_object_kind(uint16_t index) {
+  if (index == 0)
+    return avb_memory_object_logo;
+  if (avb_log_object_enabled() && index == 1)
+    return avb_memory_object_log;
+  if (avb_crash_object_enabled() &&
+      index == (avb_log_object_enabled() ? 2 : 1))
+    return avb_memory_object_crash;
+  return avb_memory_object_none;
+}
+static inline int avb_crash_object_index(void) {
+  return avb_log_object_enabled() ? 2 : 1;
+}
 
 #endif /* _ESP_AVB_AVB_H_ */

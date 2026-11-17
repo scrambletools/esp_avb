@@ -2,7 +2,9 @@
 #
 # Always-compiled core: avb.c, avbutils.c, avbnet.c, mrp.c, avbstats.c,
 #   avbregistry.c (the Scramble Tools MA-S device addresses), avblog.c
-#   (the console log for ATDECC; a no-op unless ESP_AVB_LOG_OBJECT).
+#   (the console log for ATDECC; a no-op unless ESP_AVB_LOG_OBJECT),
+#   avbcrash.c (the core dump for ATDECC; a no-op unless
+#   ESP_AVB_CRASH_OBJECT).
 #   - mrp.c holds the MRP family (MSRP / MVRP / MAAP) — the generic
 #     MRP state machines (Applicant/Registrar/LeaveAll/timers per
 #     IEEE 802.1Q-2018 §10) plus the MSRP and MVRP application logic
@@ -26,7 +28,8 @@
 #   - atdecc_unsol.c (registered controllers and unsolicited
 #     notifications).
 
-set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c avbregistry.c avblog.c)
+set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c avbregistry.c avblog.c
+    avbcrash.c)
 set(avb_embed "")
 
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)
@@ -42,7 +45,7 @@ endif()
 
 idf_component_register(SRCS ${avb_srcs}
                        REQUIRES esp_eth
-                       PRIV_REQUIRES esp_app_format esp_codec_dev esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
+                       PRIV_REQUIRES esp_app_format esp_codec_dev esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_gpio esp_hal_clock esp_hw_support esp_netif esp_partition esp_timer esp_wifi espcoredump nvs_flash
                        INCLUDE_DIRS "." "./include"
                        EMBED_FILES ${avb_embed})
 
