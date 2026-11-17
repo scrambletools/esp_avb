@@ -1677,32 +1677,80 @@ static inline esp_err_t avb_crash_object_erase(void) {
 void avb_crash_object_test_crash(void);
 #endif
 
-/* Memory objects by descriptor index: 0 is the logo, then the console log
- * and the crash dump when they are on, in that order. Controllers find
- * them by memory_object_type. */
+/* avbfw.c: firmware update over ATDECC (IEEE 1722.1-2021 Annex D) into
+ * the inactive OTA slot, a FIRMWARE_IMAGE memory object from
+ * AVB_FIRMWARE_OBJECT_BASE. */
+#define AVB_FIRMWARE_OBJECT_BASE 0x300000000ULL
+#define AVB_FW_WRITE_OK 0
+#define AVB_FW_WRITE_INVALID 1  /* ADDRESS_INVALID */
+#define AVB_FW_WRITE_TOO_HIGH 2 /* ADDRESS_TOO_HIGH */
+#if CONFIG_ESP_AVB_FIRMWARE_OBJECT
+/* Finds the inactive slot, and whether this boot runs an image not yet
+ * kept; at start. */
+void avb_fw_init(void);
+bool avb_fw_object_enabled(void);
+/* 0, or the stored image's length while it waits for the reboot. */
+uint64_t avb_fw_object_length(void);
+/* The inactive slot's size. */
+uint64_t avb_fw_object_max_length(void);
+/* START_OPERATION UPLOAD, STORE / STORE_AND_REBOOT and ABORT_OPERATION;
+ * op_id receives the new operation's ID. */
+aecp_status_t avb_fw_start_upload(avb_state_s *state, uint64_t length,
+                                  uint16_t *op_id);
+aecp_status_t avb_fw_start_store(avb_state_s *state, bool reboot,
+                                 uint16_t *op_id);
+aecp_status_t avb_fw_abort(avb_state_s *state, uint16_t op_id);
+/* One ADDRESS_ACCESS WRITE at an offset into the image: AVB_FW_WRITE_*. */
+int avb_fw_write(uint64_t offset, const uint8_t *data, uint32_t length);
+/* True while the board's streams are stopped for an upload:
+ * avb_start_stream_in/out then start nothing. */
+bool avb_fw_streams_paused(void);
+/* From the AVB task: keeps or rolls back a new image, finishes a store
+ * (status, reboot), restarts paused streams when the lock goes. */
+void avb_fw_tick(avb_state_s *state);
+#else
+static inline void avb_fw_init(void) {}
+static inline bool avb_fw_object_enabled(void) { return false; }
+static inline uint64_t avb_fw_object_length(void) { return 0; }
+static inline uint64_t avb_fw_object_max_length(void) { return 0; }
+static inline bool avb_fw_streams_paused(void) { return false; }
+static inline void avb_fw_tick(avb_state_s *state) {}
+#endif
+
+/* Memory objects by descriptor index: 0 is the logo, then the console log,
+ * the crash dump and the firmware image when they are on, in that order.
+ * Controllers find them by memory_object_type. */
 typedef enum {
   avb_memory_object_none,
   avb_memory_object_logo,
   avb_memory_object_log,
   avb_memory_object_crash,
+  avb_memory_object_firmware,
 } avb_memory_object_kind_t;
 static inline int avb_memory_object_count(void) {
   return 1 + (avb_log_object_enabled() ? 1 : 0) +
-         (avb_crash_object_enabled() ? 1 : 0);
+         (avb_crash_object_enabled() ? 1 : 0) +
+         (avb_fw_object_enabled() ? 1 : 0);
 }
 static inline avb_memory_object_kind_t
 avb_memory_object_kind(uint16_t index) {
-  if (index == 0)
+  int next = 0;
+  if (index == next++)
     return avb_memory_object_logo;
-  if (avb_log_object_enabled() && index == 1)
+  if (avb_log_object_enabled() && index == next++)
     return avb_memory_object_log;
-  if (avb_crash_object_enabled() &&
-      index == (avb_log_object_enabled() ? 2 : 1))
+  if (avb_crash_object_enabled() && index == next++)
     return avb_memory_object_crash;
+  if (avb_fw_object_enabled() && index == next++)
+    return avb_memory_object_firmware;
   return avb_memory_object_none;
 }
 static inline int avb_crash_object_index(void) {
   return avb_log_object_enabled() ? 2 : 1;
+}
+static inline int avb_fw_object_index(void) {
+  return 1 + (avb_log_object_enabled() ? 1 : 0) +
+         (avb_crash_object_enabled() ? 1 : 0);
 }
 
 #endif /* _ESP_AVB_AVB_H_ */

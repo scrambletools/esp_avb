@@ -1981,6 +1981,13 @@ int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
 int avb_process_aecp_cmd_start_operation(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr);
+int avb_process_aecp_cmd_abort_operation(avb_state_s *state,
+                                         aecp_message_u *msg,
+                                         eth_addr_t *src_addr);
+int avb_send_adp_entity_departing(avb_state_s *state);
+void avb_send_operation_status(avb_state_s *state, uint16_t descriptor_type,
+                               uint16_t descriptor_index, uint16_t operation_id,
+                               uint16_t percent);
 int avb_process_aecp_cmd_get_stream_info(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr);

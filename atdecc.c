@@ -76,6 +76,49 @@ int avb_send_adp_entity_available(avb_state_s *state) {
   return ret;
 }
 
+/* ADP ENTITY_DEPARTING, before a restart, so controllers drop the entity
+ * at once instead of waiting out its valid time. */
+int avb_send_adp_entity_departing(avb_state_s *state) {
+  adp_message_s msg;
+  struct timespec ts;
+  size_t body_size = 56;
+  memset(&msg, 0, sizeof(msg));
+  msg.header.subtype = avtp_subtype_adp;
+  msg.header.msg_type = adp_msg_type_entity_departing;
+  msg.header.status_valtime = 0;
+  msg.header.control_data_len = body_size;
+  memcpy(&msg.entity, &state->own_entity.summary, sizeof(avb_entity_summary_s));
+  int ret = avb_net_send(state, ethertype_avtp, &msg, 4 + body_size + 8, &ts);
+  if (ret < 0)
+    avberr("send ADP Entity Departing failed: %d", errno);
+  return ret;
+}
+
+/* OPERATION_STATUS (IEEE 1722.1-2021 command 0x0036) to the registered
+ * controllers: an operation's progress in tenths of a percent, 1000 when
+ * done, 0 when it failed. */
+void avb_send_operation_status(avb_state_s *state, uint16_t descriptor_type,
+                               uint16_t descriptor_index, uint16_t operation_id,
+                               uint16_t percent) {
+  aecp_operation_status_s status;
+  memset(&status, 0, sizeof(status));
+  status.common.header.subtype = avtp_subtype_aecp;
+  status.common.header.msg_type = aecp_msg_type_aem_response;
+  status.common.header.status_valtime = aecp_status_success;
+  uint16_t cdl = sizeof(status) - AVTP_CDL_PREAMBLE_LEN;
+  status.common.header.control_data_len_h = (cdl >> 8) & 0x07;
+  status.common.header.control_data_len = cdl & 0xFF;
+  memcpy(status.common.target_entity_id, state->own_entity.summary.entity_id,
+         UNIQUE_ID_LEN);
+  status.aem.command_type = aecp_cmd_code_operation_status;
+  int_to_octets(&descriptor_type, status.descriptor_type, 2);
+  int_to_octets(&descriptor_index, status.descriptor_index, 2);
+  int_to_octets(&operation_id, status.operation_id, 2);
+  int_to_octets(&percent, status.percent_complete, 2);
+  avb_unsol_notify(state, &status, sizeof(status), avb_unsol_kind_aem, NULL,
+                   NULL);
+}
+
 int avb_send_aecp_cmd_get_stream_info(avb_state_s *state,
                                       unique_id_t *target_id) {
   aecp_get_stream_info_s msg;
@@ -664,7 +707,23 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   aem_memory_object_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_memory_object_desc_s));
 
-  if (kind == avb_memory_object_log || kind == avb_memory_object_crash) {
+  if (kind == avb_memory_object_firmware) {
+    /* The firmware image: the inactive OTA slot (avbfw.c). */
+    static const char name[] = "Firmware";
+    memcpy(descriptor.object_name, name, sizeof(name) - 1);
+    uint16_t no_string = 0xFFFF;
+    uint16_t object_type = aem_memory_obj_type_firmware_image;
+    uint64_t base = AVB_FIRMWARE_OBJECT_BASE;
+    uint64_t length = avb_fw_object_length();
+    uint64_t max_length = avb_fw_object_max_length();
+    int_to_octets(&no_string, descriptor.localized_description, 2);
+    int_to_octets(&object_type, &descriptor.memory_object_type, 2);
+    int_to_octets(&base, descriptor.start_address, 8);
+    int_to_octets(&length, descriptor.length, 8);
+    int_to_octets(&max_length, descriptor.maximum_length, 8);
+    int_to_octets(&max_length, descriptor.maximum_segment_length, 8);
+  } else if (kind == avb_memory_object_log ||
+             kind == avb_memory_object_crash) {
     /* The console log (avblog.c) or the crash dump (avbcrash.c). */
     bool is_log = kind == avb_memory_object_log;
     const char *name = is_log ? "Console log" : "Crash dump";
@@ -1809,6 +1868,7 @@ int avb_process_aecp_cmd_get_name(avb_state_s *state, aecp_message_u *msg,
 #define AA_TLV_HEADER_LEN 10
 #define AA_MAX_TLVS 8
 #define AA_MODE_READ 0
+#define AA_MODE_WRITE 1
 #define AA_MODE_EXECUTE 2
 /* After target_entity_id, before the TLVs: controller_entity_id,
  * sequence_id and tlv_count. */
@@ -1818,12 +1878,14 @@ typedef enum {
   aa_status_not_implemented = 1,
   aa_status_address_too_low = 2,
   aa_status_address_too_high = 3,
+  aa_status_address_invalid = 4,
   aa_status_tlv_invalid = 5,
 } aa_status_t;
 
 /* Process AECP ADDRESS_ACCESS commands: READs of the memory objects, the
  * entity logo (at its real address), the console log (from
- * AVB_LOG_OBJECT_BASE) and the crash dump (from AVB_CRASH_OBJECT_BASE).
+ * AVB_LOG_OBJECT_BASE), the crash dump (from AVB_CRASH_OBJECT_BASE), and
+ * WRITEs of a firmware image (from AVB_FIRMWARE_OBJECT_BASE, avbfw.c).
  * In CONFIG_ESP_AVB_CRASH_TEST builds, a lone EXECUTE TLV at the crash
  * dump's base address is answered and then aborts the board. A READ TLV may carry no data octets or as many
  * as it asks for (la_avdecc sends zeros); the response carries the data.
@@ -1845,13 +1907,15 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
     uint8_t mode;
     uint16_t length;
     uint64_t address;
+    const uint8_t *data; /* a WRITE's data */
   } tlvs[AA_MAX_TLVS];
+  bool with_data = false;
   if (tlv_count == 0 || tlv_count > AA_MAX_TLVS || area < 0 ||
       area > (int)sizeof(cmd->tlv_data)) {
     status = aa_status_tlv_invalid;
   } else {
     /* READs without data sit 10 octets apart, with data 10 + length. */
-    bool with_data = area != tlv_count * AA_TLV_HEADER_LEN;
+    with_data = area != tlv_count * AA_TLV_HEADER_LEN;
     int pos = 0;
     for (int i = 0; i < tlv_count; i++) {
       if (pos + AA_TLV_HEADER_LEN > area) {
@@ -1862,6 +1926,7 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
       tlvs[i].mode = tlv[0] >> 4;
       tlvs[i].length = ((tlv[0] & 0x0F) << 8) | tlv[1];
       tlvs[i].address = octets_to_uint(tlv + 2, 8);
+      tlvs[i].data = tlv + AA_TLV_HEADER_LEN;
       pos += AA_TLV_HEADER_LEN + (with_data ? tlvs[i].length : 0);
     }
     if (status == aa_status_success && pos != area)
@@ -1878,10 +1943,37 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
   for (int i = 0; i < tlv_count && status == aa_status_success; i++) {
     uint16_t length = tlvs[i].length;
     uint64_t address = tlvs[i].address;
-    bool is_crash =
-        avb_crash_object_enabled() && address >= AVB_CRASH_OBJECT_BASE;
+#if CONFIG_ESP_AVB_FIRMWARE_OBJECT
+    if (avb_fw_object_enabled() && address >= AVB_FIRMWARE_OBJECT_BASE) {
+      /* The firmware image: WRITEs in order, answered with their TLV. */
+      if (tlvs[i].mode != AA_MODE_WRITE || !with_data) {
+        status = aa_status_not_implemented;
+        break;
+      }
+      if (out_len + AA_TLV_HEADER_LEN + length > (int)sizeof(out)) {
+        status = aa_status_tlv_invalid;
+        break;
+      }
+      int written = avb_fw_write(address - AVB_FIRMWARE_OBJECT_BASE,
+                                 tlvs[i].data, length);
+      if (written != AVB_FW_WRITE_OK) {
+        status = written == AVB_FW_WRITE_TOO_HIGH
+                     ? aa_status_address_too_high
+                     : aa_status_address_invalid;
+        break;
+      }
+      memcpy(out + out_len, tlvs[i].data - AA_TLV_HEADER_LEN,
+             AA_TLV_HEADER_LEN + length);
+      out_len += AA_TLV_HEADER_LEN + length;
+      continue;
+    }
+#endif
+    bool is_crash = avb_crash_object_enabled() &&
+                    address >= AVB_CRASH_OBJECT_BASE &&
+                    address < AVB_FIRMWARE_OBJECT_BASE;
     bool is_log = !is_crash && avb_log_object_enabled() &&
-                  address >= AVB_LOG_OBJECT_BASE;
+                  address >= AVB_LOG_OBJECT_BASE &&
+                  address < AVB_CRASH_OBJECT_BASE;
 #if CONFIG_ESP_AVB_CRASH_TEST
     if (tlvs[i].mode == AA_MODE_EXECUTE && is_crash &&
         address == AVB_CRASH_OBJECT_BASE && tlv_count == 1) {
@@ -4032,7 +4124,8 @@ int avb_process_aecp_cmd_get_max_transit_time(avb_state_s *state,
 }
 
 /* Process AECP GET_MEMORY_OBJECT_LENGTH: the logo's size, the console
- * log's header plus held bytes, or the stored crash dump's size. */
+ * log's header plus held bytes, the stored crash dump's size, or a staged
+ * firmware image's size. */
 int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
                                                   aecp_message_u *msg,
                                                   eth_addr_t *src_addr) {
@@ -4050,6 +4143,9 @@ int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
     break;
   case avb_memory_object_crash:
     length = avb_crash_object_length();
+    break;
+  case avb_memory_object_firmware:
+    length = avb_fw_object_length();
     break;
   default:
     status = aecp_status_no_such_descriptor;
@@ -4069,36 +4165,59 @@ int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
   return ret;
 }
 
-/* Process AECP START_OPERATION on a memory object. Only ERASE of the crash
- * dump so far: it is done before the response (one flash sector, ~45 ms),
- * then OPERATION_STATUS 1000 goes to the registered controllers. */
+/* Process AECP START_OPERATION on a memory object: ERASE of the crash dump
+ * (one flash sector, ~45 ms, done before the response, then
+ * OPERATION_STATUS 1000), and UPLOAD, STORE and STORE_AND_REBOOT of the
+ * firmware image (avbfw.c, which reports through OPERATION_STATUS). */
 int avb_process_aecp_cmd_start_operation(avb_state_s *state,
                                          aecp_message_u *msg,
                                          eth_addr_t *src_addr) {
-  static uint16_t s_operation_id;
+  static uint16_t s_erase_op_id;
   struct timespec ts;
   aecp_start_operation_s *rsp = &msg->start_operation;
   uint16_t descriptor_type = octets_to_uint(rsp->descriptor_type, 2);
   uint16_t index = octets_to_uint(rsp->descriptor_index, 2);
   uint16_t operation = octets_to_uint(rsp->operation_type, 2);
   avb_memory_object_kind_t kind = avb_memory_object_kind(index);
+  /* values follow operation_type; UPLOAD's is the image length (u64) */
+  int values_len = (int)avb_aecp_msg_len(msg) - (int)sizeof(*rsp);
+  const uint8_t *values = (const uint8_t *)msg + sizeof(*rsp);
 
   aecp_status_t status = aecp_status_success;
+  uint16_t operation_id = 0;
+  bool erased = false;
   if (descriptor_type != aem_desc_type_memory_object ||
       kind == avb_memory_object_none) {
     status = aecp_status_no_such_descriptor;
-  } else if (kind != avb_memory_object_crash ||
-             operation != aem_memory_obj_op_type_erase) {
+  } else if (kind == avb_memory_object_crash &&
+             operation == aem_memory_obj_op_type_erase) {
+    if (avb_crash_object_erase() != ESP_OK) {
+      status = aecp_status_entity_misbehaving;
+    } else {
+      if (++s_erase_op_id == 0)
+        s_erase_op_id = 1;
+      operation_id = s_erase_op_id;
+      erased = true;
+    }
+#if CONFIG_ESP_AVB_FIRMWARE_OBJECT
+  } else if (kind == avb_memory_object_firmware &&
+             operation == aem_memory_obj_op_type_upload) {
+    if (values_len < 8)
+      status = aecp_status_bad_arguments;
+    else
+      status = avb_fw_start_upload(state, octets_to_uint(values, 8),
+                                   &operation_id);
+  } else if (kind == avb_memory_object_firmware &&
+             (operation == aem_memory_obj_op_type_store ||
+              operation == aem_memory_obj_op_type_store_and_reboot)) {
+    status = avb_fw_start_store(
+        state, operation == aem_memory_obj_op_type_store_and_reboot,
+        &operation_id);
+#endif
+  } else {
     status = aecp_status_not_supported;
-  } else if (avb_crash_object_erase() != ESP_OK) {
-    status = aecp_status_entity_misbehaving;
   }
-  uint16_t operation_id = 0;
-  if (status == aecp_status_success) {
-    if (++s_operation_id == 0)
-      s_operation_id = 1;
-    operation_id = s_operation_id;
-  }
+  (void)values;
   int_to_octets(&operation_id, rsp->operation_id, 2);
   rsp->common.header.msg_type = aecp_msg_type_aem_response;
   rsp->common.header.status_valtime = (uint8_t)status;
@@ -4107,26 +4226,37 @@ int avb_process_aecp_cmd_start_operation(avb_state_s *state,
   if (ret < 0) {
     avberr("send AECP START_OPERATION response failed: %d", errno);
   }
+  if (erased)
+    avb_send_operation_status(state, descriptor_type, index, operation_id,
+                              1000);
+  return ret;
+}
 
-  if (status == aecp_status_success) {
-    aecp_operation_status_s done;
-    memset(&done, 0, sizeof(done));
-    done.common.header.subtype = avtp_subtype_aecp;
-    done.common.header.msg_type = aecp_msg_type_aem_response;
-    done.common.header.status_valtime = aecp_status_success;
-    uint16_t cdl = sizeof(done) - AVTP_CDL_PREAMBLE_LEN;
-    done.common.header.control_data_len_h = (cdl >> 8) & 0x07;
-    done.common.header.control_data_len = cdl & 0xFF;
-    memcpy(done.common.target_entity_id, state->own_entity.summary.entity_id,
-           UNIQUE_ID_LEN);
-    done.aem.command_type = aecp_cmd_code_operation_status;
-    memcpy(done.descriptor_type, rsp->descriptor_type, 2);
-    memcpy(done.descriptor_index, rsp->descriptor_index, 2);
-    int_to_octets(&operation_id, done.operation_id, 2);
-    uint16_t percent = 1000;
-    int_to_octets(&percent, done.percent_complete, 2);
-    avb_unsol_notify(state, &done, sizeof(done), avb_unsol_kind_aem, NULL,
-                     NULL);
+/* Process AECP ABORT_OPERATION (IEEE 1722.1-2021 command 0x0035): a
+ * firmware upload in progress. */
+int avb_process_aecp_cmd_abort_operation(avb_state_s *state,
+                                         aecp_message_u *msg,
+                                         eth_addr_t *src_addr) {
+  struct timespec ts;
+  aecp_start_operation_s *rsp = &msg->start_operation;
+  uint16_t descriptor_type = octets_to_uint(rsp->descriptor_type, 2);
+  uint16_t index = octets_to_uint(rsp->descriptor_index, 2);
+  uint16_t operation_id = octets_to_uint(rsp->operation_id, 2);
+  aecp_status_t status = aecp_status_bad_arguments;
+  if (descriptor_type != aem_desc_type_memory_object ||
+      avb_memory_object_kind(index) == avb_memory_object_none) {
+    status = aecp_status_no_such_descriptor;
+#if CONFIG_ESP_AVB_FIRMWARE_OBJECT
+  } else if (avb_memory_object_kind(index) == avb_memory_object_firmware) {
+    status = avb_fw_abort(state, operation_id);
+#endif
+  }
+  rsp->common.header.msg_type = aecp_msg_type_aem_response;
+  rsp->common.header.status_valtime = (uint8_t)status;
+  int ret = avb_net_send_to(state, ethertype_avtp, rsp, avb_aecp_msg_len(msg),
+                            &ts, src_addr);
+  if (ret < 0) {
+    avberr("send AECP ABORT_OPERATION response failed: %d", errno);
   }
   return ret;
 }
@@ -4440,6 +4570,7 @@ static bool avb_aem_command_changes_state(uint8_t command_type) {
   case aecp_cmd_code_set_name:
   case aecp_cmd_code_set_control:
   case aecp_cmd_code_start_operation:
+  case aecp_cmd_code_abort_operation:
     return true;
   default:
     return false;
@@ -4630,6 +4761,8 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
                                                            src_addr);
     case aecp_cmd_code_start_operation:
       return avb_process_aecp_cmd_start_operation(state, msg, src_addr);
+    case aecp_cmd_code_abort_operation:
+      return avb_process_aecp_cmd_abort_operation(state, msg, src_addr);
     case aecp_cmd_code_set_name:
       return avb_process_aecp_cmd_set_name(state, msg, src_addr);
       break;

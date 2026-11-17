@@ -5815,6 +5815,8 @@ void avb_stream_in_reserve(void) {
  * starts drain timer, registers stream RX handler. */
 int avb_start_stream_in(avb_state_s *state, uint16_t index) {
 
+  if (avb_fw_streams_paused() && index != avb_get_crf_input_index(state))
+    return ERROR; /* stopped for a firmware upload; starts again after */
   if (index == avb_get_crf_input_index(state)) {
     return avb_start_stream_in_crf(state, index);
   }
@@ -6271,6 +6273,8 @@ static int avb_crf_stream_out_start(avb_state_s *state,
  */
 int avb_start_stream_out(avb_state_s *state, uint16_t index) {
 
+  if (avb_fw_streams_paused())
+    return ERROR; /* stopped for a firmware upload; starts again after */
   if (state->output_streams[index].streaming) {
     avberr("Stream out %d is already active", index);
     return ERROR;

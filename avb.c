@@ -2179,6 +2179,9 @@ static void avb_task(void *task_param) {
     // The console log object's 60 s cost summary.
     avb_log_object_tick();
 
+    // Firmware update: keep or roll back a new image, finish a store.
+    avb_fw_tick(state);
+
     // Process status requests
     avb_process_statusreq(state);
   } // while (!state->stop)
@@ -2195,6 +2198,7 @@ err:
 int avb_start(avb_config_s *config) {
   esp_avb_log_capture_start(); /* no-op if the app already started it */
   avb_crash_object_init();
+  avb_fw_init();
   if (!config->talker && !config->listener) {
     avberr("No talker or listener enabled");
     return ERROR;

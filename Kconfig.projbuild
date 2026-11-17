@@ -164,6 +164,34 @@ menu "AVB Configuration"
             cable. Anyone on the AVB network could crash it, so leave this
             off outside the bench.
 
+    config ESP_AVB_FIRMWARE_OBJECT
+        bool "Take firmware updates from ATDECC controllers"
+        depends on ESP_AVB_ATDECC && !ESP_AVB_ROLE_BRIDGE
+        default y
+        help
+            The inactive OTA slot is a FIRMWARE_IMAGE memory object that
+            controllers update the IEEE 1722.1-2021 Annex D way, as Hive
+            does: START_OPERATION UPLOAD, ADDRESS_ACCESS WRITEs, then
+            STORE or STORE_AND_REBOOT. The image's chip and project name
+            and its hash (and signature, in signed builds) are checked
+            before it is set to boot. New firmware keeps itself once gPTP
+            is valid and rolls back if that takes over 60 s (needs app
+            rollback in the bootloader). Needs a partition table with two
+            OTA slots; without one it is off at run time.
+
+    config ESP_AVB_FW_UPLOAD_WHILE_STREAMING
+        bool "Keep streams running during a firmware upload"
+        depends on ESP_AVB_FIRMWARE_OBJECT
+        default n
+        help
+            By default UPLOAD is refused with STREAM_IS_RUNNING while a
+            talker sends or a listener receives, unless the controller
+            holds the entity (LOCK or ACQUIRE); the board then stops its
+            streams for the upload and starts them again if no reboot
+            follows. With this, streams keep running while the slot is
+            erased and written, which needs flash auto-suspend to keep
+            the caches on.
+
     config ESP_AVB_WIFI_UNICAST_STREAMS
         bool "Deliver AVTP streams over Wi-Fi as unicast"
         default y
