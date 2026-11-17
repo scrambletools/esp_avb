@@ -1358,8 +1358,11 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
     char suffix[40];
     int suffix_len = snprintf(suffix, sizeof(suffix), "(esp_avb %s - %s)",
                               ESP_AVB_VERSION, elf_sha);
-    const char *app_version =
-        state->config.firmware_version ? state->config.firmware_version : "";
+    /* Without an explicit version, the app's own (PROJECT_VER: version.txt,
+     * CONFIG_APP_PROJECT_VER or git describe), the one an update carries. */
+    const char *app_version = state->config.firmware_version
+                                  ? state->config.firmware_version
+                                  : esp_app_get_description()->version;
     int room = (int)sizeof(state->own_entity.detail.firmware_version) - 2 -
                suffix_len;
     snprintf((char *)state->own_entity.detail.firmware_version,

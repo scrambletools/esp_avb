@@ -110,7 +110,7 @@
    .vendor_name = "ACME",                                                      \
    .model_name = "AVB Device Model 1",                                         \
    .group_name = "",                                                           \
-   .firmware_version = "1.0.0",                                                \
+   .firmware_version = NULL, /* NULL: the app's own version */                 \
    .serial_number = "12345678",                                                \
    .eth_interface = DEF_ETH_IF,                                                \
    .wifi_interface = NULL,                                                     \
