@@ -12,11 +12,14 @@
  * The object's address space, from AVB_LOG_OBJECT_BASE:
  *   0..127       one ASCII line, the header:
  *                "AVBLOG1 total=%016x drop=%08x boot=%08x ring=%08x
- *                 ptp=%016x ms=%08x" padded with spaces, '\n' at 127
+ *                 ptp=%016x ms=%08x rst=%02x resets=%04x" padded with
+ *                spaces, '\n' at 127
  *   128..128+R   the ring; byte n of the log is at 128 + (n % R)
  * total is the bytes written since boot, drop the lines the hook threw
  * away whole, boot a per-boot ID, ring R, and ptp/ms the gPTP time (0 while
- * unsynced) and the log's ms clock, sampled when a read is answered. The
+ * unsynced) and the log's ms clock, sampled when a read is answered, rst
+ * this boot's esp_reset_reason() and resets the unexpected resets counted
+ * in NVS (avb_log_note_reset). The
  * ring bytes of one command are copied under one lock, together with the
  * total the header reports, so the header and the data agree.
  *
@@ -35,6 +38,75 @@
 #include "sdkconfig.h"
 
 #include "avb.h"
+#include "esp_system.h"
+#include "nvs.h"
+
+static uint8_t s_reset_reason;
+static uint16_t s_unexpected_resets;
+
+static const char *reset_name(esp_reset_reason_t reason) {
+  switch (reason) {
+  case ESP_RST_POWERON: return "POWERON";
+  case ESP_RST_EXT: return "EXT";
+  case ESP_RST_SW: return "SW";
+  case ESP_RST_PANIC: return "PANIC";
+  case ESP_RST_INT_WDT: return "INT_WDT";
+  case ESP_RST_TASK_WDT: return "TASK_WDT";
+  case ESP_RST_WDT: return "WDT";
+  case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+  case ESP_RST_BROWNOUT: return "BROWNOUT";
+  case ESP_RST_SDIO: return "SDIO";
+  case ESP_RST_USB: return "USB";
+  case ESP_RST_JTAG: return "JTAG";
+  case ESP_RST_EFUSE: return "EFUSE";
+  case ESP_RST_PWR_GLITCH: return "PWR_GLITCH";
+  case ESP_RST_CPU_LOCKUP: return "CPU_LOCKUP";
+  default: return "UNKNOWN";
+  }
+}
+
+/* Resets the firmware did not ask for: crashes, watchdogs, power. */
+static bool reset_unexpected(esp_reset_reason_t reason) {
+  switch (reason) {
+  case ESP_RST_PANIC:
+  case ESP_RST_INT_WDT:
+  case ESP_RST_TASK_WDT:
+  case ESP_RST_WDT:
+  case ESP_RST_BROWNOUT:
+  case ESP_RST_PWR_GLITCH:
+  case ESP_RST_CPU_LOCKUP:
+    return true;
+  default:
+    return false;
+  }
+}
+
+void avb_log_note_reset(void) {
+  static bool done;
+  if (done)
+    return;
+  done = true;
+  esp_reset_reason_t reason = esp_reset_reason();
+  s_reset_reason = (uint8_t)reason;
+  uint16_t count = 0;
+  nvs_handle_t handle;
+  if (nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+    nvs_get_u16(handle, "resets", &count);
+    if (reset_unexpected(reason) && count < 0xFFFF) {
+      count++;
+      if (nvs_set_u16(handle, "resets", count) == ESP_OK)
+        nvs_commit(handle);
+    }
+    nvs_close(handle);
+  }
+  s_unexpected_resets = count;
+  if (reset_unexpected(reason))
+    avbwarn("Reset: %s (%d), unexpected resets: %u", reset_name(reason),
+            (int)reason, count);
+  else
+    avbinfo("Reset: %s (%d), unexpected resets: %u", reset_name(reason),
+            (int)reason, count);
+}
 
 #if CONFIG_ESP_AVB_LOG_OBJECT
 
@@ -210,6 +282,10 @@ static void build_header(char *header, uint64_t total, uint64_t ptp_ns,
   out = put_hex(out, ptp_ns, 16);
   out = put_str(out, " ms=");
   out = put_hex(out, ms, 8);
+  out = put_str(out, " rst=");
+  out = put_hex(out, s_reset_reason, 2);
+  out = put_str(out, " resets=");
+  out = put_hex(out, s_unexpected_resets, 4);
   memset(out, ' ', header + AVB_LOG_HEADER_LEN - 1 - out);
   header[AVB_LOG_HEADER_LEN - 1] = '\n';
 }

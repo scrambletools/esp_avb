@@ -1602,6 +1602,14 @@ void stream_id_from_mac(eth_addr_t *mac_addr, uint8_t *stream_id, size_t uid);
  * in place; false when not one (avbregistry.c). */
 bool avb_registry_translate_entity_id(uint8_t entity_id[8]);
 
+/* The NVS namespace esp_avb keeps its settings in. */
+#define AVB_NVS_NAMESPACE "avb"
+
+/* Logs this boot's reset reason and counts unexpected ones (crashes,
+ * watchdogs, power) in NVS; the log object's header carries both. From
+ * avb_start, once NVS is up. */
+void avb_log_note_reset(void);
+
 /* avblog.c: the console log as MEMORY_OBJECT 1, type LOG_OBJECT. The
  * object's addresses start at AVB_LOG_OBJECT_BASE (above the 32-bit
  * space, so it can't overlap the logo's real address): a 128-byte ASCII

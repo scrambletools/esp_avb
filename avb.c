@@ -2197,6 +2197,7 @@ err:
 /* Start the AVB task */
 int avb_start(avb_config_s *config) {
   esp_avb_log_capture_start(); /* no-op if the app already started it */
+  avb_log_note_reset();
   avb_crash_object_init();
   avb_fw_init();
   if (!config->talker && !config->listener) {
@@ -2525,7 +2526,6 @@ static void avb_audio_test_run(avb_state_s *state) {
 
 /* NVS persistent storage */
 
-#define AVB_NVS_NAMESPACE "avb"
 #define AVB_NVS_KEY "persist"
 /* Operating sample rate a stream format last set, as a u32 in Hz. */
 #define AVB_NVS_RATE_KEY "rate"
