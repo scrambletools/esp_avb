@@ -58,8 +58,10 @@ needed.
 Streaming:
 
 - 1 Talker, 1 Listener (run simultaneously on endpoints)
-- Up to 2 channels per stream
-- AAF PCM audio, 24 bit, 48 kHz
+- Up to 8 channels per stream
+- AAF PCM (24-bit samples in 32-bit containers, Milan base formats) and
+  AM824; 44.1, 48, 88.2, 96 and 192 kHz
+- CRF media clock talker and listener
 
 Bridging:
 
@@ -132,17 +134,136 @@ Targets:
 
 Boards:
 
-- Waveshare ESP32-P4-ETH (wired endpoint with onboard ES8311)
-- Waveshare ESP32-P4-WiFi6-PoE-ETH (bridge: P4 host + onboard C6 Wi-Fi)
-- ESP32-C6 dev board (wireless endpoint)
+- Waveshare ESP32-P4-ETH — wired endpoint, with the hat-trik v4 audio
+  hat (ES8389) or the board's onboard ES8311
+- Waveshare ESP32-P4-WIFI6-POE-ETH — bridge (P4 host + onboard C6 Wi-Fi)
+- Waveshare ESP32-C6-LCD-1.69 — wireless endpoint (onboard ES8311)
 
 Network peers:
 
-- MOTU AVB switch
+- MOTU AVB Switch
+- PreSonus AVB switch
 - MOTU 8D AVB endpoint
-- Apple Mac Mini M1 and M4
+- Apple Mac mini M1 and M4
 - Sonnet Thunderbolt AVB Adapter
 - Hive AVB Controller
+- Linux AVB endpoints and controllers (avb-endpointd)
+
+## Milan 1.3 test results
+
+No Avnu certification has been run, and no conformance claim is made.
+These are bench results against the Avnu Milan Specification v1.3,
+with the first esp_avb release that carries each fix. Dates are 2026.
+gPTP timing results (IEEE 802.1AS Annex B) are in the esp_ptp README.
+
+### How it was tested
+
+- **Devices under test:** Waveshare ESP32-P4-ETH wired endpoints with
+  the hat-trik v4 (ES8389) or the onboard ES8311, and Waveshare
+  ESP32-C6-LCD-1.69 Wi-Fi endpoints behind a Waveshare
+  ESP32-P4-WIFI6-POE-ETH bridge. The bridge has no ATDECC entity.
+- **Network:** a MOTU AVB Switch (gPTP BTC and SRP bridge) and,
+  separately, a PreSonus AVB switch.
+- **Controllers:**
+  - Hive;
+  - macOS (Mac mini M4, macOS 26.5);
+  - avb-endpointd on Linux;
+  - a scripted AECP/ACMP controller (`tools/atdecc_controller.py`),
+    including fake controllers for the lock and notification limits.
+- **Peers:** the MOTU 8D, the Mac as talker and listener, and Linux
+  AVB endpoints.
+- **Wire checks:** captures on tapped links for ACMP, AECP and MSRP.
+- **Presentation time:** checked on an oscilloscope. A talker test
+  pulse played through a listener's analog output is compared with the
+  gPTP second pulse of another board.
+
+### ATDECC (AECP/AEM)
+
+| Item | Result | Release |
+| --- | --- | --- |
+| ACQUIRE_ENTITY answers NOT_SUPPORTED (§5.4.2.1); LOCK_ENTITY owner-only, 60 s expiry | verified | 2.36.0 |
+| Unsolicited notifications (§5.4.2.21): 16 registrations, TIME_LIMITED expiry at 300 s, NO_RESOURCES for a 17th, CONTROLLER_AVAILABLE every 30–60 s | verified | 2.36.0–2.37.1 |
+| SET_STREAM_FORMAT: STREAM_IS_RUNNING while bound or streaming (§5.4.2.7), BAD_ARGUMENTS for an unsupported format, the response carries the current format | verified | 2.41.0 |
+| GET/SET_SAMPLING_RATE, START/STOP_STREAMING | verified | 2.43.0–2.44.0 |
+| SET_CONFIGURATION, GET_DYNAMIC_INFO | implemented; SET_CONFIGURATION's success path not exercised | 2.44.0 |
+| STREAM_ID_VALID on stream inputs; GET_COUNTERS | verified | 2.35.3, 2.20.0 |
+| Localized string references | verified with Hive | — |
+| MVU GET_MILAN_INFO | implemented; see gaps | — |
+
+### Connection management (ACMP)
+
+| Item | Result | Release |
+| --- | --- | --- |
+| Fast connect: PROBE_TX within 0–1 s of discovering the talker (§5.5.3.6.9) | verified: +399 ms at boot, +840 ms after the talker came back (11-13) | 2.45.0 |
+| PROBE_TX / CONNECT_TX response: connection_count 0, REGISTERING_FAILED clear (Table 5.48) | verified on the wire | 2.45.0 |
+| DISCONNECT_TX reply-only and zeroed (Table 5.50), never stops a stream that other listeners hold | verified on the wire | 2.45.0 |
+| A probe for the other SR class gets the stream's current class, not TALKER_EXCLUSIVE (§5.5.4.1) | verified | 2.34.1 |
+| GET_TX_STATE connection_count 0 (Table 5.52); GET_TX_CONNECTION NOT_SUPPORTED (§5.5.4.4) | implemented | — |
+| LISTENER_EXCLUSIVE; connect and disconnect with the MOTU 8D | verified | — |
+
+### Stream formats, rates and CRF
+
+| Item | Result |
+| --- | --- |
+| AAF base formats (§6.2): bit depth 32, 6/12/24 samples per frame at 48/96/192 kHz | verified, the Mac as listener at all three rates |
+| CRF (Table 7.1): 48 kHz base, timestamp interval 96, 1 timestamp per PDU | verified; matches the Mac's CRF on the wire |
+| Format, rate, presentation offset and binding kept across a reboot (§5.3.5.1, §5.3.7.1, §5.3.7.6, §5.3.8.2) | verified |
+| Format sweep against Linux AVB endpoints: AAF 32-bit, 24-in-32 and AM824 at 44.1–192 kHz | 23 of 24 wired pairs passed (10-27); 44.1/88.2 kHz 10 of 10 |
+| 44.1 kHz CRF (§7.3.2) | not tested |
+
+### SRP (MSRP/MVRP)
+
+- LeaveAll is handled per attribute type (5 Mac connect cycles with no
+  sequence gaps), and pure-LeaveAll vectors are parsed. With these, the
+  MOTU AVB Switch reserves and prunes correctly.
+- A malformed EndMark that upset the PreSonus switch is fixed.
+- A talker whose reservation grows moves to a new stream ID, so no
+  bridge applies the old, smaller reservation. It plays again within
+  1–3 s (2.41.0), and the ID is kept across a reboot (unreleased,
+  esp_avb main).
+- A listener's declaration change is sent as New (2.37.1).
+- A talker's SR class is kept across a reboot (2.39.0).
+
+### Media clock and presentation time
+
+- Strict presentation time is the default. On the oscilloscope, a
+  hat-trik v4 (ES8389) listener's analog output lands −7 / +9 / −1 µs
+  from the gPTP second at 48 / 96 / 192 kHz (10-29). The onboard
+  ES8311 boards have not been measured.
+- Switching the media clock source to a CRF stream ran clean for
+  12 minutes.
+
+### Interoperability notes
+
+- **Hive:** enumeration and localized names verified. Hive flags a
+  non-zero GET_TX_STATE count as a Milan error; esp_avb reports 0 in
+  Milan mode. Over Wi-Fi, READ_DESCRIPTOR can exceed Hive's 250 ms
+  timeout.
+- **macOS (Mac mini M4, macOS 26.5):** connections made by an external
+  controller work. As a controller the Mac uses LOCK (never ACQUIRE),
+  registers TIME_LIMITED notifications and answers
+  CONTROLLER_AVAILABLE. Two issues are on the Mac's side: clocking a
+  Mac input from CRF stops coreaudiod, and the Mac as a 192 kHz
+  listener plays at a third of the speed.
+- **MOTU 8D:** it decodes every input as AM824, its INPUT_STREAM
+  clocking is unstable, and it refuses SET_SAMPLING_RATE.
+- **PreSonus AVB switch:** full AVB with four endpoints.
+- **MOTU AVB Switch:** gPTP BTC and SRP bridge for the bench. On its
+  own it loses about 40 frames an hour (07-22) and passes about 92 % of
+  a stream sent at MaxIntervalFrames 2 (10-11).
+
+### Known gaps
+
+- macOS sends MVU GET_MILAN_INFO with zero target and controller IDs,
+  and esp_avb's AECP target filter drops it. The Mac then treats the
+  endpoints as plain IEEE 1722.1 entities.
+- After AskingFailed the talker waits 10 s before acting; Milan has no
+  such hold-down.
+- An ACMP connection row stays behind when a listener disappears without
+  DISCONNECT_TX.
+- Listener recovery does not yet use ADP available_index.
+- Wi-Fi endpoints run Class B only. A station listener sets CLASS_B,
+  which Table 5.25 lists as unused; Milan peers are not affected.
 
 ## ATDECC support
 
