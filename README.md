@@ -47,8 +47,9 @@ needed.
   hardware.
 - **bridge (experimental)** — transparent L2 AVB bridge between an Ethernet port and a
   Wi-Fi SoftAP. Forwards AVTP control (ADP/AECP/ACMP/MAAP), MSRP, MVRP,
-  and VLAN-tagged stream frames in both directions. No codec, no own
-  ATDECC entity. Includes FQTSS Credit-Based Shaper and MSRP admission
+  and VLAN-tagged stream frames in both directions. No codec, and no own
+  ATDECC entity unless `ESP_AVB_ATDECC` is set, which adds a maintenance
+  entity (see ATDECC support). Includes FQTSS Credit-Based Shaper and MSRP admission
   control on the egress port (Class B-only on Wi-Fi per the v1 plan;
   Class A reservations propagating to Wi-Fi are rejected with
   `insufficient_bandwidth_for_traffic_class`).
@@ -270,7 +271,13 @@ gPTP timing results (IEEE 802.1AS Annex B) are in the esp_ptp README.
 Note that ATDECC support is limited to functionality that is required
 for an AVB talker and listener. No effort has been made to implement
 functionality that is needed to operate as a controller. The bridge role
-is transparent at L2 and exposes no ATDECC entity of its own.
+is transparent at L2 and exposes no ATDECC entity of its own, unless
+`ESP_AVB_ATDECC` is set (off by default there). It then answers on its
+Ethernet port as a maintenance entity: ADP and AECP with a model of the
+AVB interface, the strings and the memory objects. It has no streams,
+audio, clocks or controls, ignores ACMP, answers Milan MVU with
+NOT_IMPLEMENTED, and refuses other AEM commands with NOT_IMPLEMENTED or
+NO_SUCH_DESCRIPTOR. The ATDECC frames it receives are still forwarded.
 
 - Discovery
     Entity Available
@@ -344,7 +351,18 @@ Besides the entity logo, an endpoint serves:
   Operation ERASE;
 - the firmware image (`FIRMWARE_IMAGE`, `ESP_AVB_FIRMWARE_OBJECT`, with
   two OTA slots): updated the IEEE 1722.1-2021 Annex D way. New firmware
-  keeps itself once gPTP is valid and otherwise rolls back.
+  keeps itself once gPTP is valid and otherwise rolls back;
+- a coprocessor's firmware (a second `FIRMWARE_IMAGE`, named by the app,
+  `ESP_AVB_COPROCESSOR_FW_OBJECT`, needs PSRAM): the app registers how to
+  store and start an image (`esp_avb_register_coprocessor_fw`). The
+  upload goes to PSRAM; STORE or STORE_AND_REBOOT hands it to the app,
+  which writes it to the coprocessor and switches the coprocessor to it,
+  with progress in OPERATION_STATUS, and then the board restarts. A
+  bridge uses it for its Wi-Fi coprocessor (1.2 MB in under 1 s, then
+  about 6 s to store and switch).
+
+The two firmware images have the same memory object type, so a
+controller tells them apart by name ("Firmware" for this chip's).
 
 ### Notes for controllers
 
@@ -358,4 +376,6 @@ Besides the entity logo, an endpoint serves:
   reboot.
 - A firmware upload while a stream runs gets STREAM_IS_RUNNING unless
   the controller holds the entity (Lock or Acquire); the endpoint then
-  stops its streams for the upload.
+  stops its streams for the upload. A coprocessor's firmware upload
+  leaves streams running, since nothing in it writes this chip's flash,
+  but its STORE ends in a restart either way.
