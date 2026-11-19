@@ -2072,11 +2072,30 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
         free(buf);
         return ESP_OK;
       }
-      avb_bridge_forward(d.egress_port, ethertype, buf, len);
-      if (ethertype == 0x22f0)
-        avb_bridge_wifi_control(ingress_port, d.egress_port, buf, len);
-      free(buf);
-      return ESP_OK;
+    {
+      /* The bridge's maintenance entity (ATDECC on a bridge build)
+       * answers on Ethernet: ADP and AECP addressed to it stay here,
+       * multicast ones are forwarded and handled here too. */
+      bool to_entity = false;
+#ifdef CONFIG_ESP_AVB_ATDECC
+      if (ethertype == 0x22f0 && ingress_port == 0 &&
+          len > ETH_HEADER_LEN &&
+          (buf[ETH_HEADER_LEN] == avtp_subtype_adp ||
+           buf[ETH_HEADER_LEN] == avtp_subtype_aecp))
+        to_entity = (buf[0] & 1) ||
+                    memcmp(buf, s_own_mac, ETH_ADDR_LEN) == 0;
+#endif
+      if (!to_entity || (buf[0] & 1)) {
+        avb_bridge_forward(d.egress_port, ethertype, buf, len);
+        if (ethertype == 0x22f0)
+          avb_bridge_wifi_control(ingress_port, d.egress_port, buf, len);
+      }
+      if (!to_entity) {
+        free(buf);
+        return ESP_OK;
+      }
+      break; /* on to the control queue below */
+    }
     case AVB_BRIDGE_TERMINATE:
     default:
       break; /* fall through to existing per-protocol dispatch */

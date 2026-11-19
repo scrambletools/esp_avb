@@ -1235,12 +1235,14 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   }
   entity_caps.aem_supported = true;
   entity_caps.aem_config_index_valid = true;
-  entity_caps.aem_identify_control_index_valid = true;
+  /* A maintenance entity has no controls, so no IDENTIFY. */
+  entity_caps.aem_identify_control_index_valid = AVB_ENTITY_HAS_STREAMS;
   entity_caps.aem_interface_index_valid = true;
   /* vendor_unique_supported signals the Milan MVU protocol. Only advertise
    * it when Milan-compliant mode is enabled so non-Milan controllers (e.g.
    * macOS native AVDECC) don't run Milan-specific validation against us. */
-  entity_caps.vendor_unique_supported = state->config.milan_compliant;
+  entity_caps.vendor_unique_supported =
+      state->config.milan_compliant && AVB_ENTITY_HAS_STREAMS;
   entity_caps.address_access_supported = true;
   memcpy(&state->own_entity.summary.entity_capabilities, &entity_caps,
          sizeof(avb_entity_cap_s));
@@ -1307,7 +1309,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   int_to_octets(&class_b_vlan, state->msrp_mappings[1].vlan_id, 2);
 
   // Set talker sources and capabilities
-  if (config->talker) {
+  if (config->talker && AVB_ENTITY_HAS_STREAMS) {
     uint16_t talker_sources = AVB_MAX_NUM_OUTPUT_STREAMS;
     int_to_octets(&talker_sources,
                   state->own_entity.summary.talker_stream_sources, 2);
@@ -1325,7 +1327,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   // media-clock input rather than an extra audio sink. Only advertise
   // audio_sink when the application is actually configured as an audio
   // listener; a talker-only endpoint may still be a media_clock_sink for CRF.
-  if (config->listener || config->talker) {
+  if ((config->listener || config->talker) && AVB_ENTITY_HAS_STREAMS) {
     uint16_t listener_sinks = config->listener ? AVB_MAX_NUM_INPUT_STREAMS : 1;
     int_to_octets(&listener_sinks,
                   state->own_entity.summary.listener_stream_sinks, 2);
@@ -1840,6 +1842,7 @@ static int avb_periodic_send(avb_state_s *state) {
    * leaving it to time out. */
   avb_process_inflight_timeouts(state);
 
+#if AVB_ENTITY_HAS_STREAMS
   /* Attempt fast-connect for any listener stream with a saved binding
    * that hasn't reconnected yet (self-throttled per-stream). Disabled
    * under CONFIG_ESP_AVB_DISABLE_FAST_CONNECT for class-selection
@@ -1885,6 +1888,7 @@ static int avb_periodic_send(avb_state_s *state) {
     }
   }
 #endif
+#endif /* AVB_ENTITY_HAS_STREAMS */
 #endif /* CONFIG_ESP_AVB_ATDECC */
 
   return OK;
@@ -2173,7 +2177,7 @@ static void avb_task(void *task_param) {
       state->last_ptp_status_update = time_now;
       avb_refresh_link_speed(state);
       avb_update_ptp_status(state);
-#ifdef CONFIG_ESP_AVB_ATDECC
+#if defined(CONFIG_ESP_AVB_ATDECC) && AVB_ENTITY_HAS_STREAMS
       avb_lite_status_tick(state);
 #endif
     }
@@ -2209,6 +2213,7 @@ static void avb_task(void *task_param) {
 
     // Firmware update: keep or roll back a new image, finish a store.
     avb_fw_tick(state);
+    avb_cpfw_tick(state);
 
     // Process status requests
     avb_process_statusreq(state);

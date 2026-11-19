@@ -12,6 +12,7 @@
 #ifndef _ESP_AVB_H_
 #define _ESP_AVB_H_
 
+#include <esp_err.h>
 #include <esp_eth.h>
 #include <stdbool.h>
 #include <time.h>
@@ -205,6 +206,25 @@ void esp_avb_log_set_line_writer(esp_avb_log_line_writer_t writer);
  * pauses the streams, whatever CONFIG_ESP_AVB_FW_UPLOAD_WHILE_STREAMING
  * says. */
 void esp_avb_fw_keep_streams_paused(void);
+
+/* A coprocessor's firmware over ATDECC
+ * (CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT): a second FIRMWARE_IMAGE memory
+ * object, named name, that controllers update the Annex D way. The upload
+ * is kept in PSRAM. At STORE or STORE_AND_REBOOT esp_avb calls store()
+ * from a task of its own with the whole image, then activate() to switch
+ * the coprocessor to it, and reports progress (permille, through
+ * OPERATION_STATUS) and the result. When both passed the entity departs
+ * and the board restarts, for either operation: a coprocessor can only
+ * change images by restarting. Register before avb_start. */
+typedef struct {
+  const char *name;    /* object_name, up to 64 octets */
+  uint32_t max_length; /* largest image accepted */
+  esp_err_t (*store)(const uint8_t *image, uint32_t length,
+                     void (*progress)(uint16_t permille), void *context);
+  esp_err_t (*activate)(void *context);
+  void *context;
+} esp_avb_coprocessor_fw_t;
+esp_err_t esp_avb_register_coprocessor_fw(const esp_avb_coprocessor_fw_t *fw);
 
 /* Endpoint link policy (AVB Lite §6 item 9): advertise neither EEE nor
  * PAUSE, and do not act on PAUSE. Call between esp_eth_driver_install

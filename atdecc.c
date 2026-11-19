@@ -34,7 +34,11 @@ int atdecc_dispatch_avtp_rx(avb_state_s *state, avtp_msgbuf_u *msg,
   case avtp_subtype_aecp:
     return avb_process_aecp(state, &msg->aecp, src_addr);
   case avtp_subtype_acmp:
+#if AVB_ENTITY_HAS_STREAMS
     return avb_process_acmp(state, &msg->acmp);
+#else
+    return OK; /* no streams to connect */
+#endif
   default:
     return OK; /* not an ATDECC subtype — caller's default-case handles log */
   }
@@ -350,6 +354,12 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
    */
   uint16_t descriptors[AEM_MAX_NUM_DESC];
   int i = 0;
+#if !AVB_ENTITY_HAS_STREAMS
+  /* A maintenance entity: no audio, streams, clocks or controls. */
+  descriptors[i++] = aem_desc_type_avb_interface;
+  descriptors[i++] = aem_desc_type_memory_object;
+  descriptors[i++] = aem_desc_type_locale;
+#else
   descriptors[i++] = aem_desc_type_audio_unit;
   if (state->num_input_streams > 0) {
     descriptors[i++] = aem_desc_type_stream_input;
@@ -363,6 +373,7 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
   descriptors[i++] = aem_desc_type_locale;
   descriptors[i++] = aem_desc_type_control;
   descriptors[i++] = aem_desc_type_clock_domain;
+#endif
   uint16_t descriptor_counts_count = i;
 
   // build the descriptor
@@ -707,15 +718,32 @@ int avb_send_aecp_rsp_read_descr_memory_obj(avb_state_s *state,
   aem_memory_object_desc_s descriptor;
   memset(&descriptor, 0, sizeof(aem_memory_object_desc_s));
 
-  if (kind == avb_memory_object_firmware) {
-    /* The firmware image: the inactive OTA slot (avbfw.c). */
-    static const char name[] = "Firmware";
-    memcpy(descriptor.object_name, name, sizeof(name) - 1);
+  if (kind == avb_memory_object_firmware ||
+      kind == avb_memory_object_coprocessor_firmware) {
+    /* The firmware image: the inactive OTA slot (avbfw.c), or the
+     * coprocessor's, staged in PSRAM (avbcpfw.c). */
+    bool own = kind == avb_memory_object_firmware;
+    const char *name = "Firmware";
+    uint64_t base = AVB_FIRMWARE_OBJECT_BASE;
+    uint64_t length = 0, max_length = 0;
+    if (own) {
+      length = avb_fw_object_length();
+      max_length = avb_fw_object_max_length();
+    }
+#if CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+    if (!own) {
+      name = avb_cpfw_object_name();
+      base = AVB_COPROCESSOR_FW_OBJECT_BASE;
+      length = avb_cpfw_object_length();
+      max_length = avb_cpfw_object_max_length();
+    }
+#endif
+    size_t name_length = strlen(name);
+    if (name_length > sizeof(descriptor.object_name))
+      name_length = sizeof(descriptor.object_name);
+    memcpy(descriptor.object_name, name, name_length);
     uint16_t no_string = 0xFFFF;
     uint16_t object_type = aem_memory_obj_type_firmware_image;
-    uint64_t base = AVB_FIRMWARE_OBJECT_BASE;
-    uint64_t length = avb_fw_object_length();
-    uint64_t max_length = avb_fw_object_max_length();
     int_to_octets(&no_string, descriptor.localized_description, 2);
     int_to_octets(&object_type, &descriptor.memory_object_type, 2);
     int_to_octets(&base, descriptor.start_address, 8);
@@ -1943,9 +1971,14 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
   for (int i = 0; i < tlv_count && status == aa_status_success; i++) {
     uint16_t length = tlvs[i].length;
     uint64_t address = tlvs[i].address;
-#if CONFIG_ESP_AVB_FIRMWARE_OBJECT
-    if (avb_fw_object_enabled() && address >= AVB_FIRMWARE_OBJECT_BASE) {
-      /* The firmware image: WRITEs in order, answered with their TLV. */
+#if CONFIG_ESP_AVB_FIRMWARE_OBJECT || CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+    bool to_cpfw = avb_cpfw_object_enabled() &&
+                   address >= AVB_COPROCESSOR_FW_OBJECT_BASE;
+    bool to_fw = !to_cpfw && avb_fw_object_enabled() &&
+                 address >= AVB_FIRMWARE_OBJECT_BASE &&
+                 address < AVB_COPROCESSOR_FW_OBJECT_BASE;
+    if (to_fw || to_cpfw) {
+      /* A firmware image: WRITEs in order, answered with their TLV. */
       if (tlvs[i].mode != AA_MODE_WRITE || !with_data) {
         status = aa_status_not_implemented;
         break;
@@ -1954,8 +1987,17 @@ int avb_process_aecp_addr_access(avb_state_s *state, aecp_message_u *msg,
         status = aa_status_tlv_invalid;
         break;
       }
-      int written = avb_fw_write(address - AVB_FIRMWARE_OBJECT_BASE,
+      int written = AVB_FW_WRITE_INVALID;
+#if CONFIG_ESP_AVB_FIRMWARE_OBJECT
+      if (to_fw)
+        written = avb_fw_write(address - AVB_FIRMWARE_OBJECT_BASE,
+                               tlvs[i].data, length);
+#endif
+#if CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+      if (to_cpfw)
+        written = avb_cpfw_write(address - AVB_COPROCESSOR_FW_OBJECT_BASE,
                                  tlvs[i].data, length);
+#endif
       if (written != AVB_FW_WRITE_OK) {
         status = written == AVB_FW_WRITE_TOO_HIGH
                      ? aa_status_address_too_high
@@ -4147,6 +4189,11 @@ int avb_process_aecp_cmd_get_memory_object_length(avb_state_s *state,
   case avb_memory_object_firmware:
     length = avb_fw_object_length();
     break;
+#if CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+  case avb_memory_object_coprocessor_firmware:
+    length = avb_cpfw_object_length();
+    break;
+#endif
   default:
     status = aecp_status_no_such_descriptor;
   }
@@ -4214,10 +4261,24 @@ int avb_process_aecp_cmd_start_operation(avb_state_s *state,
         state, operation == aem_memory_obj_op_type_store_and_reboot,
         &operation_id);
 #endif
+#if CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+  } else if (kind == avb_memory_object_coprocessor_firmware &&
+             operation == aem_memory_obj_op_type_upload) {
+    if (values_len < 8)
+      status = aecp_status_bad_arguments;
+    else
+      status = avb_cpfw_start_upload(state, octets_to_uint(values, 8),
+                                     &operation_id);
+  } else if (kind == avb_memory_object_coprocessor_firmware &&
+             (operation == aem_memory_obj_op_type_store ||
+              operation == aem_memory_obj_op_type_store_and_reboot)) {
+    status = avb_cpfw_start_store(state, &operation_id);
+#endif
   } else {
     status = aecp_status_not_supported;
   }
   (void)values;
+  (void)values_len;
   int_to_octets(&operation_id, rsp->operation_id, 2);
   rsp->common.header.msg_type = aecp_msg_type_aem_response;
   rsp->common.header.status_valtime = (uint8_t)status;
@@ -4250,7 +4311,13 @@ int avb_process_aecp_cmd_abort_operation(avb_state_s *state,
   } else if (avb_memory_object_kind(index) == avb_memory_object_firmware) {
     status = avb_fw_abort(state, operation_id);
 #endif
+#if CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+  } else if (avb_memory_object_kind(index) ==
+             avb_memory_object_coprocessor_firmware) {
+    status = avb_cpfw_abort(state, operation_id);
+#endif
   }
+  (void)operation_id;
   rsp->common.header.msg_type = aecp_msg_type_aem_response;
   rsp->common.header.status_valtime = (uint8_t)status;
   int ret = avb_net_send_to(state, ethertype_avtp, rsp, avb_aecp_msg_len(msg),
@@ -4554,6 +4621,50 @@ int avb_process_aecp_rsp_get_counters(avb_state_s *state, aecp_message_u *msg) {
   return OK;
 }
 
+#if !AVB_ENTITY_HAS_STREAMS
+/* A maintenance entity serves discovery, locking, notifications, the
+ * descriptors of its model, the AVB interface and the memory objects:
+ * SUCCESS for a command it takes, else the status to refuse it with. */
+static aecp_status_t avb_maintenance_entity_refuses(aecp_message_u *msg) {
+  switch (msg->basic.aem.command_type) {
+  case aecp_cmd_code_register_unsol_notif:
+  case aecp_cmd_code_deregister_unsol_notif:
+  case aecp_cmd_code_acquire_entity:
+  case aecp_cmd_code_lock_entity:
+  case aecp_cmd_code_entity_available:
+  case aecp_cmd_code_get_configuration:
+  case aecp_cmd_code_get_avb_info:
+  case aecp_cmd_code_get_as_path:
+  case aecp_cmd_code_get_memory_object_length:
+  case aecp_cmd_code_start_operation:
+  case aecp_cmd_code_abort_operation:
+    return aecp_status_success;
+  case aecp_cmd_code_read_descriptor:
+    switch (octets_to_uint(msg->read_descriptor.descriptor_type, 2)) {
+    case aem_desc_type_entity:
+    case aem_desc_type_configuration:
+    case aem_desc_type_avb_interface:
+    case aem_desc_type_memory_object:
+    case aem_desc_type_locale:
+    case aem_desc_type_strings:
+      return aecp_status_success;
+    default:
+      return aecp_status_no_such_descriptor;
+    }
+  case aecp_cmd_code_get_counters:
+    switch (octets_to_uint(msg->get_counters.descriptor_type, 2)) {
+    case aem_desc_type_entity:
+    case aem_desc_type_avb_interface:
+      return aecp_status_success;
+    default:
+      return aecp_status_no_such_descriptor;
+    }
+  default:
+    return aecp_status_not_implemented;
+  }
+}
+#endif
+
 /* AEM commands that change the entity, refused to a controller other
  * than the one holding the lock or acquisition (IEEE 1722.1-2021 §7.4.2). */
 static bool avb_aem_command_changes_state(uint8_t command_type) {
@@ -4626,6 +4737,22 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
     return avb_process_aecp_addr_access(state, msg, src_addr);
   }
 
+#if !AVB_ENTITY_HAS_STREAMS
+  /* A maintenance entity: Milan MVU commands get NOT_IMPLEMENTED, the
+   * AVB Lite and AVB Wireless ones nothing, as before it was an entity. */
+  if (msg->header.msg_type == aecp_msg_type_vendor_unique_command) {
+    aecp_mvu_common_s *mvu = (aecp_mvu_common_s *)msg;
+    uint8_t mvu_pid[] = MVU_PROTOCOL_ID;
+    if (memcmp(mvu->protocol_id, mvu_pid, 6) != 0)
+      return OK;
+    uint16_t cdl = (mvu->common.header.control_data_len_h << 8) |
+                   mvu->common.header.control_data_len;
+    return avb_send_mvu_response(state, msg, src_addr,
+                                 AVTP_CDL_PREAMBLE_LEN + cdl,
+                                 aecp_status_not_implemented);
+  }
+#endif
+
   /* Process AVB Lite CVU / Milan MVU Vendor Unique commands */
   if (msg->header.msg_type == aecp_msg_type_vendor_unique_command) {
     aecp_cvu_common_s *cvu = (aecp_cvu_common_s *)msg;
@@ -4683,6 +4810,11 @@ int avb_process_aecp(avb_state_s *state, aecp_message_u *msg,
 
   /* Process AECP AEM commands */
   if (msg->header.msg_type == aecp_msg_type_aem_command) {
+#if !AVB_ENTITY_HAS_STREAMS
+    aecp_status_t refused = avb_maintenance_entity_refuses(msg);
+    if (refused != aecp_status_success)
+      return avb_reflect_aem_command(state, msg, src_addr, refused);
+#endif
     if (avb_aem_command_changes_state(msg->basic.aem.command_type) &&
         avb_acquired_or_locked_by_other(state,
                                         &msg->common.controller_entity_id)) {

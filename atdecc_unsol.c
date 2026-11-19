@@ -426,12 +426,14 @@ void avb_unsol_tick(avb_state_s *state) {
   avb_unsol_lock_tick(state, now_us);
   if (now_us >= s_async_due_us) {
     s_async_due_us = now_us + UNSOL_ASYNC_PERIOD_US;
-    avb_unsol_stream_info_tick(state);
     avb_unsol_avb_info_tick(state);
+    if (!AVB_ENTITY_HAS_STREAMS)
+      return; /* a maintenance entity: no streams to report */
+    avb_unsol_stream_info_tick(state);
     if (state->config.milan_compliant)
       avb_unsol_stream_input_info_ex_tick(state);
   }
-  if (now_us >= s_counters_due_us) {
+  if (AVB_ENTITY_HAS_STREAMS && now_us >= s_counters_due_us) {
     bool wifi = state->port[0].medium == avb_port_medium_wifi_ftm;
     s_counters_due_us =
         now_us + (wifi ? UNSOL_COUNTERS_WIFI_US : UNSOL_COUNTERS_WIRED_US);

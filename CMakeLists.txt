@@ -5,7 +5,8 @@
 #   (the console log for ATDECC; a no-op unless ESP_AVB_LOG_OBJECT),
 #   avbcrash.c (the core dump for ATDECC; a no-op unless
 #   ESP_AVB_CRASH_OBJECT), avbfw.c (firmware updates over ATDECC; a no-op
-#   unless ESP_AVB_FIRMWARE_OBJECT).
+#   unless ESP_AVB_FIRMWARE_OBJECT), avbcpfw.c (a coprocessor's firmware
+#   over ATDECC; a no-op unless ESP_AVB_COPROCESSOR_FW_OBJECT).
 #   - mrp.c holds the MRP family (MSRP / MVRP / MAAP) — the generic
 #     MRP state machines (Applicant/Registrar/LeaveAll/timers per
 #     IEEE 802.1Q-2018 §10) plus the MSRP and MVRP application logic
@@ -30,7 +31,7 @@
 #     notifications).
 
 set(avb_srcs avb.c avbutils.c avbnet.c mrp.c avbstats.c avbregistry.c avblog.c
-    avbcrash.c avbfw.c)
+    avbcrash.c avbfw.c avbcpfw.c)
 set(avb_embed "")
 
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)

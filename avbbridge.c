@@ -250,6 +250,33 @@ void avb_stream_in_drain_prof(uint32_t *calls, uint32_t *cycles,
 void avb_stream_out_print_diag(void) {}
 uint64_t avb_stream_out_work_us_total(void) { return 0; }
 
+/* Reached only from AECP handlers the maintenance entity (ATDECC on a
+ * bridge build) refuses before dispatch; they link against these. */
+bool avb_stream_in_playout_delay_us(int32_t *delay_us) {
+  (void)delay_us;
+  return false;
+}
+bool avb_crf_stream_valid(void) { return false; }
+bool avb_talker_audio_streaming(const avb_state_s *state) {
+  (void)state;
+  return false;
+}
+void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
+                                aem_stream_in_counters_s *counters) {
+  memset(valid, 0, sizeof(*valid));
+  memset(counters, 0, sizeof(*counters));
+}
+void avb_get_stream_out_counters(aem_stream_out_counters_val_s *valid,
+                                 aem_stream_out_counters_s *counters) {
+  memset(valid, 0, sizeof(*valid));
+  memset(counters, 0, sizeof(*counters));
+}
+esp_err_t avb_audio_set_rate(avb_state_s *state, uint32_t rate) {
+  (void)state;
+  (void)rate;
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
 /* avbpll.c stubs — bridge has no media-clock PLL. */
 void avb_pll_tick(avb_state_s *state) { (void)state; }
 void avb_pll_print_stats(avb_state_s *state) { (void)state; }

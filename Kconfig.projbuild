@@ -114,7 +114,12 @@ menu "AVB Configuration"
             ADP/AECP/ACMP subtypes and atdecc.c is excluded from the build.
 
             Default off for bridge builds (transparent L2 forwarder has no
-            ATDECC entity); default on for endpoints.
+            ATDECC entity); default on for endpoints. On a bridge it makes
+            a maintenance entity: ADP and AECP on the Ethernet port only,
+            with an entity model of the AVB interface, the strings and
+            the memory objects (console log, crash dump, coprocessor
+            firmware). It has no streams, audio, clocks or controls and
+            takes no ACMP; ATDECC frames it receives are still forwarded.
 
     config ESP_AVB_LOG_OBJECT
         bool "Serve the console log to ATDECC controllers"
@@ -195,6 +200,19 @@ menu "AVB Configuration"
             capture hook did at the first erase). Such an app calls
             esp_avb_fw_keep_streams_paused(), and its uploads still
             pause the streams.
+
+    config ESP_AVB_COPROCESSOR_FW_OBJECT
+        bool "Take a coprocessor's firmware from ATDECC controllers"
+        depends on ESP_AVB_ATDECC && SPIRAM
+        default n
+        help
+            A second FIRMWARE_IMAGE memory object for a coprocessor the
+            app updates itself (esp_avb_register_coprocessor_fw), e.g.
+            the Wi-Fi coprocessor of a bridge. The upload is kept in
+            PSRAM (up to the size the app registers); STORE or
+            STORE_AND_REBOOT then hands it to the app, switches the
+            coprocessor to it and restarts the board. Off at run time
+            until the app registers.
 
     config ESP_AVB_WIFI_UNICAST_STREAMS
         bool "Deliver AVTP streams over Wi-Fi as unicast"

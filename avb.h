@@ -1725,20 +1725,57 @@ static inline bool avb_fw_streams_paused(void) { return false; }
 static inline void avb_fw_tick(avb_state_s *state) {}
 #endif
 
+/* A bridge is an ATDECC entity for maintenance only (CONFIG_ESP_AVB_ATDECC
+ * on a bridge build): its model has the AVB interface, the strings and
+ * the memory objects, and no streams, audio, clocks or controls. */
+#if defined(CONFIG_ESP_AVB_ROLE_BRIDGE)
+#define AVB_ENTITY_HAS_STREAMS 0
+#else
+#define AVB_ENTITY_HAS_STREAMS 1
+#endif
+
+/* avbcpfw.c: the coprocessor's firmware over ATDECC, a second
+ * FIRMWARE_IMAGE memory object from AVB_COPROCESSOR_FW_OBJECT_BASE that
+ * the app registered (esp_avb_register_coprocessor_fw). */
+#define AVB_COPROCESSOR_FW_OBJECT_BASE 0x400000000ULL
+#if CONFIG_ESP_AVB_COPROCESSOR_FW_OBJECT
+bool avb_cpfw_object_enabled(void);
+const char *avb_cpfw_object_name(void);
+/* 0, or the stored image's length while the restart is pending. */
+uint64_t avb_cpfw_object_length(void);
+uint64_t avb_cpfw_object_max_length(void);
+/* START_OPERATION UPLOAD, STORE / STORE_AND_REBOOT and ABORT_OPERATION. */
+aecp_status_t avb_cpfw_start_upload(avb_state_s *state, uint64_t length,
+                                    uint16_t *op_id);
+aecp_status_t avb_cpfw_start_store(avb_state_s *state, uint16_t *op_id);
+aecp_status_t avb_cpfw_abort(avb_state_s *state, uint16_t op_id);
+/* One ADDRESS_ACCESS WRITE at an offset into the image: AVB_FW_WRITE_*. */
+int avb_cpfw_write(uint64_t offset, const uint8_t *data, uint32_t length);
+/* From the AVB task: reports a store's progress and result, then
+ * switches the coprocessor and restarts. */
+void avb_cpfw_tick(avb_state_s *state);
+#else
+static inline bool avb_cpfw_object_enabled(void) { return false; }
+static inline void avb_cpfw_tick(avb_state_s *state) {}
+#endif
+
 /* Memory objects by descriptor index: 0 is the logo, then the console log,
- * the crash dump and the firmware image when they are on, in that order.
- * Controllers find them by memory_object_type. */
+ * the crash dump, the firmware image and the coprocessor's firmware when
+ * they are on, in that order. Controllers find them by memory_object_type
+ * (and the two firmware images by name). */
 typedef enum {
   avb_memory_object_none,
   avb_memory_object_logo,
   avb_memory_object_log,
   avb_memory_object_crash,
   avb_memory_object_firmware,
+  avb_memory_object_coprocessor_firmware,
 } avb_memory_object_kind_t;
 static inline int avb_memory_object_count(void) {
   return 1 + (avb_log_object_enabled() ? 1 : 0) +
          (avb_crash_object_enabled() ? 1 : 0) +
-         (avb_fw_object_enabled() ? 1 : 0);
+         (avb_fw_object_enabled() ? 1 : 0) +
+         (avb_cpfw_object_enabled() ? 1 : 0);
 }
 static inline avb_memory_object_kind_t
 avb_memory_object_kind(uint16_t index) {
@@ -1751,6 +1788,8 @@ avb_memory_object_kind(uint16_t index) {
     return avb_memory_object_crash;
   if (avb_fw_object_enabled() && index == next++)
     return avb_memory_object_firmware;
+  if (avb_cpfw_object_enabled() && index == next++)
+    return avb_memory_object_coprocessor_firmware;
   return avb_memory_object_none;
 }
 static inline int avb_crash_object_index(void) {
@@ -1759,6 +1798,9 @@ static inline int avb_crash_object_index(void) {
 static inline int avb_fw_object_index(void) {
   return 1 + (avb_log_object_enabled() ? 1 : 0) +
          (avb_crash_object_enabled() ? 1 : 0);
+}
+static inline int avb_cpfw_object_index(void) {
+  return avb_fw_object_index() + (avb_fw_object_enabled() ? 1 : 0);
 }
 
 #endif /* _ESP_AVB_AVB_H_ */
