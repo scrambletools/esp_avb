@@ -105,7 +105,6 @@ menu "AVB Configuration"
     config ESP_AVB_ATDECC
         bool "Build ATDECC (IEEE 1722.1) discovery + control"
         depends on ESP_AVB
-        default n if ESP_AVB_ROLE_BRIDGE
         default y
         help
             Compile and link the ATDECC layer (atdecc.c) — ADP discovery,
@@ -113,13 +112,13 @@ menu "AVB Configuration"
             When disabled, the AVTP RX dispatcher in avb.c silently drops
             ADP/AECP/ACMP subtypes and atdecc.c is excluded from the build.
 
-            Default off for bridge builds (transparent L2 forwarder has no
-            ATDECC entity); default on for endpoints. On a bridge it makes
-            a maintenance entity: ADP and AECP on the Ethernet port only,
+            On a bridge it makes a maintenance entity, so controllers can
+            update its firmware: ADP and AECP on the Ethernet port only,
             with an entity model of the AVB interface, the strings and
-            the memory objects (console log, crash dump, coprocessor
-            firmware). It has no streams, audio, clocks or controls and
-            takes no ACMP; ATDECC frames it receives are still forwarded.
+            the memory objects (console log, crash dump, firmware,
+            coprocessor firmware). It has no streams, audio, clocks or
+            controls and takes no ACMP; ATDECC frames it receives are
+            still forwarded.
 
     config ESP_AVB_LOG_OBJECT
         bool "Serve the console log to ATDECC controllers"
@@ -171,7 +170,7 @@ menu "AVB Configuration"
 
     config ESP_AVB_FIRMWARE_OBJECT
         bool "Take firmware updates from ATDECC controllers"
-        depends on ESP_AVB_ATDECC && !ESP_AVB_ROLE_BRIDGE
+        depends on ESP_AVB_ATDECC
         default y
         help
             The inactive OTA slot is a FIRMWARE_IMAGE memory object that
@@ -204,6 +203,7 @@ menu "AVB Configuration"
     config ESP_AVB_COPROCESSOR_FW_OBJECT
         bool "Take a coprocessor's firmware from ATDECC controllers"
         depends on ESP_AVB_ATDECC && SPIRAM
+        default y if ESP_HOSTED_HOST
         default n
         help
             A second FIRMWARE_IMAGE memory object for a coprocessor the
@@ -212,7 +212,10 @@ menu "AVB Configuration"
             PSRAM (up to the size the app registers); STORE or
             STORE_AND_REBOOT then hands it to the app, switches the
             coprocessor to it and restarts the board. Off at run time
-            until the app registers.
+            until the app registers. On by default where the board has
+            a coprocessor (ESP-Hosted host), bridge or endpoint;
+            esp_hosted_avb's hosted_avb_coprocessor_fw_store() and
+            _activate() do the writing.
 
     config ESP_AVB_WIFI_UNICAST_STREAMS
         bool "Deliver AVTP streams over Wi-Fi as unicast"
