@@ -2517,6 +2517,67 @@ esp_err_t esp_wifi_remote_channel_rx(void *h, void *buffer,
 }
 #endif /* CONFIG_ESP_AVB_ROLE_BRIDGE */
 
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+/* A wired endpoint with a Wi-Fi coprocessor: frames its standby station
+ * receives come up over esp-hosted to this override of esp_wifi_remote's
+ * weak symbol, as the bridge's do. Until the failover data path takes
+ * them, they are counted by EtherType and dropped, freed as esp-hosted's
+ * own guard frees a frame it drops. */
+static struct {
+  uint32_t total, ptp, avtp, msrp, mvrp, tagged, other;
+  uint16_t last_other;
+  int64_t next_log_us;
+} s_standby_rx;
+static portMUX_TYPE s_standby_rx_lock = portMUX_INITIALIZER_UNLOCKED;
+
+extern esp_err_t esp_wifi_remote_channel_rx(void *h, void *buffer,
+                                            void *buff_to_free, size_t len);
+esp_err_t esp_wifi_remote_channel_rx(void *h, void *buffer,
+                                     void *buff_to_free, size_t len) {
+  (void)h;
+  const uint8_t *frame = buffer;
+  uint16_t type = 0;
+  bool tagged = false;
+  if (frame && len >= 14) {
+    type = (uint16_t)(frame[12] << 8 | frame[13]);
+    if (type == 0x8100 && len >= 18) {
+      tagged = true;
+      type = (uint16_t)(frame[16] << 8 | frame[17]);
+    }
+  }
+  free(buff_to_free);
+  int64_t now_us = esp_timer_get_time();
+  bool log_now = false;
+  portENTER_CRITICAL(&s_standby_rx_lock);
+  s_standby_rx.total++;
+  s_standby_rx.tagged += tagged;
+  switch (type) {
+  case 0x88f7: s_standby_rx.ptp++; break;
+  case 0x22f0: s_standby_rx.avtp++; break;
+  case 0x22ea: s_standby_rx.msrp++; break;
+  case 0x88f5: s_standby_rx.mvrp++; break;
+  default:
+    s_standby_rx.other++;
+    s_standby_rx.last_other = type;
+    break;
+  }
+  if (now_us >= s_standby_rx.next_log_us) {
+    log_now = s_standby_rx.next_log_us != 0;
+    s_standby_rx.next_log_us = now_us + 60 * 1000 * 1000LL;
+  }
+  typeof(s_standby_rx) counts = s_standby_rx;
+  portEXIT_CRITICAL(&s_standby_rx_lock);
+  if (log_now)
+    ESP_LOGI(TAG,
+             "STANDBYRX,%" PRIu32 " frames,PTP %" PRIu32 ",AVTP %" PRIu32
+             ",MSRP %" PRIu32 ",MVRP %" PRIu32 ",VLAN-tagged %" PRIu32
+             ",other %" PRIu32 " (last 0x%04x)",
+             counts.total, counts.ptp, counts.avtp, counts.msrp, counts.mvrp,
+             counts.tagged, counts.other, counts.last_other);
+  return ESP_OK;
+}
+#endif /* CONFIG_ESP_AVB_WIFI_FAILOVER */
+
 /* Open the four per-protocol L2TAP fds for one port and bind them to
  * the port's interface key. Works for any netif (Eth or Wi-Fi); the
  * caller does the medium-specific MAC / promiscuous setup separately. */

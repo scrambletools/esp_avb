@@ -1149,6 +1149,19 @@ menu "AVB Configuration"
         depends on ESP_AVB && !ESP_AVB_ROLE_BRIDGE && !ESP_AVB_ROLE_ENDPOINT_WIRELESS
         select I2S_ISR_IRAM_SAFE
 
+    config ESP_AVB_WIFI_FAILOVER
+        bool "Receive through a Wi-Fi coprocessor's standby station"
+        depends on ESP_AVB_ROLE_ENDPOINT_WIRED && ESP_HOSTED_HOST
+        default n
+        help
+            A wired endpoint whose board has an esp-hosted Wi-Fi
+            coprocessor joined to the bridge as a standby station. Frames
+            the station receives reach the endpoint (the application
+            creates the station's WIFI_STA_DEF netif so esp-hosted delivers
+            them). For now they are counted by EtherType every 60 s
+            (STANDBYRX lines) and dropped: the failover data path will
+            take them while Wi-Fi is the active link.
+
     config ESP_AVB_FTM_IE_HOOK
         bool "Use FTM-frame Vendor IE for FollowUpInformation transport"
         default n
