@@ -5485,6 +5485,20 @@ int avb_process_acmp_connect_tx_command(avb_state_s *state, acmp_message_s *msg,
       avbinfo("ACMP: stream %d stays Class B behind Wi-Fi", talker_uid);
       req_class_b = true;
     }
+    /* On a failover to Wi-Fi a stream keeps its class: a Class A stream
+     * is withdrawn until wired returns, and a class change would alter
+     * its reservation under the same stream ID, which switches can hold
+     * stale for an hour. */
+    if (avb_net_failover_wifi()) {
+      if (!stream->stream_info_flags.class_b) {
+        avbinfo("ACMP: stream %d is Class A, not offered over Wi-Fi",
+                talker_uid);
+        avb_send_acmp_response(state, tx_response_type, msg,
+                               acmp_status_talker_misbehaving);
+        return ERROR;
+      }
+      req_class_b = true;
+    }
     /* The requester's own earlier connection does not hold the class. */
     uint16_t conn_count = octets_to_uint(stream->connection_count, 2);
     int other_listeners = 0;
@@ -6374,6 +6388,30 @@ void avb_failover_restart_listeners(avb_state_s *state) {
     stream->fast_connect_due = now;
     avbinfo("Failover: stream_input %u probes again over %s", i,
             wifi ? "Wi-Fi" : "Ethernet");
+  }
+}
+
+/* Failover moved port 0: every output stops; on Wi-Fi a Class A one is
+ * withdrawn and stays down (parked) until wired, a Class B one is
+ * declared again over the station and starts on the next Listener Ready.
+ * Back on wired all are declared again. AVB task. */
+void avb_failover_restart_talkers(avb_state_s *state) {
+  bool wifi = avb_net_failover_wifi();
+  for (uint16_t i = 0; i < state->num_output_streams; i++) {
+    avb_talker_stream_s *stream = &state->output_streams[i];
+    if (stream->streaming)
+      avb_stop_stream_out(state, i);
+    bool park = wifi && !stream->stream_info_flags.class_b;
+    if (park && !stream->failover_parked) {
+      mrp_withdraw_talker(state, 0, &stream->stream_id);
+      avbwarn("Failover: stream_output %u is Class A; withdrawn until wired",
+              i);
+    }
+    stream->failover_parked = park;
+    stream->last_declared = (struct timespec){0}; /* declare at once */
+    if (!park)
+      avbinfo("Failover: stream_output %u declared again over %s", i,
+              wifi ? "Wi-Fi" : "Ethernet");
   }
 }
 

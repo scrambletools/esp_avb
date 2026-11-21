@@ -187,6 +187,10 @@ void esp_avb_failover_use_wifi(bool wifi) {
 bool esp_avb_failover_using_wifi(void) { return s_failover_wifi; }
 #endif
 
+const uint8_t *avb_net_tx_mac(const avb_state_s *state) {
+  return avb_net_port0_tx_mac(state);
+}
+
 bool avb_net_failover_wifi(void) {
 #ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
   return s_failover_wifi;

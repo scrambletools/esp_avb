@@ -975,7 +975,7 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
 
   /* ETH header: dst MAC + src MAC + 0x8100 (VLAN ethertype) */
   memcpy(tx_frame, &params->dest_addr, ETH_ADDR_LEN);
-  memcpy(tx_frame + ETH_ADDR_LEN, state->port[0].internal_mac_addr, ETH_ADDR_LEN);
+  memcpy(tx_frame + ETH_ADDR_LEN, avb_net_tx_mac(state), ETH_ADDR_LEN);
   tx_frame[12] = 0x81;
   tx_frame[13] = 0x00; /* VLAN ethertype */
 
@@ -6202,7 +6202,7 @@ static int avb_crf_stream_out_start(avb_state_s *state,
   uint8_t *frame = ctx->frame;
   uint8_t *avtp = frame + TX_ETH_HDR_LEN + TX_VLAN_TAG_LEN;
   memcpy(frame, &params->dest_addr, ETH_ADDR_LEN);
-  memcpy(frame + ETH_ADDR_LEN, state->port[0].internal_mac_addr, ETH_ADDR_LEN);
+  memcpy(frame + ETH_ADDR_LEN, avb_net_tx_mac(state), ETH_ADDR_LEN);
   frame[12] = 0x81;
   frame[13] = 0x00;
   uint16_t vid = (params->vlan_id[0] << 8) | params->vlan_id[1];
@@ -6303,7 +6303,9 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   params->state = state;
   params->stream_index = index;
   params->i2s_rx_handle = state->i2s_rx_handle;
-  params->eth_handle = state->config.eth_handle;
+  /* On a failover to Wi-Fi the stream goes out through the station. */
+  params->eth_handle =
+      avb_net_failover_wifi() ? NULL : state->config.eth_handle;
   memcpy(&params->stream_id, state->output_streams[index].stream_id,
          UNIQUE_ID_LEN);
   memcpy(&params->dest_addr, &state->output_streams[index].stream_dest_addr,

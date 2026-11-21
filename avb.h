@@ -722,6 +722,9 @@ typedef struct {
     bool lite_admitted; /* its unicast copy holds egress budget */
     int64_t lite_hold_until_us;
   } connected_listeners[AVB_MAX_NUM_CONNECTED_LISTENERS];
+  /* Failover to Wi-Fi: a Class A stream is withdrawn and not declared
+   * until wired returns (the bridge refuses Class A toward Wi-Fi). */
+  bool failover_parked;
 } avb_talker_stream_s;
 
 /* Stream Input — handled by avb_stream_rx_handler callback registered
@@ -1198,6 +1201,9 @@ void avb_net_capture_begin(uint8_t *buf, size_t cap);
 bool avb_net_failover_wifi(void);
 bool avb_net_failover_take_change(void);
 void avb_failover_restart_listeners(avb_state_s *state);
+void avb_failover_restart_talkers(avb_state_s *state);
+/* The source MAC port 0's frames carry now: the station's on Wi-Fi. */
+const uint8_t *avb_net_tx_mac(const avb_state_s *state);
 int avb_net_capture_end(void);
 
 /* A dual-core talker runs its send loop from IRAM. In flash, the

@@ -832,7 +832,8 @@ void avb_lite_update_stream_tx_addrs(avb_state_s *state) {
   memset(plans, 0, sizeof(plans));
   bool wifi_port = false;
 #ifdef CONFIG_ESP_AVB_WIFI_UNICAST_STREAMS
-  wifi_port = state->port[0].medium == avb_port_medium_wifi_ftm;
+  wifi_port = state->port[0].medium == avb_port_medium_wifi_ftm ||
+              avb_net_failover_wifi();
 #endif
   if (state->avb_lite && !wifi_port) {
     for (int i = 0; i < state->num_output_streams; i++)
@@ -1785,6 +1786,9 @@ static int avb_periodic_send(avb_state_s *state) {
           memcmp(state->output_streams[i].stream_dest_addr, zero_mac,
                  ETH_ADDR_LEN) == 0)
         continue;
+      /* A Class A stream is not offered over a failover to Wi-Fi. */
+      if (state->output_streams[i].failover_parked && avb_net_failover_wifi())
+        continue;
       /* MSRP talker — SM-driven; the SM resolves JoinIn vs JoinMt
        * at TX time. Keep the declaration alive at a steady cadence.
        * Each stream keeps its own time: on a shared one, a connected
@@ -1849,9 +1853,13 @@ static int avb_periodic_send(avb_state_s *state) {
    * testing — the auto-rebind otherwise masks controller-driven
    * Class B connections within milliseconds. */
   avb_periodic_playout_delay_notify(state);
-  /* A failover switch restarts the inputs over the new path. */
-  if (avb_net_failover_take_change() && state->config.listener)
-    avb_failover_restart_listeners(state);
+  /* A failover switch restarts the streams over the new path. */
+  if (avb_net_failover_take_change()) {
+    if (state->config.listener)
+      avb_failover_restart_listeners(state);
+    if (state->config.talker)
+      avb_failover_restart_talkers(state);
+  }
 #ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
   if (state->config.listener) {
     avb_periodic_fast_connect(state);
