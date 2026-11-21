@@ -687,9 +687,14 @@ typedef struct {
 static avb_wifi_entity_t s_wifi_entities[AVB_WIFI_ENTITY_TABLE_SIZE];
 static portMUX_TYPE s_wifi_entities_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_fwd_wifi_acmp_copies;
+static volatile uint32_t s_fwd_wifi_adp_copies;
 
 uint32_t avb_bridge_forward_stats_acmp_copies(void) {
   return s_fwd_wifi_acmp_copies;
+}
+
+uint32_t avb_bridge_forward_stats_adp_copies(void) {
+  return s_fwd_wifi_adp_copies;
 }
 
 static void avb_wifi_entity_learn(const uint8_t *frame, uint32_t len) {
@@ -761,6 +766,45 @@ static void avb_bridge_wifi_control(int ingress_port, int egress_port,
   uint8_t subtype = frame[ETH_HEADER_LEN];
   if (subtype == avtp_subtype_adp && ingress_port == s_wifi_port_idx) {
     avb_wifi_entity_learn(frame, len);
+    return;
+  }
+  /* ENTITY_DISCOVER likewise: to the station running the entity it
+   * names, or to every known station for a wildcard one. A lost group
+   * frame otherwise left a station's entity unfound (2 of 7 lookups in
+   * one bench run). */
+  if (subtype == avtp_subtype_adp && egress_port == s_wifi_port_idx &&
+      (frame[0] & 0x01) && len >= ETH_HEADER_LEN + 12 &&
+      ((const atdecc_header_s *)(frame + ETH_HEADER_LEN))->msg_type ==
+          adp_msg_type_entity_discover) {
+    const uint8_t *entity_id = frame + ETH_HEADER_LEN + 4;
+    static const unique_id_t zero_id = {0};
+    uint8_t stations[AVB_WIFI_ENTITY_TABLE_SIZE][ETH_ADDR_LEN];
+    int count = 0;
+    if (memcmp(entity_id, zero_id, UNIQUE_ID_LEN) != 0) {
+      if (avb_wifi_entity_station(entity_id, stations[0]))
+        count = 1;
+    } else {
+      int64_t now_us = esp_timer_get_time();
+      portENTER_CRITICAL(&s_wifi_entities_lock);
+      for (int i = 0; i < AVB_WIFI_ENTITY_TABLE_SIZE; i++) {
+        const avb_wifi_entity_t *entity = &s_wifi_entities[i];
+        if (entity->expires_us <= now_us)
+          continue;
+        bool seen = false;
+        for (int j = 0; j < count && !seen; j++)
+          seen = memcmp(stations[j], entity->station, ETH_ADDR_LEN) == 0;
+        if (!seen)
+          memcpy(stations[count++], entity->station, ETH_ADDR_LEN);
+      }
+      portEXIT_CRITICAL(&s_wifi_entities_lock);
+    }
+    for (int i = 0; i < count; i++) {
+      memcpy(frame, stations[i], ETH_ADDR_LEN);
+      if (esp_wifi_internal_tx(1 /* WIFI_IF_AP */, frame, len) == ESP_OK)
+        s_fwd_wifi_adp_copies++;
+      else
+        s_fwd_wifi_fail++;
+    }
     return;
   }
   if (subtype != avtp_subtype_acmp || egress_port != s_wifi_port_idx ||

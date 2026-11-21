@@ -1287,6 +1287,7 @@ uint32_t avb_bridge_forward_stats_restored(void);
 /* ACMP frames also sent individually addressed to the station of the
  * entity they are for (AVB Wireless 3.5). */
 uint32_t avb_bridge_forward_stats_acmp_copies(void);
+uint32_t avb_bridge_forward_stats_adp_copies(void);
 /* Station stream frames held by the uplink pacer, those sent unpaced
  * because a pacer queue was full, and the deepest queue since the last
  * call. */
