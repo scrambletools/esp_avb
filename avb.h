@@ -631,6 +631,12 @@ typedef struct {
    * changed stream identity during a link outage. ADP
    * ENTITY_DEPARTING demotes immediately. Runtime-only. */
   int64_t demote_ref_us;
+  /* Failover to Wi-Fi (CONFIG_ESP_AVB_WIFI_FAILOVER): the class the
+   * stream had on wired, restored when wired returns, and whether the
+   * talker refused Class B while on Wi-Fi (parked until wired). */
+  bool failover_parked;
+  bool failover_wired_class_saved;
+  bool failover_wired_class_b;
 } avb_listener_stream_s;
 
 /* Talker stream */
@@ -1185,6 +1191,13 @@ esp_err_t avb_net_transmit_raw(esp_eth_handle_t eth_handle, const void *frame,
 /* Catch the calling task's next avb_net_send_to message in buf instead of
  * sending it; end returns its length, or -1 when nothing was sent. */
 void avb_net_capture_begin(uint8_t *buf, size_t cap);
+
+/* Failover to the Wi-Fi coprocessor's station (CONFIG_ESP_AVB_WIFI_FAILOVER):
+ * whether port 0 runs over the station now, and (AVB task) whether that
+ * changed since the last call. Both false without failover. */
+bool avb_net_failover_wifi(void);
+bool avb_net_failover_take_change(void);
+void avb_failover_restart_listeners(avb_state_s *state);
 int avb_net_capture_end(void);
 
 /* A dual-core talker runs its send loop from IRAM. In flash, the

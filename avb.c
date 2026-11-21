@@ -1849,6 +1849,9 @@ static int avb_periodic_send(avb_state_s *state) {
    * testing — the auto-rebind otherwise masks controller-driven
    * Class B connections within milliseconds. */
   avb_periodic_playout_delay_notify(state);
+  /* A failover switch restarts the inputs over the new path. */
+  if (avb_net_failover_take_change() && state->config.listener)
+    avb_failover_restart_listeners(state);
 #ifndef CONFIG_ESP_AVB_DISABLE_FAST_CONNECT
   if (state->config.listener) {
     avb_periodic_fast_connect(state);

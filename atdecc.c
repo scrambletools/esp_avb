@@ -5154,7 +5154,8 @@ int avb_send_acmp_response(avb_state_s *state, acmp_msg_type_t msg_type,
  * refuses a Class A stream toward Wi-Fi. CLASS_B is the 0x0001 ACMP flag. */
 static uint16_t listener_connect_flags(const avb_state_s *state,
                                        uint16_t flags) {
-  if (state->port[0].medium == avb_port_medium_wifi_ftm)
+  if (state->port[0].medium == avb_port_medium_wifi_ftm ||
+      avb_net_failover_wifi())
     flags |= 0x0001;
   return flags;
 }
@@ -5615,7 +5616,19 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
     memcpy(old_stream_id, state->input_streams[listener_uid].stream_id,
            UNIQUE_ID_LEN);
     // if succcessful connect tx response then connect the listener
-    if (response->header.status_valtime == acmp_status_success) {
+    /* On a failover to Wi-Fi a stream goes on only as Class B (the bridge
+     * refuses Class A toward Wi-Fi): a talker that answers Class A parks
+     * it until wired returns. */
+    bool parked = response->header.status_valtime == acmp_status_success &&
+                  avb_net_failover_wifi() &&
+                  !(octets_to_uint(response->flags, 2) & 0x0001) &&
+                  status != acmp_status_listener_unknown_id;
+    if (parked) {
+      if (!state->input_streams[listener_uid].failover_parked)
+        avbwarn("Failover: stream_input %d's talker offers no Class B; "
+                "parked until wired", listener_uid);
+      state->input_streams[listener_uid].failover_parked = true;
+    } else if (response->header.status_valtime == acmp_status_success) {
       status = avb_connect_listener(state, response);
       avbdebug("ConnTX rsp: listener_uid=%d, connect_status=%d", listener_uid,
               status);
@@ -6198,7 +6211,9 @@ acmp_status_t avb_connect_listener(avb_state_s *state,
   // Setting as connected will cause the stream-in handler to start
   stream->connected = true;
   stream->provisional = false; /* authoritative parameters in place */
-  avb_persist_note_stream_id(state, index);
+  /* A connection made on a failover to Wi-Fi is not the one to keep. */
+  if (!avb_net_failover_wifi())
+    avb_persist_note_stream_id(state, index);
 
   /* SM-driven listener declaration. Initial decl_event is decided by
    * the current talker state — at the moment of CONNECT_TX_RESPONSE
@@ -6259,6 +6274,8 @@ static bool avb_fast_connect_listener(avb_state_s *state, uint16_t index) {
     return false;
   if ((stream->connected && !stream->provisional) ||
       stream->pending_connection)
+    return false;
+  if (stream->failover_parked && avb_net_failover_wifi())
     return false;
 
   /* Milan requires the talker to be ADP-discovered before probing. */
@@ -6324,6 +6341,39 @@ void avb_fast_connect_talker_discovered(avb_state_s *state,
     stream->fast_connect_due = due;
     avbinfo("ACMP: bound talker discovered, stream_input %u probes in %u ms",
             i, (unsigned)delay_ms);
+  }
+}
+
+/* Failover moved port 0 between Ethernet and Wi-Fi: every bound input
+ * stops and probes again at once over the new path (Class B on Wi-Fi,
+ * its own class again on wired). Bindings are kept. AVB task. */
+void avb_failover_restart_listeners(avb_state_s *state) {
+  bool wifi = avb_net_failover_wifi();
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  unique_id_t zero_id = {0};
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    avb_listener_stream_s *stream = &state->input_streams[i];
+    if (memcmp(stream->talker_id, zero_id, UNIQUE_ID_LEN) == 0)
+      continue;
+    if (stream->connected || stream->provisional) {
+      avb_stop_stream_in(state, i);
+      mrp_withdraw_listener(state, 0, &stream->stream_id);
+    }
+    if (wifi && !stream->failover_wired_class_saved) {
+      stream->failover_wired_class_b = stream->stream_info_flags.class_b;
+      stream->failover_wired_class_saved = true;
+    } else if (!wifi && stream->failover_wired_class_saved) {
+      stream->stream_info_flags.class_b = stream->failover_wired_class_b;
+      stream->failover_wired_class_saved = false;
+    }
+    stream->failover_parked = false;
+    stream->connected = false;
+    stream->provisional = false;
+    stream->pending_connection = false;
+    stream->fast_connect_due = now;
+    avbinfo("Failover: stream_input %u probes again over %s", i,
+            wifi ? "Wi-Fi" : "Ethernet");
   }
 }
 

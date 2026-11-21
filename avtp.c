@@ -3031,7 +3031,8 @@ static uint32_t stream_in_dac_pos_now(stream_rx_ctx_t *ctx) {
  * latency, plus the Wi-Fi cushion on a station. */
 static inline uint32_t stream_in_extra_latency_ns(const stream_rx_ctx_t *ctx) {
   uint32_t extra_us = CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_US;
-  if (ctx->state && ctx->state->port[0].medium == avb_port_medium_wifi_ftm)
+  if (ctx->state && (ctx->state->port[0].medium == avb_port_medium_wifi_ftm ||
+                     avb_net_failover_wifi()))
     extra_us += CONFIG_ESP_AVB_LISTENER_EXTRA_LATENCY_WIFI_US;
   return extra_us * 1000U;
 }

@@ -126,6 +126,7 @@ static int s_wifi_port_idx = -1;
  * from the station's own MAC, and control frames arriving over Ethernet
  * are dropped so nothing is taken twice. gPTP stays on its own path. */
 static volatile bool s_failover_wifi;
+static volatile bool s_failover_changed;
 static volatile bool s_failover_station_up;
 static uint8_t s_failover_station_mac[ETH_ADDR_LEN];
 #endif
@@ -178,12 +179,31 @@ void esp_avb_failover_use_wifi(bool wifi) {
   if (s_failover_wifi == wifi)
     return;
   s_failover_wifi = wifi;
+  s_failover_changed = true;
   ESP_LOGW(TAG, "Failover: control traffic now on %s",
            wifi ? "the Wi-Fi coprocessor's station" : "Ethernet");
 }
 
 bool esp_avb_failover_using_wifi(void) { return s_failover_wifi; }
 #endif
+
+bool avb_net_failover_wifi(void) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  return s_failover_wifi;
+#else
+  return false;
+#endif
+}
+
+bool avb_net_failover_take_change(void) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  bool changed = s_failover_changed;
+  s_failover_changed = false;
+  return changed;
+#else
+  return false;
+#endif
+}
 
 static void avb_net_cache_port_indices(avb_state_s *state) {
   s_eth_port_idx = -1;
@@ -2182,7 +2202,13 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
      * streams and tagged control multicasts are unaffected. */
     static const uint8_t zero_mac[ETH_ADDR_LEN] = {0};
     if (!(buf[0] & 1) && memcmp(buf, s_own_mac, ETH_ADDR_LEN) != 0 &&
-        memcmp(s_own_mac, zero_mac, ETH_ADDR_LEN) != 0) {
+        memcmp(s_own_mac, zero_mac, ETH_ADDR_LEN) != 0
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+        /* On Wi-Fi the bridge addresses a station's streams to it. */
+        && !(s_failover_wifi && eth_handle == NULL &&
+             memcmp(buf, s_failover_station_mac, ETH_ADDR_LEN) == 0)
+#endif
+    ) {
       free(buf);
       return ESP_OK;
     }
