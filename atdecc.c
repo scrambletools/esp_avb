@@ -4528,6 +4528,24 @@ uint16_t avb_fill_rsp_get_counters(avb_state_s *state, aecp_get_counters_s *msg,
     iface_valid->link_up = true;
     iface_valid->link_down = true;
     iface_valid->gptp_btc_changed = true;
+    aem_avb_interface_counters_s *iface =
+        &response->counters_block.avb_interface_counters;
+    memset(iface, 0, sizeof(*iface));
+    int_to_octets(&state->iface_link_up_count, iface->link_up, 4);
+    int_to_octets(&state->iface_link_down_count, iface->link_down, 4);
+    int_to_octets(&state->iface_btc_changed_count, iface->gptp_btc_changed, 4);
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+    /* Entity-specific 1-3: failovers to Wi-Fi, fail-backs to wired, and
+     * seconds spent on Wi-Fi. */
+    uint32_t to_wifi, to_wired, wifi_seconds;
+    avb_net_failover_counts(&to_wifi, &to_wired, &wifi_seconds);
+    iface_valid->entity_specific1 = true;
+    iface_valid->entity_specific2 = true;
+    iface_valid->entity_specific3 = true;
+    int_to_octets(&to_wifi, iface->entity_specific1, 4);
+    int_to_octets(&to_wired, iface->entity_specific2, 4);
+    int_to_octets(&wifi_seconds, iface->entity_specific3, 4);
+#endif
     break;
   }
   case aem_desc_type_clock_domain: {

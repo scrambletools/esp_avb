@@ -1045,6 +1045,11 @@ typedef struct avb_state_s {
   /* AVB interface */
   // only one interface is supported currently
   aem_avb_interface_desc_s avb_interface;
+  /* Its counters (Milan Table 5.10): link up and down events and gPTP
+   * grandmaster changes, counted by the AVB task. */
+  uint32_t iface_link_up_count, iface_link_down_count, iface_btc_changed_count;
+  bool iface_link_known, iface_link_last;
+  uint8_t iface_last_btc[8];
   aem_msrp_mapping_s msrp_mappings[2];
   uint16_t msrp_mappings_count;
 
@@ -1200,6 +1205,10 @@ void avb_net_capture_begin(uint8_t *buf, size_t cap);
  * changed since the last call. Both false without failover. */
 bool avb_net_failover_wifi(void);
 bool avb_net_failover_take_change(void);
+/* Failovers to Wi-Fi, fail-backs to wired and whole seconds spent on
+ * Wi-Fi so far (all 0 without failover). */
+void avb_net_failover_counts(uint32_t *to_wifi, uint32_t *to_wired,
+                             uint32_t *wifi_seconds);
 void avb_failover_restart_listeners(avb_state_s *state);
 void avb_failover_restart_talkers(avb_state_s *state);
 /* The source MAC port 0's frames carry now: the station's on Wi-Fi. */

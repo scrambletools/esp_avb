@@ -1587,6 +1587,16 @@ static void avb_update_ptp_status(avb_state_s *state) {
   struct ptpd_status_s ptp_status;
   if (ptpd_status(0, &ptp_status) == 0) {
     memcpy(&state->ptp_status, &ptp_status, sizeof(struct ptpd_status_s));
+    /* AVB_INTERFACE gptp_btc_changed: a new grandmaster selected. */
+    static const uint8_t zero_btc[8] = {0};
+    if (ptp_status.clock_source_selected &&
+        memcmp(ptp_status.clock_source_info.btc_id, zero_btc, 8) != 0) {
+      if (memcmp(state->iface_last_btc, zero_btc, 8) != 0 &&
+          memcmp(state->iface_last_btc, ptp_status.clock_source_info.btc_id,
+                 8) != 0)
+        state->iface_btc_changed_count++;
+      memcpy(state->iface_last_btc, ptp_status.clock_source_info.btc_id, 8);
+    }
     avb_update_avb_lite_from_ptp(state);
 #ifdef CONFIG_ESP_AVB_ATDECC
     avb_update_avb_interface_from_ptp(state);
@@ -1853,6 +1863,16 @@ static int avb_periodic_send(avb_state_s *state) {
    * testing — the auto-rebind otherwise masks controller-driven
    * Class B connections within milliseconds. */
   avb_periodic_playout_delay_notify(state);
+  /* AVB_INTERFACE link counters: the wired port's carrier. */
+  bool link = ptpd_port_link_up(0);
+  if (state->iface_link_known && link != state->iface_link_last) {
+    if (link)
+      state->iface_link_up_count++;
+    else
+      state->iface_link_down_count++;
+  }
+  state->iface_link_known = true;
+  state->iface_link_last = link;
   /* A failover switch restarts the streams over the new path. */
   if (avb_net_failover_take_change()) {
     if (state->config.listener)

@@ -127,6 +127,8 @@ static int s_wifi_port_idx = -1;
  * are dropped so nothing is taken twice. gPTP stays on its own path. */
 static volatile bool s_failover_wifi;
 static volatile bool s_failover_changed;
+static uint32_t s_failover_to_wifi, s_failover_to_wired;
+static int64_t s_failover_wifi_since_us, s_failover_wifi_us;
 static volatile bool s_failover_station_up;
 static uint8_t s_failover_station_mac[ETH_ADDR_LEN];
 #endif
@@ -180,6 +182,14 @@ void esp_avb_failover_use_wifi(bool wifi) {
     return;
   s_failover_wifi = wifi;
   s_failover_changed = true;
+  int64_t now_us = esp_timer_get_time();
+  if (wifi) {
+    s_failover_to_wifi++;
+    s_failover_wifi_since_us = now_us;
+  } else {
+    s_failover_to_wired++;
+    s_failover_wifi_us += now_us - s_failover_wifi_since_us;
+  }
   ESP_LOGW(TAG, "Failover: control traffic now on %s",
            wifi ? "the Wi-Fi coprocessor's station" : "Ethernet");
 }
@@ -196,6 +206,20 @@ bool avb_net_failover_wifi(void) {
   return s_failover_wifi;
 #else
   return false;
+#endif
+}
+
+void avb_net_failover_counts(uint32_t *to_wifi, uint32_t *to_wired,
+                             uint32_t *wifi_seconds) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  int64_t wifi_us = s_failover_wifi_us;
+  if (s_failover_wifi)
+    wifi_us += esp_timer_get_time() - s_failover_wifi_since_us;
+  *to_wifi = s_failover_to_wifi;
+  *to_wired = s_failover_to_wired;
+  *wifi_seconds = (uint32_t)(wifi_us / 1000000);
+#else
+  *to_wifi = *to_wired = *wifi_seconds = 0;
 #endif
 }
 
