@@ -30,7 +30,8 @@
 #define UNSOL_ASYNC_PERIOD_US 100000
 #define UNSOL_COUNTERS_WIRED_US 1000000
 #define UNSOL_COUNTERS_WIFI_US 10000000
-/* Propagation delay jitters by a few ns; a smaller step is no change */
+/* Propagation delay jitters by a few ns; a smaller step is no change,
+ * unless the delay goes between zero and nonzero */
 #define UNSOL_PDELAY_STEP_NS 100
 
 static uint8_t s_frame[AVB_MAX_MSG_LEN];
@@ -363,7 +364,10 @@ static void avb_unsol_avb_info_tick(avb_state_s *state) {
     uint32_t sent_ns = (uint32_t)octets_to_uint(sent_delay, 4);
     uint32_t now_ns = (uint32_t)octets_to_uint(rsp.propagation_delay, 4);
     uint32_t step_ns = now_ns > sent_ns ? now_ns - sent_ns : sent_ns - now_ns;
-    if (step_ns < UNSOL_PDELAY_STEP_NS)
+    /* A delay appearing or going away is a change however small: a Wi-Fi
+     * link's few tens of ns would otherwise never replace the 0 sent
+     * before its first measurement. */
+    if (step_ns < UNSOL_PDELAY_STEP_NS && (sent_ns == 0) == (now_ns == 0))
       memcpy(rsp.propagation_delay, sent_delay, 4);
   }
   avb_unsol_send_changed(state, &s_avb_info, &rsp, msg_len,
