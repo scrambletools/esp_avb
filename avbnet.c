@@ -120,6 +120,71 @@ uint32_t avb_bridge_forward_stats_restored(void) { return s_fwd_eth_restored; }
 static int s_eth_port_idx = -1;
 static int s_wifi_port_idx = -1;
 
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+/* Failover to the Wi-Fi coprocessor (esp_avb_failover_*). While active,
+ * port 0's control traffic goes through the coprocessor station, sent
+ * from the station's own MAC, and control frames arriving over Ethernet
+ * are dropped so nothing is taken twice. gPTP stays on its own path. */
+static volatile bool s_failover_wifi;
+static volatile bool s_failover_station_up;
+static uint8_t s_failover_station_mac[ETH_ADDR_LEN];
+#endif
+
+/* The port a received control frame belongs to, or -1 to drop it. */
+static inline int avb_net_ingress_port(esp_eth_handle_t eth_handle) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  if (s_failover_wifi)
+    return eth_handle == NULL ? 0 : -1;
+#endif
+  return eth_handle == NULL ? s_wifi_port_idx : s_eth_port_idx;
+}
+
+/* Port 0's carrier: with failover active, the station's association. */
+static inline bool avb_net_port0_link_up(void) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  if (s_failover_wifi)
+    return s_failover_station_up;
+#endif
+  return ptpd_port_link_up(0);
+}
+
+static inline bool avb_net_port0_wifi(const avb_state_s *state) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  if (s_failover_wifi)
+    return true;
+#endif
+  return state->port[0].medium == avb_port_medium_wifi_ftm;
+}
+
+/* The source MAC port 0 sends from: the station's while on Wi-Fi. The
+ * entity keeps port 0's MAC as its identity either way. */
+static inline const uint8_t *avb_net_port0_tx_mac(const avb_state_s *state) {
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  if (s_failover_wifi)
+    return s_failover_station_mac;
+#endif
+  return state->port[0].internal_mac_addr;
+}
+
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+void esp_avb_failover_set_station(bool associated,
+                                  const uint8_t station_mac[6]) {
+  if (station_mac)
+    memcpy(s_failover_station_mac, station_mac, ETH_ADDR_LEN);
+  s_failover_station_up = associated;
+}
+
+void esp_avb_failover_use_wifi(bool wifi) {
+  if (s_failover_wifi == wifi)
+    return;
+  s_failover_wifi = wifi;
+  ESP_LOGW(TAG, "Failover: control traffic now on %s",
+           wifi ? "the Wi-Fi coprocessor's station" : "Ethernet");
+}
+
+bool esp_avb_failover_using_wifi(void) { return s_failover_wifi; }
+#endif
+
 static void avb_net_cache_port_indices(avb_state_s *state) {
   s_eth_port_idx = -1;
   s_wifi_port_idx = -1;
@@ -2132,7 +2197,7 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
         buf[18] == avtp_subtype_aecp) {
       if (s_ctrl_rx_queue) {
         ctrl_rx_pkt_t pkt;
-        int ingress = (eth_handle == NULL) ? s_wifi_port_idx : s_eth_port_idx;
+        int ingress = avb_net_ingress_port(eth_handle);
         if (ingress < 0) {
           free(buf);
           return ESP_OK;
@@ -2195,7 +2260,7 @@ static esp_err_t avb_unified_rx_cb_inner(esp_eth_handle_t eth_handle,
        * looked up once at init in avb_net_init so neither callback
        * needs to know the bridge vs. endpoint topology. -1 means
        * "no port configured for this medium" — drop the frame. */
-      int ingress = (eth_handle == NULL) ? s_wifi_port_idx : s_eth_port_idx;
+      int ingress = avb_net_ingress_port(eth_handle);
       if (ingress < 0) {
         free(buf);
         return ESP_OK;
@@ -2545,7 +2610,6 @@ esp_err_t esp_wifi_remote_channel_rx(void *h, void *buffer,
       type = (uint16_t)(frame[16] << 8 | frame[17]);
     }
   }
-  free(buff_to_free);
   int64_t now_us = esp_timer_get_time();
   bool log_now = false;
   portENTER_CRITICAL(&s_standby_rx_lock);
@@ -2571,9 +2635,15 @@ esp_err_t esp_wifi_remote_channel_rx(void *h, void *buffer,
     ESP_LOGI(TAG,
              "STANDBYRX,%" PRIu32 " frames,PTP %" PRIu32 ",AVTP %" PRIu32
              ",MSRP %" PRIu32 ",MVRP %" PRIu32 ",VLAN-tagged %" PRIu32
-             ",other %" PRIu32 " (last 0x%04x)",
+             ",other %" PRIu32 " (last 0x%04x),%s",
              counts.total, counts.ptp, counts.avtp, counts.msrp, counts.mvrp,
-             counts.tagged, counts.other, counts.last_other);
+             counts.tagged, counts.other, counts.last_other,
+             s_failover_wifi ? "taken" : "dropped");
+  /* While Wi-Fi carries port 0 the frame goes to the dispatcher as the
+   * bridge's do; gPTP among them is not injected (no Wi-Fi port). */
+  if (s_failover_wifi)
+    return avb_wifi_rx_cb(buffer, (uint16_t)len, buff_to_free);
+  free(buff_to_free);
   return ESP_OK;
 }
 #endif /* CONFIG_ESP_AVB_WIFI_FAILOVER */
@@ -2880,7 +2950,7 @@ void avb_create_eth_frame(uint8_t *eth_frame, eth_addr_t *dest_addr,
                                           htons((prio << 13) | (vid & 0x0FFF)),
                                       .tpid = htons(ethertype_avtp)};
   memcpy(&eth_hdr.dest.addr, dest_addr, ETH_ADDR_LEN);
-  memcpy(&eth_hdr.src.addr, state->port[0].internal_mac_addr, ETH_ADDR_LEN);
+  memcpy(&eth_hdr.src.addr, avb_net_port0_tx_mac(state), ETH_ADDR_LEN);
   memcpy(eth_frame, &eth_hdr, sizeof(eth_hdr));
   if (ethertype == ethertype_vlan) {
     memcpy(eth_frame + sizeof(eth_hdr), &eth_vlan_hdr, sizeof(eth_vlan_hdr));
@@ -3009,7 +3079,7 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
   /* Match the guard in avb_net_send_on: skip TX silently when port 0
    * has no carrier so periodic ADP / MAAP / AECP cycles do not spam
    * the failure log. Single source of truth is esp_ptp. */
-  if (!ptpd_port_link_up(0)) {
+  if (!avb_net_port0_link_up()) {
     return 0;
   }
 
@@ -3021,7 +3091,7 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
 
   /* Wi-Fi port: L2TAP is Ethernet-only, so we bypass the per-ethertype
    * fds and push the frame straight at the Wi-Fi driver. */
-  if (state->port[0].medium == avb_port_medium_wifi_ftm) {
+  if (avb_net_port0_wifi(state)) {
     return (avb_net_wifi_tx_control(0 /* WIFI_IF_STA */, eth_frame,
                                     sizeof(eth_frame)) == ESP_OK)
                ? (int)sizeof(eth_frame)
@@ -3058,7 +3128,7 @@ int avb_net_send_to(avb_state_s *state, ethertype_t ethertype, void *msg,
 int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
                          uint16_t msg_len, struct timespec *ts,
                          eth_addr_t *dest_addr, uint8_t *vlan_id) {
-  if (!ptpd_port_link_up(0)) {
+  if (!avb_net_port0_link_up()) {
     return 0;
   }
 
@@ -3069,7 +3139,7 @@ int avb_net_send_to_vlan(avb_state_s *state, ethertype_t ethertype, void *msg,
                        vlan_id);
 
   /* Wi-Fi port: L2TAP is Ethernet-only — go straight to wifi raw TX. */
-  if (state->port[0].medium == avb_port_medium_wifi_ftm) {
+  if (avb_net_port0_wifi(state)) {
     return (avb_net_wifi_tx_control(0 /* WIFI_IF_STA */, eth_frame,
                                     sizeof(eth_frame)) == ESP_OK)
                ? (int)sizeof(eth_frame)
@@ -3154,7 +3224,8 @@ int avb_net_send_on(avb_state_s *state, int port_index,
    * source of truth lives in esp_ptp — it already owns the per-port
    * topology and event handlers. Returning 0 (zero bytes sent) lets
    * the callers' `if (ret < 0)` failure check pass silently. */
-  if (!ptpd_port_link_up(port_index)) {
+  if (port_index == 0 ? !avb_net_port0_link_up()
+                      : !ptpd_port_link_up(port_index)) {
     return 0;
   }
 
@@ -3187,7 +3258,17 @@ int avb_net_send_on(avb_state_s *state, int port_index,
   uint8_t eth_frame[msg_len + ETH_HEADER_LEN];
   avb_create_eth_frame(eth_frame, &dest_addr, state, ethertype, msg, msg_len,
                        NULL);
-  memcpy(eth_frame + ETH_ADDR_LEN, p->internal_mac_addr, ETH_ADDR_LEN);
+  memcpy(eth_frame + ETH_ADDR_LEN,
+         port_index == 0 ? avb_net_port0_tx_mac(state) : p->internal_mac_addr,
+         ETH_ADDR_LEN);
+
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  if (port_index == 0 && s_failover_wifi) {
+    esp_err_t r = avb_net_wifi_tx_control(0 /* WIFI_IF_STA */, eth_frame,
+                                          sizeof(eth_frame));
+    return (r == ESP_OK) ? (int)sizeof(eth_frame) : ERROR;
+  }
+#endif
 
   if (p->medium == avb_port_medium_wifi_ftm) {
     /* Use this port's wifi_mode (numerically WIFI_IF_STA=0 or

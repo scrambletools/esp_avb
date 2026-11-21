@@ -226,6 +226,15 @@ typedef struct {
 } esp_avb_coprocessor_fw_t;
 esp_err_t esp_avb_register_coprocessor_fw(const esp_avb_coprocessor_fw_t *fw);
 
+/* Wired-to-Wi-Fi failover through a Wi-Fi coprocessor's standby station
+ * (CONFIG_ESP_AVB_WIFI_FAILOVER). The application reports the station's
+ * association and MAC, and moves the entity's control traffic (ADP,
+ * AECP, ACMP, MSRP, MVRP) between Ethernet and the station; the entity
+ * ID and stream IDs keep the wired MAC. Streams are not moved yet. */
+void esp_avb_failover_set_station(bool associated, const uint8_t station_mac[6]);
+void esp_avb_failover_use_wifi(bool wifi);
+bool esp_avb_failover_using_wifi(void);
+
 /* Endpoint link policy (AVB Lite §6 item 9): advertise neither EEE nor
  * PAUSE, and do not act on PAUSE. Call between esp_eth_driver_install
  * and esp_eth_start; restart renegotiates at once if the advertisement
