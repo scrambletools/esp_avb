@@ -580,8 +580,10 @@ void mrp_port_arm_join_timer(avb_state_s *state, int port) {
 /* A bridge holds every stream on the network on each port, Advertise
  * and Failed in separate entries, plus its stations' streams. Sized
  * for its own streams, the wireless port filled with the wired side's
- * failed declarations and later stations' talkers were dropped. */
-#define MSRP_TALKER_TABLE_SIZE 20
+ * failed declarations and later stations' talkers were dropped. At 20,
+ * 18 wired streams filled the wired port and a station talker's
+ * declaration toward it was dropped, so no wired listener heard it. */
+#define MSRP_TALKER_TABLE_SIZE 48
 #define MSRP_LISTENER_TABLE_SIZE                                               \
   (AVB_MAX_NUM_LISTENERS + AVB_MAX_NUM_INPUT_STREAMS)
 #else
