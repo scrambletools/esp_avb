@@ -127,6 +127,7 @@ static int s_wifi_port_idx = -1;
  * are dropped so nothing is taken twice. gPTP stays on its own path. */
 static volatile bool s_failover_wifi;
 static volatile bool s_failover_changed;
+static volatile bool s_failover_wired_pending;
 static uint32_t s_failover_to_wifi, s_failover_to_wired;
 static int64_t s_failover_wifi_since_us, s_failover_wifi_us;
 static volatile bool s_failover_station_up;
@@ -177,9 +178,7 @@ void esp_avb_failover_set_station(bool associated,
   s_failover_station_up = associated;
 }
 
-void esp_avb_failover_use_wifi(bool wifi) {
-  if (s_failover_wifi == wifi)
-    return;
+static void avb_net_failover_switch(bool wifi) {
   s_failover_wifi = wifi;
   s_failover_changed = true;
   int64_t now_us = esp_timer_get_time();
@@ -192,6 +191,33 @@ void esp_avb_failover_use_wifi(bool wifi) {
   }
   ESP_LOGW(TAG, "Failover: control traffic now on %s",
            wifi ? "the Wi-Fi coprocessor's station" : "Ethernet");
+}
+
+/* Back to wired waits for the AVB task: it first withdraws the entity's
+ * declarations over the station, so the access point drops them at once
+ * instead of holding them until they age out, while the same streams are
+ * declared again over Ethernet (avb_net_failover_commit_wired). */
+void esp_avb_failover_use_wifi(bool wifi) {
+#if defined(CONFIG_ESP_AVB_ATDECC) && AVB_ENTITY_HAS_STREAMS
+  if (!wifi && s_failover_wifi) {
+    s_failover_wired_pending = true;
+    return;
+  }
+#endif
+  s_failover_wired_pending = false;
+  if (s_failover_wifi == wifi)
+    return;
+  avb_net_failover_switch(wifi);
+}
+
+bool avb_net_failover_wired_pending(void) { return s_failover_wired_pending; }
+
+void avb_net_failover_commit_wired(void) {
+  if (!s_failover_wired_pending)
+    return;
+  s_failover_wired_pending = false;
+  if (s_failover_wifi)
+    avb_net_failover_switch(false);
 }
 
 bool esp_avb_failover_using_wifi(void) { return s_failover_wifi; }

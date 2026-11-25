@@ -1873,6 +1873,13 @@ static int avb_periodic_send(avb_state_s *state) {
   }
   state->iface_link_known = true;
   state->iface_link_last = link;
+#ifdef CONFIG_ESP_AVB_WIFI_FAILOVER
+  /* Back to wired: withdraw over the station first (avbnet.c). */
+  if (avb_net_failover_wired_pending()) {
+    avb_failover_leave_wifi(state);
+    avb_net_failover_commit_wired();
+  }
+#endif
   /* A failover switch restarts the streams over the new path. */
   if (avb_net_failover_take_change()) {
     if (state->config.listener)

@@ -419,6 +419,8 @@ void mrp_withdraw_talker(avb_state_s *state, int port,
                          const unique_id_t *stream_id);
 void mrp_withdraw_listener(avb_state_s *state, int port,
                            const unique_id_t *stream_id);
+/* Send the port's pending declarations now (normally on JoinTimer). */
+void mrp_tx_flush_port(avb_state_s *state, int port);
 
 /* AVB Lite (profiles/avb_lite.md §6). mrp_lite_enter sends every local
  * declaration again as CVU SRP once the endpoint falls back.

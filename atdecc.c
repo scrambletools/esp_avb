@@ -6409,6 +6409,26 @@ void avb_failover_restart_listeners(avb_state_s *state) {
   }
 }
 
+/* Before failover returns to wired: withdraw every declaration made over
+ * the station and send the Lv at once, while port 0 still runs over
+ * Wi-Fi, so the access point drops them now. Kept, they aged out there
+ * only 15 to 37 s later, and until then the wired network routed the
+ * streams' listeners to the access point's port. AVB task. */
+void avb_failover_leave_wifi(avb_state_s *state) {
+  for (uint16_t i = 0; i < state->num_output_streams; i++) {
+    avb_talker_stream_s *stream = &state->output_streams[i];
+    if (!stream->failover_parked)
+      mrp_withdraw_talker(state, 0, &stream->stream_id);
+  }
+  for (uint16_t i = 0; i < state->num_input_streams; i++) {
+    avb_listener_stream_s *stream = &state->input_streams[i];
+    if (stream->connected || stream->provisional)
+      mrp_withdraw_listener(state, 0, &stream->stream_id);
+  }
+  mrp_tx_flush_port(state, 0);
+  avbinfo("Failover: declarations withdrawn over Wi-Fi before Ethernet");
+}
+
 /* Failover moved port 0: every output stops; on Wi-Fi a Class A one is
  * withdrawn and stays down (parked) until wired, a Class B one is
  * declared again over the station and starts on the next Listener Ready.
