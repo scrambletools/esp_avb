@@ -1842,7 +1842,33 @@ static void mrp_station_self_leaveall(int port) {
  * contained no talker re-join, and the next periodic listener
  * re-declaration flapped Ready→AskingFailed, pausing the peer talker
  * for seconds every LeaveAll cycle. */
-static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
+/* A station hears the access point's declarations group addressed, each
+ * in its own MRPDU, and Wi-Fi does not retry group addressed frames. One
+ * lost after a LeaveAll left its attribute to the next 1 s periodic
+ * declaration, which raced the 1 s LeaveTime and sometimes lost
+ * (observed: a talker on its failover station deregistered its listener
+ * three times in a minute while streaming, the Join 10 ms to 2 s late).
+ * On a station a LeaveAll's leave lasts three periodic declarations; a
+ * peer's own Lv keeps the normal LeaveTime. */
+#define MRP_STATION_LEAVEALL_LEAVE_US (3 * 1000 * 1000)
+
+static bool mrp_port_wifi_station(const avb_state_s *state, int port) {
+  const avb_port_s *p = &state->port[port];
+  if (p->medium == avb_port_medium_wifi_ftm &&
+      p->wifi_mode == avb_port_wifi_mode_sta)
+    return true;
+  return port == 0 && avb_net_failover_wifi();
+}
+
+/* rLA into one SM; leave_us, when not 0, replaces the LeaveTime. */
+static void msrp_step_leaveall(mrp_sm_state_t *sm, int64_t leave_us) {
+  mrp_sm_step(sm, mrp_event_r_la);
+  if (leave_us != 0 && sm->registrar == mrp_registrar_lv)
+    sm->leave_timer_us = esp_timer_get_time() + leave_us;
+}
+
+static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type,
+                                   int64_t leave_us) {
   switch (attr_type) {
   case msrp_attr_type_talker_advertise:
   case msrp_attr_type_talker_failed:
@@ -1853,21 +1879,21 @@ static void msrp_dispatch_leaveall(int port, msrp_attr_type_t attr_type) {
     for (int i = 0; i < MSRP_TALKER_TABLE_SIZE; i++) {
       if (s_msrp_talkers[port][i].valid &&
           s_msrp_talkers[port][i].attr_type == attr_type) {
-        mrp_sm_step(&s_msrp_talkers[port][i].sm, mrp_event_r_la);
+        msrp_step_leaveall(&s_msrp_talkers[port][i].sm, leave_us);
       }
     }
     break;
   case msrp_attr_type_listener:
     for (int i = 0; i < MSRP_LISTENER_TABLE_SIZE; i++) {
       if (s_msrp_listeners[port][i].valid) {
-        mrp_sm_step(&s_msrp_listeners[port][i].sm, mrp_event_r_la);
+        msrp_step_leaveall(&s_msrp_listeners[port][i].sm, leave_us);
       }
     }
     break;
   case msrp_attr_type_domain:
     for (int i = 0; i < MSRP_DOMAIN_TABLE_SIZE; i++) {
       if (s_msrp_domains[port][i].valid) {
-        mrp_sm_step(&s_msrp_domains[port][i].sm, mrp_event_r_la);
+        msrp_step_leaveall(&s_msrp_domains[port][i].sm, leave_us);
       }
     }
     break;
@@ -2573,7 +2599,10 @@ void mrp_rx_msrp(avb_state_s *state, int port, msrp_msgbuf_s *msg,
        * (200 ms), inside any spec-legal LeaveTimer. */
       if (leaveall && !state->avb_lite && attr_type < 8 &&
           !(leaveall_types & (1u << attr_type))) {
-        msrp_dispatch_leaveall(port, attr_type);
+        msrp_dispatch_leaveall(port, attr_type,
+                               mrp_port_wifi_station(state, port)
+                                   ? MRP_STATION_LEAVEALL_LEAVE_US
+                                   : 0);
         leaveall_types |= (1u << attr_type);
         mrp_port_arm_join_timer(state, port);
       }
