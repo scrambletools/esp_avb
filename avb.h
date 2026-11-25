@@ -1509,12 +1509,16 @@ avb_stream_tx_addrs_snapshot(const avb_talker_stream_s *stream,
 
 /* The presentation offset a Stream Output uses: its max transit time,
  * raised to CONFIG_ESP_AVB_TALKER_MIN_OFFSET_WIFI_US on a Wi-Fi
- * station. */
+ * station, a failover one included: with its wired offset 1.4 % of a
+ * failed-over Class B talker's frames reached a wired listener late.
+ * A failover restarts the stream, which picks the offset up. */
 static inline uint32_t avb_output_presentation_offset_ns(const avb_state_s *state,
                                                          int index) {
   uint32_t offset_ns = state->output_streams[index].presentation_time_offset_ns;
   uint32_t floor_ns = (uint32_t)CONFIG_ESP_AVB_TALKER_MIN_OFFSET_WIFI_US * 1000U;
-  if (state->port[0].medium == avb_port_medium_wifi_ftm && offset_ns < floor_ns)
+  bool station = state->port[0].medium == avb_port_medium_wifi_ftm ||
+                 avb_net_failover_wifi();
+  if (station && offset_ns < floor_ns)
     offset_ns = floor_ns;
   return offset_ns;
 }

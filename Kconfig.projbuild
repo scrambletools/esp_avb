@@ -737,8 +737,9 @@ menu "AVB Configuration"
         range 0 50000
         depends on ESP_AVB
         help
-            A Wi-Fi station's Stream Output presents its samples at
-            least this long after capture, whatever max transit time a
+            A Wi-Fi station's Stream Output, an endpoint's failover
+            station included, presents its samples at least this long
+            after capture, whatever max transit time a
             controller set (a larger one still applies), and reports
             the offset it uses. The uplink stalls for 20 to 50 ms at
             times, and the station's gPTP time runs milliseconds off
