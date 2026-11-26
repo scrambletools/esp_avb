@@ -2794,10 +2794,16 @@ typedef struct {
   uint8_t diag_first_audio[8];
   uint8_t diag_captured; /* 0=waiting, 1=pending print, 2=printed */
   uint32_t start_serial; /* increments per stream-in start (stats re-baseline) */
-  /* Milan late/early ts counters (updated by the drift sampler in
-   * main loop from drift_latest_*). Not in the hot path. */
+  /* Milan LATE_TIMESTAMP / EARLY_TIMESTAMP: frames with a valid
+   * timestamp that arrived after their presentation time, or more than
+   * 50 ms before it. Counted per frame on arrival, in gPTP time from the
+   * gPTP-less-timer offset the sparse stash keeps. Counted by the 10 ms
+   * sampler from the latest frame, they went on while no frames came
+   * and were not frames. */
   uint32_t late_ts_count;
   uint32_t early_ts_count;
+  int64_t ptp_less_timer_ns;
+  bool ptp_less_timer_valid;
   /* Latest-packet avtp_timestamp for the deferred drift sampler. Sparse
    * write (every 8 packets) to keep the hot path lean. Read from main
    * at 10 ms rate — 1-8 packets of staleness doesn't matter. */
@@ -4749,6 +4755,18 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   }
 
   int64_t arrival_us = esp_timer_get_time();
+  if ((avtp_data[1] & 0x01) && ctx->ptp_less_timer_valid) {
+    uint32_t presentation_ns =
+        ((uint32_t)avtp_data[12] << 24) | ((uint32_t)avtp_data[13] << 16) |
+        ((uint32_t)avtp_data[14] << 8) | (uint32_t)avtp_data[15];
+    uint32_t arrival_ns = (uint32_t)((uint64_t)arrival_us * 1000ULL +
+                                     (uint64_t)ctx->ptp_less_timer_ns);
+    int32_t lead_ns = (int32_t)(presentation_ns - arrival_ns);
+    if (lead_ns < 0)
+      ctx->late_ts_count++;
+    else if (lead_ns > 50 * 1000 * 1000)
+      ctx->early_ts_count++;
+  }
   if (ctx->arrival_prev_us &&
       arrival_us - ctx->arrival_prev_us > ctx->arrival_gap_max_us)
     ctx->arrival_gap_max_us = (int32_t)(arrival_us - ctx->arrival_prev_us);
@@ -5165,8 +5183,12 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->last_packet_us = ctx->drift_latest_rx_ts_us;
     struct timespec now_ts;
     if (ptpd_now(&now_ts) == 0) {
-      uint32_t now_ns = (uint32_t)((uint64_t)now_ts.tv_sec * 1000000000ULL +
-                                   (uint64_t)now_ts.tv_nsec);
+      uint64_t now_ptp_ns =
+          (uint64_t)now_ts.tv_sec * 1000000000ULL + (uint64_t)now_ts.tv_nsec;
+      ctx->ptp_less_timer_ns =
+          (int64_t)(now_ptp_ns - (uint64_t)ctx->drift_latest_rx_ts_us * 1000ULL);
+      ctx->ptp_less_timer_valid = true;
+      uint32_t now_ns = (uint32_t)now_ptp_ns;
       int32_t lead_us = (int32_t)(ctx->drift_latest_avtp_ts - now_ns) / 1000;
       if (lead_us < ctx->arrival_lead_min_us)
         ctx->arrival_lead_min_us = lead_us;
@@ -5639,12 +5661,6 @@ void avb_stream_in_sample_drift(avb_state_s *state) {
         drift > state->media_clock.stream_drift_max_ns) {
       state->media_clock.stream_drift_max_ns = drift;
     }
-    /* Milan late_ts / early_ts — approximate at sample rate, which is
-     * enough for trend. */
-    if (drift < 0)
-      stream_ctx->late_ts_count++;
-    else if (drift > 50 * 1000 * 1000)
-      stream_ctx->early_ts_count++;
   }
 
   if (have_crf) {
