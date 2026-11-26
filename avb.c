@@ -437,9 +437,10 @@ static void stream_id_set_generation(uint8_t *stream_id, uint8_t gen) {
  * two LeaveAll periods with no Talker Advertise (13 to 23 s on a MOTU
  * switch), or a bridge that kept the old, smaller TSpec polices it (seen:
  * 36 % of the frames dropped). Under a stream ID no bridge has seen for
- * AVB_STREAM_ID_REUSE_US the grown stream is declared at once, with the
- * old ID's Leave, and a PC endpoint doing so had audio 1 to 3 s after the
- * connect. Only while nothing would lose the stream: it is not running,
+ * AVB_STREAM_ID_REUSE_US the grown stream is declared, with the old ID's
+ * Leave, as soon as MAAP has its generation's own address (about 1.5 s),
+ * and a PC endpoint doing so had audio 1 to 3 s after the connect. Only
+ * while nothing would lose the stream: it is not running,
  * so its frame template is rebuilt at the next start, and no listener
  * other than except_listener holds an ACMP connection to the old ID. */
 static bool avb_output_stream_renew_id(avb_state_s *state, uint16_t index,
@@ -490,6 +491,11 @@ static bool avb_output_stream_renew_id(avb_state_s *state, uint16_t index,
             "%02x%02x%02x%02x%02x%02x%02x%02x",
             index, next[0], next[1], next[2], next[3], next[4], next[5],
             next[6], next[7]);
+    /* The new ID takes its generation's own address, declared once MAAP
+     * has it (mrp.c, maap_generate_addr); ACMP reports it meanwhile. */
+    avb_maap_restart(state, index, true);
+    memcpy(stream->stream_dest_addr, state->maap[index].acquired_addr,
+           ETH_ADDR_LEN);
     /* Kept across a reboot: back on the old ID, the grown stream would
      * meet the old ID's smaller reservation a bridge still holds. */
     avb_persist_append_output_stream(state, index);
@@ -513,8 +519,12 @@ static void avb_output_streams_restore_id_gen(avb_state_s *state) {
                             AVB_STREAM_ID_GENERATIONS);
     stream->stream_id_gen = gen;
     stream_id_set_generation(stream->stream_id, gen);
-    if (gen != 0)
+    if (gen != 0) {
       avbinfo("Stream out %u: stream ID generation %u as last saved", i, gen);
+      /* MAAP started on generation 0's address before the load. */
+      if (state->config.talker)
+        avb_maap_restart(state, i, false);
+    }
   }
 }
 #endif
@@ -535,6 +545,8 @@ static void avb_declare_output_stream(avb_state_s *state, uint16_t index,
           max_frame_size, max_interval_frames,
           stream->stream_info_flags.class_b))
     avb_output_stream_renew_id(state, index, except_listener);
+  if (state->maap[index].hold_declaration)
+    return; /* its new ID's address is still being probed */
 #else
   (void)except_listener;
 #endif

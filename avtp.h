@@ -198,6 +198,9 @@ typedef struct {
    * hash, so without this a defended probe regenerates the identical
    * address and re-collides forever. */
   uint16_t reselect_count;
+  /* The stream moved to a new stream ID and waits, undeclared, for the
+   * address of that ID's generation (avb_maap_restart). */
+  bool hold_declaration;
 } maap_stream_state_s;
 
 /* ===== AVTP stream formats ===== */
@@ -286,6 +289,9 @@ int avb_send_aaf_pcm(avb_state_s *state);
 
 void avb_maap_init(avb_state_s *state);
 void avb_maap_tick(avb_state_s *state);
+/* Probe again for the address of the stream's current stream ID
+ * generation; hold its declaration until acquired when hold is set. */
+void avb_maap_restart(avb_state_s *state, int stream_index, bool hold);
 int avb_send_maap_msg(avb_state_s *state, maap_msg_type_t msg_type,
                       eth_addr_t *req_addr, uint16_t req_count,
                       eth_addr_t *confl_addr, uint16_t confl_count);

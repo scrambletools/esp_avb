@@ -4216,6 +4216,8 @@ static int mrp_send_attr(avb_state_s *state, int port, void *attr,
 #define MAAP_ANNOUNCE_INTERVAL_VAR_MS 2000
 /* MAAP dynamic allocation pool: 91:E0:F0:00:00:00 to 91:E0:F0:00:FD:FF */
 #define MAAP_POOL_SIZE 0xFE00
+/* Distance between the addresses of one stream's ID generations. */
+#define MAAP_GENERATION_STRIDE 0x1000u
 
 /* Generate a deterministic address within the MAAP pool from the device
  * MAC. Deterministic across boots is important: switches cache per-
@@ -4238,6 +4240,13 @@ static void maap_generate_addr(avb_state_s *state, eth_addr_t *addr,
    * neighbors defending → same final address), which keeps switch-
    * cached MSRP state valid across reboots. */
   seed += (uint32_t)state->maap[stream_index].reselect_count * 0x0101u;
+  /* Each stream ID generation has its own address. A stream that moved
+   * to a new ID on a grown reservation kept the old ID's address, and a
+   * bridge still holding the old ID's registration failed the new one
+   * with "destination address in use" (code 5), which some switches
+   * never clear. Generation 0 keeps the address it always had. */
+  seed += (uint32_t)state->output_streams[stream_index].stream_id_gen *
+          MAAP_GENERATION_STRIDE;
   uint16_t offset = seed % MAAP_POOL_SIZE;
   uint8_t *a = (uint8_t *)addr;
   a[0] = 0x91;
@@ -4299,6 +4308,7 @@ void avb_maap_init(avb_state_s *state) {
     maap_stream_state_s *m = &state->maap[i];
     m->state = maap_state_initial;
     m->acquired = false;
+    m->hold_declaration = false;
     maap_generate_addr(state, &m->acquired_addr, i);
     m->probe_count = MAAP_PROBE_RETRANSMITS;
     m->timer_expiry_us =
@@ -4311,6 +4321,28 @@ void avb_maap_init(avb_state_s *state) {
             m->acquired_addr[0], m->acquired_addr[1], m->acquired_addr[2],
             m->acquired_addr[3], m->acquired_addr[4], m->acquired_addr[5], i);
   }
+}
+
+void avb_maap_restart(avb_state_s *state, int stream_index, bool hold) {
+  if (stream_index < 0 || stream_index >= state->num_output_streams)
+    return;
+  maap_stream_state_s *m = &state->maap[stream_index];
+  m->acquired = false;
+  m->reselect_count = 0;
+  m->hold_declaration = hold;
+  maap_generate_addr(state, &m->acquired_addr, stream_index);
+  m->probe_count = MAAP_PROBE_RETRANSMITS;
+  m->state = maap_state_probe;
+  m->timer_expiry_us =
+      esp_timer_get_time() +
+      maap_jitter_us(MAAP_PROBE_INTERVAL_BASE_MS, MAAP_PROBE_INTERVAL_VAR_MS);
+  avb_send_maap_msg(state, maap_msg_type_probe, &m->acquired_addr, 1, NULL, 0);
+  avbinfo("MAAP: probing %02x:%02x:%02x:%02x:%02x:%02x for stream %d, "
+          "stream ID generation %u",
+          m->acquired_addr[0], m->acquired_addr[1], m->acquired_addr[2],
+          m->acquired_addr[3], m->acquired_addr[4], m->acquired_addr[5],
+          stream_index,
+          (unsigned)state->output_streams[stream_index].stream_id_gen);
 }
 
 /* MAAP periodic tick — called from AVB main loop.
@@ -4331,6 +4363,11 @@ void avb_maap_tick(avb_state_s *state) {
         m->acquired = true;
         memcpy(state->output_streams[i].stream_dest_addr, m->acquired_addr,
                ETH_ADDR_LEN);
+        if (m->hold_declaration) {
+          /* The moved stream is declared at once on its new address. */
+          m->hold_declaration = false;
+          state->output_streams[i].last_declared = (struct timespec){0};
+        }
         avb_send_maap_msg(state, maap_msg_type_announce, &m->acquired_addr, 1,
                           NULL, 0);
         m->timer_expiry_us =
