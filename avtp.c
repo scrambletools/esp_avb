@@ -1044,10 +1044,11 @@ static AVB_TALKER_IRAM_ATTR void avb_stream_out_task(void *task_param) {
   }
 
   avbinfo("Stream out: rate=%luHz ch=%d samples/pkt=%d interval=%dus "
-          "frame=%d bytes audio@%d %s",
+          "frame=%d bytes audio@%d %s, presented %lu us after capture",
           params->sample_rate, params->channels, params->samples_per_packet,
           params->interval, frame_len, audio_offset,
-          params->use_sine_wave ? "sine" : "mic");
+          params->use_sine_wave ? "sine" : "mic",
+          (unsigned long)(params->presentation_time_offset_ns / 1000));
 
   uint32_t avtp_media_ts = 0;
   /* Base media-clock advance per packet, exact in Q16 ns/sample so a
